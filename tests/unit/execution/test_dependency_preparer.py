@@ -32,9 +32,14 @@ class FakeDocker:
         self.files = files if files is not None else {"flask-3.1.0-py3-none-any.whl": b"FLASK"}
         self.fail = fail
         self.calls: list[list[str]] = []
+        self.image_id = b"sha256:" + b"1" * 64 + b"\n"
 
     async def run(self, argv: Sequence[str], *, deadline: float, max_output: int) -> ProcessResult:
         argv = list(argv)
+        if argv[1:3] == ["image", "inspect"]:
+            return ProcessResult(
+                exit_code=0, stdout=self.image_id, stderr=b"", truncated=False, timed_out=False
+            )
         self.calls.append(argv)
         m = mounts(argv)
         if "download" in argv:
@@ -121,8 +126,14 @@ async def test_a_corrupted_bundle_is_refused(tmp_path: Path) -> None:
     wheel = tmp_path / "deps" / bundle.key / "wheels" / bundle.packages[0].filename
     wheel.chmod(0o644)
     wheel.write_bytes(b"TAMPERED")
-    with pytest.raises(DependencyPolicyError, match="dependency_bundle_corrupted"):
-        await prep.prepare(req("flask"))
+    downloads = sum("download" in c for c in prep._runner.calls)  # type: ignore[attr-defined]
+    rebuilt = await prep.prepare(req("flask"))  # never mounted: quarantined, rebuilt once
+    assert rebuilt is not None and rebuilt.key == bundle.key
+    assert sum("download" in c for c in prep._runner.calls) == downloads + 1  # type: ignore[attr-defined]
+    assert [p.name for p in (tmp_path / "deps").iterdir() if p.name.startswith(".corrupt-")]
+    assert (
+        tmp_path / "deps" / bundle.key / "wheels" / bundle.packages[0].filename
+    ).read_bytes() == b"FLASK"
 
 
 async def test_a_tampered_lock_manifest_is_refused(tmp_path: Path) -> None:
@@ -134,7 +145,87 @@ async def test_a_tampered_lock_manifest_is_refused(tmp_path: Path) -> None:
     data = json.loads(meta.read_text())
     data["packages"][0]["sha256"] = "0" * 64
     meta.write_text(json.dumps(data))
-    with pytest.raises(DependencyPolicyError, match="dependency_bundle_corrupted"):
+    rebuilt = await prep.prepare(req("flask"))
+    assert rebuilt is not None and rebuilt.packages[0].sha256 == bundle.packages[0].sha256
+
+
+async def test_a_tampered_installed_site_is_detected_and_never_reused(tmp_path: Path) -> None:
+    """The sandbox mounts site/, so site/ itself is digest-checked, not only the wheels."""
+    docker = FakeDocker()
+    prep = preparer(tmp_path, docker)
+    bundle = await prep.prepare(req("flask"))
+    assert bundle is not None
+    init = Path(bundle.site_dir) / "flask" / "__init__.py"
+    init.parent.chmod(0o755)
+    init.chmod(0o644)
+    init.write_text("import os; os.system('curl evil')")
+    rebuilt = await prep.prepare(req("flask"))
+    assert rebuilt is not None
+    assert (Path(rebuilt.site_dir) / "flask" / "__init__.py").read_text() == ""
+    assert sum("download" in c for c in docker.calls) == 2
+
+
+async def test_a_corrupted_rebuild_fails_closed(tmp_path: Path) -> None:
+    docker = FakeDocker()
+    prep = preparer(tmp_path, docker)
+    bundle = await prep.prepare(req("flask"))
+    assert bundle is not None
+    (tmp_path / "deps" / bundle.key / "lock.json").chmod(0o644)
+    (tmp_path / "deps" / bundle.key / "lock.json").write_text("{not json")
+    docker.fail = b"ERROR: No matching distribution found for flask"
+    with pytest.raises(DependencyPolicyError, match="dependency_wheel_unavailable"):
+        await prep.prepare(req("flask"))
+    assert not (tmp_path / "deps" / bundle.key).exists()  # nothing half-published
+
+
+async def test_the_cache_key_changes_with_the_execution_image_identity(tmp_path: Path) -> None:
+    first = preparer(tmp_path, FakeDocker())
+    a = await first.prepare(req("flask"))
+    other = FakeDocker()
+    other.image_id = b"sha256:" + b"2" * 64  # same tag, rebuilt image (e.g. another Python)
+    b = await preparer(tmp_path, other).prepare(req("flask"))
+    assert a is not None and b is not None and a.key != b.key
+    assert len(other.calls) == 2  # a fresh download + install, not a reuse
+
+
+async def test_an_unknown_execution_image_fails_closed(tmp_path: Path) -> None:
+    docker = FakeDocker()
+    docker.image_id = b""
+    with pytest.raises(DependencyPolicyError, match="dependency_image_unavailable"):
+        await preparer(tmp_path, docker).prepare(req("flask"))
+    assert docker.calls == []
+
+
+async def test_a_resolver_timeout_is_classified(tmp_path: Path) -> None:
+    class Slow(FakeDocker):
+        async def run(
+            self, argv: Sequence[str], *, deadline: float, max_output: int
+        ) -> ProcessResult:
+            if "download" in argv:
+                return ProcessResult(
+                    exit_code=-9, stdout=b"", stderr=b"", truncated=False, timed_out=True
+                )
+            return await super().run(argv, deadline=deadline, max_output=max_output)
+
+    prep = preparer(tmp_path, Slow())
+    with pytest.raises(DependencyPolicyError, match="dependency_preparation_timeout"):
+        await prep.prepare(req("flask"))
+    assert [p for p in (tmp_path / "deps").iterdir() if not p.name.startswith(".")] == []
+
+
+async def test_installed_size_is_bounded(tmp_path: Path) -> None:
+    class Big(FakeDocker):
+        async def run(
+            self, argv: Sequence[str], *, deadline: float, max_output: int
+        ) -> ProcessResult:
+            result = await super().run(argv, deadline=deadline, max_output=max_output)
+            if "install" in argv:
+                site = Path(mounts(list(argv))["/site"])
+                (site / "blob.bin").write_bytes(b"x" * 5000)
+            return result
+
+    prep = preparer(tmp_path, Big(), max_bytes=1000)
+    with pytest.raises(DependencyPolicyError, match="dependency_limit_exceeded"):
         await prep.prepare(req("flask"))
 
 

@@ -71,3 +71,27 @@ Approve B as an amendment to C2, implemented in the roadmap order of the design 
 - [ ] Approve the allowed package index list (default: `https://pypi.org/simple` only).
 - [ ] Approve egress enforcement for the resolver container (Docker network + egress proxy, or host firewall).
 - [ ] Approve limits (direct and transitive package counts, bundle size, preparation timeout).
+
+## Hardening and verified behaviour (2026-11-26)
+
+**Supported input (exactly this, nothing else).** The only dependency input is the `dependencies` list of the agent's implementation plan. Each entry is a PEP 508 name, optionally followed by version specifiers (`==`, `>=`, `~=`, ...). The policy refuses URLs, file paths, VCS references, extras, environment markers, pip options and duplicates (`dependency_request_invalid`, `dependency_conflict`). Repository files (`requirements.txt`, `pyproject.toml`, `uv.lock`) are **not** read: a repository's existing dependencies must already be in the execution image, otherwise its tests fail in the offline sandbox and the attempt fails. Nothing is ever installed from the network as a fallback.
+
+**Resolution.** One resolver container (`pip download --only-binary=:all:`) runs in the execution image itself, so the Python version (3.12) and platform are the sandbox's. Transitive dependencies are resolved and every wheel is recorded in `requirements.lock` (`name==version --hash=sha256:...`). Only `DEPENDENCY_INDEX_URL` is used (https, no credentials, validated at start-up). Resolution is as deterministic as the index allows: an unpinned request can resolve to a newer release later; that produces a new lock, never a silent change of an existing bundle.
+
+**Integrity.** `lock.json` records the wheel hashes, the lock hash, the execution image's immutable id and a digest of every file in the installed `site/` tree (the directory the sandbox mounts). Every reuse re-verifies all of them. A bundle that fails is moved to `.corrupt-*` (kept for inspection) and rebuilt once; if the rebuild fails, the attempt fails. Validation additionally checks that its bundle has the same lock hash as the `dependency_lock` artifact recorded at implementation (`dependency_bundle_changed` otherwise).
+
+**Cache identity.** The key is sha256 of image tag, image id, index URL and the normalised requests. A different request set, Python version or image build gives a different key. Bundles are immutable and read-only; two repositories that request the same set share one read-only bundle, so nothing mutable is ever shared.
+
+**Publication.** Each build runs in a private `.tmp-*` directory that is frozen and then renamed into place. A concurrent build of the same key keeps the first published bundle; partial builds are deleted.
+
+**Limits.** At most `DEPENDENCY_MAX_PACKAGES` wheels and `DEPENDENCY_MAX_BYTES` downloaded; the installed tree is limited to 4x that; `DEPENDENCY_TIMEOUT_SECONDS` per container; resolver/installer containers: read-only root, all capabilities dropped, no-new-privileges, non-root, 1 GiB memory, 256 pids.
+
+**Failure codes** (become the attempt's `failure_code` and appear in the Jira comment; no PR is created): `dependency_request_invalid`, `dependency_conflict`, `dependency_limit_exceeded`, `dependency_wheel_unavailable`, `dependency_python_unsupported`, `dependency_preparation_timeout`, `dependency_preparation_failed` (index/Docker unavailable), `dependency_install_failed`, `dependency_image_unavailable`, `dependency_bundle_corrupted`, `dependency_bundle_changed`, `dependency_preparation_unavailable`.
+
+**Verified against real Docker and PyPI** (`tests/integration/test_dependency_bundle_docker.py`): `tabulate==0.9.0` (not in the image) is resolved, hash-locked and installed offline. A `--network none`, read-only, non-root sandbox imports exactly 0.9.0, cannot open a socket and cannot write to `/opt/deps`. Without the bundle the import fails (no fetch). A second preparer reuses the cache. Two concurrent preparers publish one bundle. A modified file in `site/` is detected, quarantined and rebuilt. A non-existent version fails with `dependency_wheel_unavailable` and publishes nothing.
+
+**Known limitations.**
+- Hashes are generated from what the index served over HTTPS (trust on first download); the index's own published hashes are not cross-checked.
+- Wheels only: packages without a wheel for this platform are refused.
+- Resolver egress is restricted by argv (`--index-url`), not by a network policy; a host firewall is the operator's control.
+- A live Jira-triggered Story that needs a new dependency has not been run (needs approval for a Story, model calls and a draft PR).

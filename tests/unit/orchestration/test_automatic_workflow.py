@@ -4,12 +4,14 @@ policy decisions replace the two human gates; failures never publish and are rep
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
 from ai_code_change_agent.application.artifacts.models import ArtifactKind
 from ai_code_change_agent.application.dependencies.ports import DependencyBundle, LockedPackage
 from ai_code_change_agent.domain.changes.models import ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
-from ai_code_change_agent.domain.dependencies.policy import DependencyRequest
+from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, DependencyRequest
 from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps
 from tests.support import workflow
 from tests.support.changes import python_profile
@@ -101,16 +103,23 @@ async def test_a_protected_path_in_the_plan_is_rejected(tmp_path: Path) -> None:
 
 
 class FakePreparer:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, locks: list[str] | None = None, error: str | None = None
+    ) -> None:
         self.root = root
         self.calls: list[tuple[DependencyRequest, ...]] = []
+        self.locks = locks or []  # lock hash per call (default: always the same)
+        self.error = error
 
     async def prepare(self, requests: tuple[DependencyRequest, ...]) -> DependencyBundle:
         self.calls.append(requests)
+        if self.error is not None:
+            raise DependencyPolicyError(self.error)
         site = self.root / "k1" / "site"
         site.mkdir(parents=True, exist_ok=True)
         pkg = LockedPackage("flask", "3.1.0", "flask-3.1.0-py3-none-any.whl", "a" * 64, 1)
-        return DependencyBundle("k1", "b" * 64, str(site), (pkg,))
+        lock = self.locks.pop(0) if self.locks else "b" * 64
+        return DependencyBundle("k1", lock, str(site), (pkg,))
 
 
 async def test_requested_dependencies_are_prepared_and_mounted_read_only(tmp_path: Path) -> None:
@@ -128,6 +137,48 @@ async def test_requested_dependencies_are_prepared_and_mounted_read_only(tmp_pat
     validation = [c for c in rig.commands if len(c) > 1 and c[1] == "run"]
     assert all("dst=/opt/deps,readonly" in " ".join(c) for c in validation)
     assert ArtifactKind.DEPENDENCY_LOCK in await kinds(rig)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "dependency_wheel_unavailable",
+        "dependency_conflict",
+        "dependency_bundle_corrupted",
+        "dependency_preparation_timeout",
+        "dependency_limit_exceeded",
+        "dependency_image_unavailable",
+    ],
+)
+async def test_a_dependency_failure_fails_the_attempt_without_a_pr(
+    tmp_path: Path, code: str
+) -> None:
+    preparer = FakePreparer(tmp_path / "deps", error=code)
+    rig = await make_rig(tmp_path, approval_mode="automatic", dependencies=preparer)
+    workflow.FakeAgent.plan_result = plan_with(dependencies=["flask"])
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == code
+    assert rig.publisher.requests == []
+    assert not any(s.writable for s in rig.sandboxes.started)  # implementation never started
+
+
+async def test_validation_refuses_a_bundle_that_changed_since_implementation(
+    tmp_path: Path,
+) -> None:
+    preparer = FakePreparer(tmp_path / "deps", locks=["b" * 64, "c" * 64])
+    rig = await make_rig(tmp_path, approval_mode="automatic", dependencies=preparer)
+    workflow.FakeAgent.plan_result = plan_with(dependencies=["flask"])
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == "dependency_bundle_changed"
+    assert rig.publisher.requests == []
 
 
 async def test_dependencies_without_a_preparer_fail_closed(tmp_path: Path) -> None:

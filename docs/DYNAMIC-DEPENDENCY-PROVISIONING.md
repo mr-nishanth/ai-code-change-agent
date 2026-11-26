@@ -236,3 +236,5 @@ The stored plan (attempt `c6139a8c`, plan sha256 `28dec3b9356c…`) declares Fas
 | Preparation failure (resolver exits non-zero or times out) | adapter, fake runner | `dependency_preparation_failed`, attempt BLOCKED |
 | Native dependency (platform-specific only, wrong arch) | unit, fake index | `dependency_wheel_unavailable` |
 | Resolver container has no app credentials or workspace | unit on argv | env and mounts asserted empty except the output dir |
+
+The current hardening, supported inputs, failure codes and live-verified behaviour are recorded in [ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md#hardening-and-verified-behaviour-2026-11-26).

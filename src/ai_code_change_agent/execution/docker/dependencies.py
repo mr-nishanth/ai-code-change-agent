@@ -14,6 +14,12 @@ Runs in the worker (trusted control plane), never in the coding sandbox:
    executes no package code;
 4. the bundle is made read-only and moved into place atomically under a content key, which is also
    the cache: a later request with the same key reuses it after re-verifying every hash.
+
+Integrity covers what the sandbox actually mounts: lock.json records the sha256 of every wheel
+AND a digest of every file in the installed `site/` tree. The cache key includes the execution
+image's immutable id (so a re-tagged image with another Python never reuses an old bundle). A
+bundle that fails verification is moved aside (`.corrupt-*`) and rebuilt once from the index;
+it is never mounted.
 """
 
 import asyncio
@@ -44,6 +50,24 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _tree_digest(root: Path) -> tuple[str, int]:
+    """sha256 over (relative path, kind, mode bits, content hash) of every entry under root, and
+    the total file size. Symlinks are refused: a bundle never contains links."""
+    digest = hashlib.sha256()
+    total = 0
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise DependencyPolicyError("dependency_bundle_corrupted")
+        if path.is_dir():
+            digest.update(f"d {rel}\n".encode())
+            continue
+        total += path.stat().st_size
+        executable = "x" if path.stat().st_mode & stat.S_IXUSR else "-"
+        digest.update(f"f {rel} {executable} {_sha256(path)}\n".encode())
+    return digest.hexdigest(), total
 
 
 def _freeze(root: Path) -> None:
@@ -82,13 +106,32 @@ class DockerDependencyPreparer:
         self._uid = os.getuid() if uid is None else uid
         self._gid = os.getgid() if gid is None else gid
         self._locks: dict[str, asyncio.Lock] = {}
+        self._image_id: str | None = None
 
     def __repr__(self) -> str:
         return f"DockerDependencyPreparer(index={self._index!r})"
 
+    async def _resolve_image_id(self) -> str:
+        """The immutable id of the execution image (Python version and platform included)."""
+        if self._image_id is None:
+            try:
+                result = await self._runner.run(
+                    [self._docker, "image", "inspect", "--format", "{{.Id}}", self._image],
+                    deadline=30.0,
+                    max_output=4096,
+                )
+            except OSError:  # Docker itself is unavailable
+                raise DependencyPolicyError("dependency_preparation_failed") from None
+            image_id = (result.stdout or b"").decode(errors="replace").strip()
+            if result.exit_code != 0 or not image_id.startswith("sha256:"):
+                raise DependencyPolicyError("dependency_image_unavailable")
+            self._image_id = image_id
+        return self._image_id
+
     def key(self, requests: tuple[DependencyRequest, ...]) -> str:
         material = {
             "image": self._image,
+            "image_id": self._image_id,
             "index": self._index,
             "requests": [r.requirement() for r in requests],
         }
@@ -97,15 +140,27 @@ class DockerDependencyPreparer:
     async def prepare(self, requests: tuple[DependencyRequest, ...]) -> DependencyBundle | None:
         if not requests:
             return None
+        await self._resolve_image_id()
         key = self.key(requests)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             final = self._root / key
             if final.is_dir():
-                bundle = await asyncio.to_thread(self._verify, final, key)
-                _log.info("dependency_bundle_reused", key=key, packages=len(bundle.packages))
-                return bundle
+                try:
+                    bundle = await asyncio.to_thread(self._verify, final, key)
+                except DependencyPolicyError:
+                    await asyncio.to_thread(self._quarantine, final, key)
+                else:
+                    _log.info("dependency_bundle_reused", key=key, packages=len(bundle.packages))
+                    return bundle
             return await self._build(key, requests, final)
+
+    def _quarantine(self, final: Path, key: str) -> None:
+        """Move a bundle that failed verification out of the cache (kept for inspection)."""
+        target = self._root / f".corrupt-{key[:16]}-{uuid.uuid4().hex[:8]}"
+        final.chmod(0o700)
+        final.rename(target)
+        _log.warning("dependency_bundle_quarantined", key=key, moved_to=target.name)
 
     async def _build(
         self, key: str, requests: tuple[DependencyRequest, ...], final: Path
@@ -124,6 +179,9 @@ class DockerDependencyPreparer:
             )
             (tmp / "wheels" / "requirements.lock").write_text(lock_text)
             await self._install(tmp)
+            site_sha, site_bytes = await asyncio.to_thread(_tree_digest, tmp / "site")
+            if site_bytes > self._max_bytes * 4:  # wheels expand; bound the installed size too
+                raise DependencyPolicyError("dependency_limit_exceeded")
             lock_sha = hashlib.sha256(lock_text.encode()).hexdigest()
             meta = {
                 "key": key,
@@ -131,6 +189,8 @@ class DockerDependencyPreparer:
                 "index": self._index,
                 "requests": [r.requirement() for r in requests],
                 "lock_sha256": lock_sha,
+                "site_sha256": site_sha,
+                "image_id": self._image_id,
                 "packages": [p.__dict__ for p in packages],
             }
             (tmp / "lock.json").write_text(json.dumps(meta, indent=1, sort_keys=True))
@@ -169,6 +229,8 @@ class DockerDependencyPreparer:
             result = await self._runner.run(argv, deadline=self._timeout, max_output=_OUTPUT_CAP)
         except OSError:
             raise DependencyPolicyError("dependency_preparation_failed") from None
+        if result.timed_out:
+            raise DependencyPolicyError("dependency_preparation_timeout")
         if result.exit_code != 0:
             out = (result.stdout or b"") + (result.stderr or b"")
             if b"No matching distribution" in out or b"Could not find a version" in out:
@@ -252,7 +314,7 @@ class DockerDependencyPreparer:
             if _sha256(final / "wheels" / p.filename) != p.sha256:
                 raise DependencyPolicyError("dependency_bundle_corrupted")
         site = final / "site"
-        if not site.is_dir():
+        if not site.is_dir() or meta.get("site_sha256") != _tree_digest(site)[0]:
             raise DependencyPolicyError("dependency_bundle_corrupted")
         return DependencyBundle(key, str(meta["lock_sha256"]), str(site), packages)
 

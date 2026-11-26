@@ -520,6 +520,13 @@ class CodeChangeSteps:
             loaded = await self._d.profiles.get(a.profile_version_id)
             commit = a.base_commit_sha
             bundle = await self._bundle(plan)  # the same verified bundle (cache hit)
+            if bundle is not None:  # validation must use exactly what the agent worked with
+                lock_ref, lock_sha = await self._latest(a, ArtifactKind.DEPENDENCY_LOCK)
+                used = await load_verified(
+                    self._d.artifacts, scope, lock_ref, lock_sha, DependencyLockDoc
+                )
+                if used.lock_sha256 != bundle.lock_sha256:
+                    raise DependencyPolicyError("dependency_bundle_changed")
 
             async def fresh_baseline() -> Any:
                 # Transient Git host failures (5xx, 429, timeouts) are retried with backoff here,
