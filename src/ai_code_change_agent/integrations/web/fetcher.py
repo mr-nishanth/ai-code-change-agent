@@ -137,8 +137,15 @@ class HttpReferenceFetcher:
                 try:
                     async with client.stream("GET", current) as response:
                         if response.is_redirect:
-                            location = response.headers.get("location", "")
-                            current = await self._check(urljoin(current, location))
+                            target = urljoin(current, response.headers.get("location", ""))
+                            try:
+                                current = await self._check(target)
+                            except ReferenceRefusedError as exc:
+                                host = (urlsplit(target).hostname or "?")[:100]
+                                _log.info("reference_redirect_refused", to_host=host, code=exc.code)
+                                raise ReferenceRefusedError(
+                                    f"reference_redirect_not_allowed:{host}"
+                                ) from None
                             continue
                         return await self._read(current, response)
                 except httpx.HTTPError:

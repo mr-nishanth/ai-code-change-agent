@@ -117,3 +117,50 @@ def test_pep740_attestation_availability_is_recorded_not_claimed_verified() -> N
     assert res.attestation_published and res.as_dict()["attestation_published"] is True
     (plain,) = MetadataVerifier(INDEX, fetch=fetcher(200, JSON_CT, json_page())).verify([PKG])
     assert not plain.attestation_published
+
+
+def _transport(size: int, status: int = 200):  # type: ignore[no-untyped-def]
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.scheme == "https"
+        return httpx.Response(status, headers={"content-type": JSON_CT}, content=b"x" * size)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize("size", [0, 1023, 1024])
+def test_index_pages_up_to_the_cap_are_read_whole(size: int) -> None:
+    from ai_code_change_agent.execution.docker.metadata_verifier import _https_fetch
+
+    status, ctype, body = _https_fetch(
+        "https://pypi.org/simple/x/", max_bytes=1024, transport=_transport(size)
+    )
+    assert (status, ctype, len(body)) == (200, JSON_CT, size)
+
+
+def test_an_index_page_over_the_cap_fails_closed() -> None:
+    from ai_code_change_agent.execution.docker.metadata_verifier import _https_fetch
+
+    with pytest.raises(DependencyPolicyError, match="dependency_metadata_unavailable"):
+        _https_fetch("https://pypi.org/simple/x/", max_bytes=1024, transport=_transport(1025))
+
+
+def test_the_production_cap_fits_the_largest_known_pypi_page() -> None:
+    from ai_code_change_agent.execution.docker import metadata_verifier
+
+    assert metadata_verifier._MAX_BYTES == 64 * 1024 * 1024  # pydantic-core: ~10 MB (2026-11)
+
+
+def test_a_redirect_from_the_index_is_never_followed() -> None:
+    import httpx
+
+    from ai_code_change_agent.execution.docker.metadata_verifier import _https_fetch
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://evil.example/simple/x/"})
+
+    status, _, _ = _https_fetch(
+        "https://pypi.org/simple/x/", transport=httpx.MockTransport(handler)
+    )
+    assert status == 302  # the verifier then refuses: dependency_metadata_unavailable

@@ -138,3 +138,16 @@ async def test_unavailable_package_and_conflict_fail_closed(tmp_path: Path) -> N
     with pytest.raises(DependencyPolicyError, match="dependency_wheel_unavailable"):
         await prep.prepare(validate_requests(["tabulate==0.0.0.999"], max_packages=10))
     assert not [p for p in (tmp_path / "deps").iterdir() if not p.name.startswith(".")]
+
+
+async def test_projects_with_very_large_index_pages_are_verified(tmp_path: Path) -> None:
+    """pydantic-core's PEP 691 page is ~10 MB (every wheel of every release); its hashes must
+    still be cross-checked (regression: an 8 MiB cap failed every pydantic project)."""
+    bundle = await preparer(tmp_path / "deps").prepare(
+        validate_requests(["pydantic==2.12.5"], max_packages=10)
+    )
+    assert bundle is not None
+    meta = json.loads((tmp_path / "deps" / bundle.key / "lock.json").read_text())
+    checks = {c["filename"].split("-")[0]: c for c in meta["verification"]}
+    assert checks["pydantic_core"]["source"] == "pep691_json"
+    assert checks["pydantic_core"]["published_sha256"] == checks["pydantic_core"]["sha256"]

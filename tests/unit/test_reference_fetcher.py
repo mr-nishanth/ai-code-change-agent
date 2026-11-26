@@ -87,7 +87,9 @@ async def test_redirects_are_rechecked_and_capped() -> None:
     def off_domain(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "https://evil.invalid/steal"})
 
-    with pytest.raises(ReferenceRefusedError, match="reference_domain_not_allowed"):
+    with pytest.raises(
+        ReferenceRefusedError, match=r"reference_redirect_not_allowed:evil\.invalid"
+    ):
         await fetcher(off_domain).fetch("https://docs.python.org/a")
 
     def within(request: httpx.Request) -> httpx.Response:
@@ -180,3 +182,49 @@ async def test_html_with_megabytes_of_head_scripts_still_yields_its_body_text() 
     doc = await f.fetch("https://docs.example.com/page")
     assert "Jira REST v3" in doc.text and "Use basic auth." in doc.text
     assert "xxxx" not in doc.text and doc.retrieved_at.endswith("+00:00")
+
+
+@pytest.mark.parametrize(
+    ("location", "allowed", "outcome"),
+    [
+        # docs.pydantic.dev moved to pydantic.dev/docs (301, verified 2026-11-26)
+        ("https://pydantic.dev/docs/validation/latest/", ["docs.pydantic.dev", "pydantic.dev"], "ok"),
+        ("https://pydantic.dev/docs/validation/latest/", ["docs.pydantic.dev"],
+         "reference_redirect_not_allowed:pydantic.dev"),
+        ("https://evil.example/x", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:evil.example"),
+        ("https://localhost/x", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:localhost"),
+        ("https://127.0.0.1/x", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:127.0.0.1"),
+        ("http://169.254.169.254/latest/meta-data/", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:169.254.169.254"),
+        ("https://pydantic.dev:8443/docs/", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:pydantic.dev"),
+        ("http://pydantic.dev/docs/", ["docs.pydantic.dev", "pydantic.dev"],
+         "reference_redirect_not_allowed:pydantic.dev"),
+    ],
+)  # fmt: skip
+async def test_every_redirect_hop_is_checked_against_the_allow_list(
+    location: str, allowed: list[str], outcome: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "docs.pydantic.dev":
+            return httpx.Response(301, headers={"location": location})
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"<p>Validators</p>"
+        )
+
+    async def public(host: str) -> list[str]:
+        return ["127.0.0.1"] if host in ("localhost",) else ["104.16.0.1"]
+
+    f = HttpReferenceFetcher(
+        allowed_domains=allowed, transport=httpx.MockTransport(handler), resolver=public
+    )
+    if outcome == "ok":
+        doc = await f.fetch("https://docs.pydantic.dev/latest/concepts/validators/")
+        assert doc.url == location and "Validators" in doc.text
+    else:
+        with pytest.raises(ReferenceRefusedError) as err:
+            await f.fetch("https://docs.pydantic.dev/latest/concepts/validators/")
+        assert err.value.code == outcome

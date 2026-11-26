@@ -38,7 +38,8 @@ _log = get_logger("metadata_verifier")
 
 Source = Literal["pep691_json", "pep503_html", "unverified"]
 _JSON = "application/vnd.pypi.simple.v1+json"
-_MAX_BYTES = 8 * 1024 * 1024  # simple pages of large projects can be a few MB
+# Simple pages list every file of every release: pydantic-core's PEP 691 page is ~10 MB (2026-11).
+_MAX_BYTES = 64 * 1024 * 1024
 _HREF = re.compile(r"""<a\s[^>]*href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 
@@ -65,14 +66,25 @@ class WheelVerification:
         }
 
 
-def _https_fetch(url: str) -> tuple[int, str, bytes]:
+def _https_fetch(
+    url: str,
+    *,
+    max_bytes: int = _MAX_BYTES,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[int, str, bytes]:
+    """GET one simple-index page: TLS verified, redirects not followed, no proxy settings from
+    the environment, body streamed and refused once it exceeds max_bytes (memory stays bounded
+    by the cap)."""
     headers = {"Accept": f"{_JSON}, text/html;q=0.1"}
-    with httpx.Client(follow_redirects=False, timeout=20.0, verify=True) as client:  # noqa: SIM117
+    with httpx.Client(  # noqa: SIM117
+        follow_redirects=False, timeout=20.0, verify=True, trust_env=False, transport=transport
+    ) as client:
         with client.stream("GET", url, headers=headers) as resp:
             body = bytearray()
             for chunk in resp.iter_bytes():
                 body += chunk
-                if len(body) > _MAX_BYTES:
+                if len(body) > max_bytes:
+                    _log.error("index_metadata_too_large", url=url, limit=max_bytes)
                     raise DependencyPolicyError(DependencyFailureCode.METADATA_UNAVAILABLE)
             return resp.status_code, resp.headers.get("content-type", ""), bytes(body)
 
@@ -137,8 +149,8 @@ class MetadataVerifier:
             status, ctype, body = self._fetch(url)
         except DependencyPolicyError:
             raise
-        except (httpx.HTTPError, OSError, ValueError):
-            _log.warning("index_metadata_fetch_failed", package=name)
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            _log.warning("index_metadata_fetch_failed", package=name, error=type(exc).__name__)
             raise DependencyPolicyError(DependencyFailureCode.METADATA_UNAVAILABLE) from None
         if status != 200:  # redirects are refused, not followed
             _log.warning("index_metadata_status", package=name, status=status)
