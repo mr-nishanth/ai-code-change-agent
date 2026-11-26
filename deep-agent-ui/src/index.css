@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+:root { color-scheme: light dark; }
+body { @apply bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100; }
+.prose-msg p { margin: 0.25rem 0; }
+.prose-msg pre { @apply my-2 overflow-x-auto rounded bg-zinc-900 p-2 text-xs text-zinc-100; }
+.prose-msg code { @apply rounded bg-zinc-200/70 px-1 text-[0.85em] dark:bg-zinc-800; }
+.prose-msg pre code { @apply bg-transparent p-0; }
+.prose-msg ul { @apply ml-5 list-disc; }
+.prose-msg ol { @apply ml-5 list-decimal; }

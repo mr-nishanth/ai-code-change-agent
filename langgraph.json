@@ -1,0 +1,28 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "coding_agent": "./studio/agent_graph.py:make_coder",
+    "coding_planner": "./studio/agent_graph.py:make_planner"
+  },
+  "http": {
+    "app": "./studio/api.py:app",
+    "cors": {
+      "allow_origins": [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+      ],
+      "allow_methods": [
+        "*"
+      ],
+      "allow_headers": [
+        "*"
+      ],
+      "expose_headers": [
+        "*"
+      ]
+    }
+  }
+}
