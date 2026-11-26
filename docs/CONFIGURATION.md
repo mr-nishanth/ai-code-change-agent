@@ -63,6 +63,8 @@ Requested names that are **deliberately absent**, because nothing uses them:
 | WORKFLOW_APPROVAL_MODE | automatic | | worker (`automatic`: policy decides PLAN and FINAL; `manual`: operator CLI) |
 | DEPENDENCY_INDEX_URL | https://pypi.org/simple | | worker (the only index the resolver container may use; https, no credentials) |
 | DEPENDENCY_MAX_PACKAGES, DEPENDENCY_MAX_BYTES, DEPENDENCY_TIMEOUT_SECONDS | 60, 314572800, 600 | | worker (per bundle) |
+| DEPENDENCY_ALLOW_UNVERIFIED_INDEX | false | | worker (accept wheels whose sha256 the index does not publish; recorded as `unverified`; a mismatch always fails) |
+| DEPENDENCY_RESOLVER_NETWORK | aica-dep-resolver | | worker (`--internal` Docker network of the resolver; created if missing, refused if routable; only exit is the allow-list proxy) |
 | REFERENCE_ALLOWED_DOMAINS | (empty: tool disabled) | | worker (comma-separated domains for `fetch_reference`) |
 | REFERENCE_MAX_FETCHES, REFERENCE_MAX_BYTES, REFERENCE_TIMEOUT_SECONDS | 20, 1048576, 20 | | worker (per agent phase, per response, per request) |
 | DEEP_AGENT_RUN_TIMEOUT_SECONDS | 5400 | | worker (wall-clock budget per agent phase) |

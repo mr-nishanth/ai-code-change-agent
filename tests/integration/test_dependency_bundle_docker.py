@@ -16,7 +16,9 @@ import pytest
 from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, validate_requests
 from ai_code_change_agent.execution.docker.dependencies import DockerDependencyPreparer
 from ai_code_change_agent.execution.docker.dependency_mount import dependency_args
+from ai_code_change_agent.execution.docker.metadata_verifier import MetadataVerifier
 from ai_code_change_agent.execution.docker.process import SubprocessRunner
+from ai_code_change_agent.execution.docker.resolver_network import ResolverEgress, egress_hosts
 
 pytestmark = pytest.mark.docker
 IMAGE = os.environ.get("WORKSPACE_IMAGE", "ai-code-change-agent/execution-python:0.2.0")
@@ -56,8 +58,15 @@ def sandbox(site: str, script: str) -> subprocess.CompletedProcess[str]:
 
 
 def preparer(root: Path) -> DockerDependencyPreparer:
+    runner = SubprocessRunner()
     return DockerDependencyPreparer(
-        root=root, image=IMAGE, index_url=INDEX, runner=SubprocessRunner(), timeout_seconds=300
+        root=root,
+        image=IMAGE,
+        index_url=INDEX,
+        runner=runner,
+        egress=ResolverEgress(runner=runner, image=IMAGE, allow_hosts=egress_hosts(INDEX)),
+        verifier=MetadataVerifier(INDEX),
+        timeout_seconds=300,
     )
 
 
@@ -69,6 +78,10 @@ async def test_real_bundle_offline_install_cache_and_tamper_rejection(tmp_path: 
     assert [(p.name, p.version) for p in bundle.packages] == [("tabulate", "0.9.0")]
     meta = json.loads((root / bundle.key / "lock.json").read_text())
     assert meta["image_id"].startswith("sha256:") and len(meta["site_sha256"]) == 64
+    # every wheel was cross-checked against the hash PyPI publishes (PEP 691)
+    (check,) = meta["verification"]
+    assert check["source"] == "pep691_json"
+    assert check["published_sha256"] == check["sha256"] == bundle.packages[0].sha256
     lock = (root / bundle.key / "wheels" / "requirements.lock").read_text()
     assert lock.startswith("tabulate==0.9.0 --hash=sha256:" + bundle.packages[0].sha256)
 

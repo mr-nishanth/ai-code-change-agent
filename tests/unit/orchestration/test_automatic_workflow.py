@@ -203,3 +203,135 @@ async def test_manual_mode_still_waits_for_an_operator(tmp_path: Path) -> None:
     rig = await make_rig(tmp_path)
     assert await run(rig) is S.AWAITING_PLAN_APPROVAL
     assert await rig.deps.changes.approvals(rig.attempt_id) == []
+
+
+def _patch_baseline_files(rig: Any, extra_files: dict[str, bytes]) -> None:
+    from ai_code_change_agent.application.git_providers.baseline import VerifiedBaseline
+    from ai_code_change_agent.application.workspaces.models import BaselineFile
+
+    reader = rig.deps.baselines._readers.get("github")
+    merged = {**workflow.FILES, **extra_files}
+
+    async def custom_read(_repo: Any, commit_sha: str) -> VerifiedBaseline:
+        return VerifiedBaseline(
+            commit_sha, tuple(BaselineFile(p, c) for p, c in sorted(merged.items()))
+        )
+
+    reader.read = custom_read
+
+
+async def test_repository_pyproject_runtime_and_dev_dependencies_are_provisioned(
+    tmp_path: Path,
+) -> None:
+    preparer = FakePreparer(tmp_path / "deps")
+    rig = await make_rig(tmp_path, approval_mode="automatic", dependencies=preparer)
+    _patch_baseline_files(
+        rig,
+        {
+            "pyproject.toml": (
+                b'[project]\nname = "shop-service"\nversion = "0.1.0"\n'
+                b'requires-python = ">=3.12"\ndependencies = ["flask>=3.0"]\n'
+                b'[project.optional-dependencies]\ndev = ["pytest>=8.3"]\n'
+                b'docs = ["mkdocs>=1.6"]\n'
+            )
+        },
+    )
+    seen_story_deps: list[tuple[str, ...]] = []
+    orig_plan = rig.agent.plan
+
+    async def capture_plan(story: Any, sandbox: Any, **kw: Any) -> ImplementationPlan:
+        seen_story_deps.append(story.repository_dependencies)
+        return await orig_plan(story, sandbox, **kw)
+
+    rig.agent.plan = capture_plan  # type: ignore[method-assign]
+    assert await run(rig) is S.COMPLETED
+    assert seen_story_deps == [("flask>=3.0", "pytest>=8.3")]
+    assert [r.requirement() for r in preparer.calls[0]] == ["flask>=3.0", "pytest>=8.3"]
+    assert len(preparer.calls) == 2
+    attempt_kinds = await kinds(rig)
+    assert ArtifactKind.REPOSITORY_DEPENDENCIES in attempt_kinds
+    assert ArtifactKind.DEPENDENCY_LOCK in attempt_kinds
+
+
+async def test_requirements_merge_compatibly_with_plan_dependencies(tmp_path: Path) -> None:
+    preparer = FakePreparer(tmp_path / "deps")
+    rig = await make_rig(tmp_path, approval_mode="automatic", dependencies=preparer)
+    _patch_baseline_files(
+        rig,
+        {
+            "requirements.txt": b"flask>=3.0\n",
+            "requirements-dev.txt": b"pytest>=8.3\n",
+        },
+    )
+    workflow.FakeAgent.plan_result = plan_with(dependencies=["flask==3.1.0", "httpx>=0.28"])
+    try:
+        assert await run(rig) is S.COMPLETED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    assert [r.requirement() for r in preparer.calls[0]] == [
+        "flask==3.1.0,>=3.0",
+        "httpx>=0.28",
+        "pytest>=8.3",
+    ]
+
+
+async def test_conflicting_plan_dependency_vs_manifest_is_rejected(tmp_path: Path) -> None:
+    preparer = FakePreparer(tmp_path / "deps")
+    rig = await make_rig(tmp_path, approval_mode="automatic", dependencies=preparer)
+    _patch_baseline_files(rig, {"requirements.txt": b"flask==3.0.0\n"})
+    workflow.FakeAgent.plan_result = plan_with(dependencies=["flask==3.1.0"])
+    try:
+        assert await run(rig) is S.REJECTED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    assert preparer.calls == []
+    assert "dependency_conflict" in rig.reporter.reports[0][1]
+
+
+@pytest.mark.parametrize(
+    ("files", "expected_code"),
+    [
+        ({"requirements.txt": b"-e ../other\n"}, "dependency_manifest_invalid"),
+        (
+            {"pyproject.toml": b'[project]\nname = "x"\nrequires-python = ">=3.13"\n'},
+            "dependency_python_unsupported",
+        ),
+        (
+            {
+                "pyproject.toml": (
+                    b'[project]\nname = "x"\n'
+                    b"[tool.uv]\nrequired-environments = [\"sys_platform == 'darwin'\"]\n"
+                )
+            },
+            "dependency_platform_unsupported",
+        ),
+    ],
+)
+async def test_invalid_baseline_manifest_fails_fast_before_llm_plan(
+    tmp_path: Path, files: dict[str, bytes], expected_code: str
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    _patch_baseline_files(rig, files)
+    called = 0
+
+    async def fail_if_called(*_a: Any, **_k: Any) -> ImplementationPlan:
+        nonlocal called
+        called += 1
+        return workflow.PLAN
+
+    rig.agent.plan = fail_if_called  # type: ignore[method-assign]
+    assert await run(rig) is S.FAILED
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == expected_code
+    assert called == 0
+    assert rig.publisher.requests == []
+    assert expected_code in rig.reporter.reports[0][1]
+
+
+async def test_discovered_manifest_without_preparer_fails_closed(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    _patch_baseline_files(rig, {"requirements.txt": b"flask==3.1.0\n"})
+    assert await run(rig) is S.FAILED
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == "dependency_preparation_unavailable"
+    assert rig.publisher.requests == []

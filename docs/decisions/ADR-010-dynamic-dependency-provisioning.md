@@ -15,7 +15,7 @@
   4. The bundle is frozen read-only and renamed atomically to `ARTIFACT_ROOT/dependency-bundles/<key>`. The key is a sha256 of image + index + requests, and also serves as the cache. Every reuse re-hashes every wheel.
 - The bundle's `site` directory is mounted **read-only at `/opt/deps`** (`PYTHONPATH`, `PATH`) into the agent sandbox and the validation container. The runtime refuses any directory outside the bundle root. The sandbox and validation containers stay `--network none`.
 - The lock is recorded per attempt as a `dependency_lock` artifact.
-- **Egress limit of the resolver:** enforced by its fixed argv (single index), not by a firewall. A host egress rule restricting it to the index is a recommended operator hardening.
+- **Egress limit of the resolver:** enforced by Docker networking. The resolver runs only on an `--internal` network; its single exit is an allow-list CONNECT proxy (see *Production readiness* below).
 - Verified live (2026-11-25): `six==1.17.0` was resolved from PyPI (hash matches PyPI), cached (second call 0.0 s) and imported offline in a `--network none` container; the mount was read-only and outbound network was unavailable.
 
 ## Context
@@ -74,7 +74,7 @@ Approve B as an amendment to C2, implemented in the roadmap order of the design 
 
 ## Hardening and verified behaviour (2026-11-26)
 
-**Supported input (exactly this, nothing else).** The only dependency input is the `dependencies` list of the agent's implementation plan. Each entry is a PEP 508 name, optionally followed by version specifiers (`==`, `>=`, `~=`, ...). The policy refuses URLs, file paths, VCS references, extras, environment markers, pip options and duplicates (`dependency_request_invalid`, `dependency_conflict`). Repository files (`requirements.txt`, `pyproject.toml`, `uv.lock`) are **not** read: a repository's existing dependencies must already be in the execution image, otherwise its tests fail in the offline sandbox and the attempt fails. Nothing is ever installed from the network as a fallback.
+**Supported input.** Two sources, merged: (1) the repository's own manifests, discovered at planning (see *Production readiness* below), and (2) the `dependencies` list of the agent's plan. Each entry is a PEP 508 name with version specifiers; URLs, file paths, VCS references, pip options and conflicting duplicates are refused (`dependency_request_invalid`, `dependency_manifest_invalid`, `dependency_conflict`). Nothing is ever installed from the network as a fallback.
 
 **Resolution.** One resolver container (`pip download --only-binary=:all:`) runs in the execution image itself, so the Python version (3.12) and platform are the sandbox's. Transitive dependencies are resolved and every wheel is recorded in `requirements.lock` (`name==version --hash=sha256:...`). Only `DEPENDENCY_INDEX_URL` is used (https, no credentials, validated at start-up). Resolution is as deterministic as the index allows: an unpinned request can resolve to a newer release later; that produces a new lock, never a silent change of an existing bundle.
 
@@ -91,7 +91,28 @@ Approve B as an amendment to C2, implemented in the roadmap order of the design 
 **Verified against real Docker and PyPI** (`tests/integration/test_dependency_bundle_docker.py`): `tabulate==0.9.0` (not in the image) is resolved, hash-locked and installed offline. A `--network none`, read-only, non-root sandbox imports exactly 0.9.0, cannot open a socket and cannot write to `/opt/deps`. Without the bundle the import fails (no fetch). A second preparer reuses the cache. Two concurrent preparers publish one bundle. A modified file in `site/` is detected, quarantined and rebuilt. A non-existent version fails with `dependency_wheel_unavailable` and publishes nothing.
 
 **Known limitations.**
-- Hashes are generated from what the index served over HTTPS (trust on first download); the index's own published hashes are not cross-checked.
+- Published-hash verification trusts the index operator's own listing (same origin as the wheel, fetched independently by the worker over TLS). It does not detect a compromised index that rewrites both.
 - Wheels only: packages without a wheel for this platform are refused.
-- Resolver egress is restricted by argv (`--index-url`), not by a network policy; a host firewall is the operator's control.
+- A worker killed mid-preparation can leave its egress proxy container running until its `--lifetime` (preparation timeout + 120 s) expires; it is `--rm` and exits on its own.
+- `setup.py`, `setup.cfg`, `Pipfile` and `poetry.lock` are not read (reading `setup.py` would mean executing it); a repository with only those fails with `dependency_manifest_invalid`.
 - A live Jira-triggered Story that needs a new dependency has not been run (needs approval for a Story, model calls and a draft PR).
+
+## Production readiness (2026-11-26, second pass)
+
+**Repository manifest discovery** (`domain/dependencies/manifests.py`, run at planning, off the event loop, recorded as the `repository_dependencies` artifact). Files are read as data only (never executed), confined to the repository (no symlinks, FIFOs, `..` or absolute paths) and size-limited. Precedence: `uv.lock` (exact pins and hashes) > `pyproject.toml` (`[project]` dependencies, optional groups, `[dependency-groups]`) > requirements files.
+
+Requirements files (older projects): `requirements.txt`, `requirements-dev/test*.txt`, `requirements_dev.txt`, `test-/dev-requirements.txt`, and the `requirements/{base,common,prod,production}.txt` + `requirements/{dev,development,test,tests,testing}.txt` layout. Supported inside them: `-r` includes (depth and count limited), `-c` constraint files (narrow versions, never add packages; an incompatible constraint is `dependency_conflict`), `--hash=sha256:` pins (enforced against the downloaded wheel), environment markers (evaluated for the execution image), `-e .` / `.` (self install, skipped: tests run from the source tree) and `-i/--index-url` equal to the configured index. Refused: any other index, `--extra-index-url`, `--find-links`, `--trusted-host`, other `-e` targets, URLs, VCS and paths. Runtime and test/dev dependencies are recorded separately; both are provisioned because validation runs the tests.
+
+Checked against every branch of the registered repositories: `pyproject.toml` (automate_connector KAN-7, reynolds_connector KAN-8), `requirements.txt` (autoSoft_connector KAN-9), no manifest (all `master` branches, cdk_connector KAN-9, smoke branch).
+
+**Published-hash verification** (`execution/docker/metadata_verifier.py`). Before a bundle is published, the worker fetches the index's project page itself (HTTPS, certificate verified, redirects refused, 8 MiB cap) as PEP 691 JSON or PEP 503 HTML and requires every wheel filename to be listed with the identical sha256. A mismatch fails with `dependency_hash_mismatch`. A missing published hash or an unavailable page fails with `dependency_metadata_unavailable`, unless `DEPENDENCY_ALLOW_UNVERIFIED_INDEX=true`, in which case the wheel is recorded as `unverified`; a mismatch is never excused. Results are stored in `lock.json` (`verification`); a cached bundle without them is quarantined and rebuilt.
+
+**Resolver egress** (`execution/docker/resolver_network.py`, `egress_proxy.py`). The resolver runs on `DEPENDENCY_RESOLVER_NETWORK` (default `aica-dep-resolver`), which must be `--internal`: it is created if missing, and an existing non-internal network is refused. For each preparation a hardened proxy container (read-only, all capabilities dropped, uid 65534, 128 MiB, self-expiring) joins that network and the bridge. It allows only `CONNECT <host>:443` to the index host (plus `files.pythonhosted.org` for PyPI), never IP literals, and refuses names that resolve to non-public addresses.
+
+Measured with real Docker: direct connections to the internet, `host.docker.internal:5432` and `169.254.169.254` are unreachable; through the proxy only the index succeeds, while `example.com`, IP literals, plain HTTP and metadata are refused. The coding sandbox and the installer stay `--network none`.
+
+**Crash recovery** (`tests/integration/test_crash_recovery.py`). A separate worker process is killed with a real SIGKILL at each of these points: before download, mid-download (truncated wheel), during verification, mid-install, after freezing but before the rename, immediately before the rename, immediately after it, and after preparation but before the workflow records it. In every case no partial directory becomes a cache entry, an earlier valid bundle stays intact and is reused, and a fresh worker rebuilds the bundle or, once it is published, reuses it after full verification. Stale `.tmp-*` build directories older than twice the timeout are swept. Four concurrent worker processes publish exactly one bundle.
+
+**Multi-repository.** Bundles are keyed by image tag, image id (Python version and architecture), index and the exact requests including hashes. Incompatible environments therefore never share a bundle, while identical sets share one read-only, verified bundle. A dependency failure fails only that child: siblings stay completed, the parent reports PARTIALLY_COMPLETED with the code, and a retry re-queues only the failed child (`tests/unit/multirepo/test_multirepo.py`).
+
+New failure code: `dependency_metadata_unavailable`.

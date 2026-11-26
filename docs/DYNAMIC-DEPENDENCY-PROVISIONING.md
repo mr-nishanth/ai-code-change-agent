@@ -198,7 +198,7 @@ python -m pip check
    - an offline install command in the command policy (`pip install --no-index ...`, network none).
 6. **Configuration:** `DEPENDENCY_INDEX_URLS`, size and count limits, preparation timeout.
 7. **Docs:** update C2 in ARCHITECTURE-DECISIONS.md, plus SECURITY.md and ARCHITECTURE.md.
-8. **Egress restriction** for the resolver container (Docker network + proxy, or host firewall rule), verified by an integration test.
+8. **Egress restriction** for the resolver container: implemented (internal network + allow-list proxy) and verified by `tests/integration/test_resolver_network.py`; see ADR-010 *Production readiness*.
 
 ## 12. ADR C2 impact
 

@@ -42,7 +42,9 @@ from ai_code_change_agent.domain.repositories.command_policy import CommandPolic
 from ai_code_change_agent.domain.webhooks.policy import ScopePolicy
 from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.execution.docker.dependencies import DockerDependencyPreparer
+from ai_code_change_agent.execution.docker.metadata_verifier import MetadataVerifier
 from ai_code_change_agent.execution.docker.process import SubprocessRunner
+from ai_code_change_agent.execution.docker.resolver_network import ResolverEgress, egress_hosts
 from ai_code_change_agent.execution.docker.runtime import ContainerLimits, DockerWorkspaceRuntime
 from ai_code_change_agent.execution.docker.sandbox import SandboxLimits, SandboxManager
 from ai_code_change_agent.integrations.github.authentication import GitHubAppAuth
@@ -269,11 +271,23 @@ def dependency_root(settings: Settings) -> Path:
 
 
 def build_dependency_preparer(settings: Settings) -> DockerDependencyPreparer:
+    runner = SubprocessRunner()
     return DockerDependencyPreparer(
         root=dependency_root(settings),
         image=_image(settings),
         index_url=settings.dependency_index_url,
-        runner=SubprocessRunner(),
+        runner=runner,
+        egress=ResolverEgress(
+            runner=runner,
+            image=_image(settings),
+            allow_hosts=egress_hosts(settings.dependency_index_url),
+            network=settings.dependency_resolver_network,
+            lifetime_seconds=settings.dependency_timeout_seconds + 120,
+        ),
+        verifier=MetadataVerifier(
+            settings.dependency_index_url,
+            allow_unverified_index=settings.dependency_allow_unverified_index,
+        ),
         max_packages=settings.dependency_max_packages,
         max_bytes=settings.dependency_max_bytes,
         timeout_seconds=settings.dependency_timeout_seconds,
@@ -470,6 +484,8 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             agent_checkpointer=saver,
             dependencies=build_dependency_preparer(settings),
             approval_mode=settings.workflow_approval_mode,
+            max_dependency_packages=settings.dependency_max_packages,
+            dependency_index_url=settings.dependency_index_url,
             multirepo=coordinator,
             toolchains=frozenset(execution_images(settings)),
         )

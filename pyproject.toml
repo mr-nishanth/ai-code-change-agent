@@ -14,6 +14,7 @@ dependencies = [
     "alembic>=1.13",
     "structlog>=24.4",
     "httpx>=0.28.1",
+    "packaging>=24.0",
     "pyjwt[crypto]>=2.10",
     "langgraph>=1.2.24",
     "langgraph-checkpoint-postgres>=3.0",

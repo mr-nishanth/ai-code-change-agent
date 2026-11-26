@@ -44,12 +44,16 @@ intend to create, modify or delete, the tests you will add or update, the risks,
 Do not attempt to change files.
 PATHS: every path in the plan (`changes`, `tests`) is repository-relative, such as
 `app/main.py` or `tests/test_main.py`; never prefix it with /workspace or use an absolute path.
-DEPENDENCIES: check which Python packages are importable in the sandbox (for example
-`python -c "import fastapi"`). List in `dependencies` every package the implementation or its tests
-need that is missing, or whose version must change, as a plain requirement such as `flask` or
-`sqlalchemy==2.0.36` (no URLs, paths, extras, markers or comments). Leave it EMPTY when everything
-needed is already importable; never list installed packages. The platform prepares exactly these,
-offline, before implementation; nothing else can be installed later."""
+DEPENDENCIES: the platform automatically discovers and provisions runtime and test/dev
+dependencies declared in the repository's manifests (uv.lock, pyproject.toml, requirements*.txt)
+listed below when present. Check which Python packages are importable in the sandbox (for example
+`python -c "import fastapi"`). List in `dependencies` only additional packages or stricter
+compatible pins the implementation or its tests need that are missing from both the sandbox and
+the repository manifest, as a plain requirement such as `flask` or `sqlalchemy==2.0.36` (no URLs,
+paths, extras, markers or comments). Leave it EMPTY when everything needed is already importable
+or covered by the repository manifest; never duplicate already-installed packages unless tightening
+a constraint. The platform prepares the combined set, offline, before implementation; nothing else
+can be installed later."""
 )
 
 IMPLEMENTATION_SYSTEM = (
@@ -73,6 +77,12 @@ implementation report."""
 
 def _story_block(story: StoryContext) -> str:
     criteria = "\n".join(f"- {c}" for c in story.acceptance_criteria) or "(none given)"
+    repo_deps = (
+        "\nRepository manifest dependencies (already queued for offline provisioning): "
+        f"{', '.join(story.repository_dependencies)}."
+        if story.repository_dependencies
+        else ""
+    )
     return (
         f"Jira Story {story.issue_key} (UNTRUSTED DATA BEGINS)\n"
         f"Summary: {story.summary}\n"
@@ -82,6 +92,7 @@ def _story_block(story: StoryContext) -> str:
         f"Repository: {story.repository_key} at commit {story.base_commit_sha}.\n"
         f"Validation commands the platform will run independently: "
         f"{', '.join(story.validation_commands) or '(none configured)'}."
+        f"{repo_deps}"
     )
 
 

@@ -5,10 +5,12 @@ Runs in the worker (trusted control plane), never in the coding sandbox:
 1. a short-lived *resolver* container runs one fixed command, `pip download --only-binary=:all:`
    against the single configured index, for the validated requests only. It holds no
    application credentials, no workspace and no agent output, and has a read-only root
-   filesystem, all capabilities dropped and a non-root user. Its network egress is limited by
-   argv (`--index-url` only); a host firewall is the operator's further control;
+   filesystem, all capabilities dropped and a non-root user. It is attached only to an
+   `--internal` Docker network; its single way out is the allow-list egress proxy
+   (`resolver_network.py`), so egress is enforced by the network, not by pip arguments;
 2. the worker refuses anything that is not a wheel, enforces count and size limits, hashes every
-   file and writes `requirements.lock` (`name==version --hash=sha256:...`);
+   file, cross-checks every hash against the index's published metadata
+   (`metadata_verifier.py`) and writes `requirements.lock` (`name==version --hash=sha256:...`);
 3. an *installer* container with `--network none` runs
    `pip install --no-index --require-hashes --no-deps --target` from that lock. Installing a wheel
    executes no package code;
@@ -28,8 +30,12 @@ import json
 import os
 import shutil
 import stat
+import time
 import uuid
+from collections.abc import Iterable
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
+from typing import Any, Protocol
 
 from ai_code_change_agent.application.dependencies.ports import DependencyBundle, LockedPackage
 from ai_code_change_agent.core.logging import get_logger
@@ -39,9 +45,18 @@ from ai_code_change_agent.domain.dependencies.policy import (
     wheel_identity,
 )
 from ai_code_change_agent.execution.docker.process import ProcessRunner
+from ai_code_change_agent.execution.docker.resolver_network import ResolverRoute
 
 _log = get_logger("dependencies")
 _OUTPUT_CAP = 262_144
+
+
+class ResolverEgressPort(Protocol):
+    def route(self) -> AbstractAsyncContextManager[ResolverRoute]: ...
+
+
+class WheelVerifierPort(Protocol):
+    def verify(self, packages: Iterable[LockedPackage]) -> tuple[Any, ...]: ...
 
 
 def _sha256(path: Path) -> str:
@@ -88,6 +103,8 @@ class DockerDependencyPreparer:
         image: str,
         index_url: str,
         runner: ProcessRunner,
+        egress: ResolverEgressPort,
+        verifier: WheelVerifierPort,
         docker: str = "docker",
         max_packages: int = 60,
         max_bytes: int = 200 * 1024 * 1024,
@@ -99,6 +116,8 @@ class DockerDependencyPreparer:
         self._image = image
         self._index = index_url
         self._runner = runner
+        self._egress = egress
+        self._verifier = verifier
         self._docker = docker
         self._max_packages = max_packages
         self._max_bytes = max_bytes
@@ -133,7 +152,7 @@ class DockerDependencyPreparer:
             "image": self._image,
             "image_id": self._image_id,
             "index": self._index,
-            "requests": [r.requirement() for r in requests],
+            "requests": [r.cache_token() for r in requests],
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
@@ -147,7 +166,7 @@ class DockerDependencyPreparer:
             final = self._root / key
             if final.is_dir():
                 try:
-                    bundle = await asyncio.to_thread(self._verify, final, key)
+                    bundle = await asyncio.to_thread(self._verify, final, key, requests)
                 except DependencyPolicyError:
                     await asyncio.to_thread(self._quarantine, final, key)
                 else:
@@ -166,6 +185,7 @@ class DockerDependencyPreparer:
         self, key: str, requests: tuple[DependencyRequest, ...], final: Path
     ) -> DependencyBundle:
         self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        await asyncio.to_thread(self._sweep_stale)
         tmp = self._root / f".tmp-{key[:16]}-{uuid.uuid4().hex[:8]}"
         try:
             for sub in ("req", "wheels", "site"):
@@ -174,6 +194,8 @@ class DockerDependencyPreparer:
             (tmp / "req" / "requirements.in").write_text(text)
             await self._download(tmp)
             packages = await asyncio.to_thread(self._lock_wheels, tmp / "wheels")
+            self._verify_declared_hashes(requests, packages)
+            checks = await asyncio.to_thread(self._verifier.verify, packages)
             lock_text = "".join(
                 f"{p.name}=={p.version} --hash=sha256:{p.sha256}\n" for p in packages
             )
@@ -187,11 +209,12 @@ class DockerDependencyPreparer:
                 "key": key,
                 "image": self._image,
                 "index": self._index,
-                "requests": [r.requirement() for r in requests],
+                "requests": [r.cache_token() for r in requests],
                 "lock_sha256": lock_sha,
                 "site_sha256": site_sha,
                 "image_id": self._image_id,
                 "packages": [p.__dict__ for p in packages],
+                "verification": [c.as_dict() for c in checks],
             }
             (tmp / "lock.json").write_text(json.dumps(meta, indent=1, sort_keys=True))
             await asyncio.to_thread(_freeze, tmp)
@@ -201,18 +224,37 @@ class DockerDependencyPreparer:
                 if not await asyncio.to_thread(final.is_dir):
                     raise
             _log.info("dependency_bundle_prepared", key=key, packages=len(packages))
-            return await asyncio.to_thread(self._verify, final, key)
+            return await asyncio.to_thread(self._verify, final, key, requests)
         finally:
             if tmp.exists():
                 await asyncio.to_thread(_remove, tmp)
 
+    def _sweep_stale(self) -> None:
+        """Remove build directories left by a worker that died mid-build. Only directories older
+        than any live build could be (2x the container timeout) are touched; they are never
+        published or read, so this is housekeeping, not a correctness requirement."""
+        horizon = time.time() - 2 * self._timeout - 60
+        for path in self._root.glob(".tmp-*"):
+            try:
+                if path.stat().st_mtime < horizon:
+                    _remove(path)
+                    _log.info("dependency_stale_build_removed", path=path.name)
+            except OSError:
+                continue
+
     def _container(
-        self, name: str, *, network: bool, mounts: list[str], argv: list[str]
+        self,
+        name: str,
+        *,
+        network: str,
+        mounts: list[str],
+        argv: list[str],
+        env: tuple[str, ...] = (),
     ) -> list[str]:
         cli = [
             self._docker, "run", "--rm", "--pull", "never", "--name", name,
             "--label", "aica.managed=true", "--label", f"aica.role={name.split('-')[1]}",
-            "--network", "bridge" if network else "none",
+            "--network", network,
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "256", "--memory", "1024m", "--memory-swap", "1024m",
             "--user", f"{self._uid}:{self._gid}",
@@ -220,6 +262,8 @@ class DockerDependencyPreparer:
             "--env", "HOME=/tmp", "--env", "PIP_NO_CACHE_DIR=1",
             "--env", "PIP_DISABLE_PIP_VERSION_CHECK=1",
         ]  # fmt: skip
+        for item in env:
+            cli += ["--env", item]
         for mount in mounts:
             cli += ["--mount", mount]
         return [*cli, self._image, *argv]
@@ -233,6 +277,8 @@ class DockerDependencyPreparer:
             raise DependencyPolicyError("dependency_preparation_timeout")
         if result.exit_code != 0:
             out = (result.stdout or b"") + (result.stderr or b"")
+            if b"Invalid requirement" in out:
+                raise DependencyPolicyError("dependency_request_invalid")
             if b"No matching distribution" in out or b"Could not find a version" in out:
                 raise DependencyPolicyError("dependency_wheel_unavailable")
             if b"ResolutionImpossible" in out or b"conflicting dependencies" in out:
@@ -243,17 +289,23 @@ class DockerDependencyPreparer:
         return result.stdout or b""
 
     async def _download(self, tmp: Path) -> None:
+        async with self._egress.route() as route:
+            await self._download_via(tmp, route)
+
+    async def _download_via(self, tmp: Path, route: ResolverRoute) -> None:
         name = f"aica-resolver-{uuid.uuid4().hex[:10]}"
         argv = self._container(
             name,
-            network=True,
+            network=route.network,
+            env=(f"HTTPS_PROXY={route.proxy_url}", f"HTTP_PROXY={route.proxy_url}", "NO_PROXY="),
             mounts=[
                 f"type=bind,src={tmp / 'req'},dst=/req,readonly",
                 f"type=bind,src={tmp / 'wheels'},dst=/wheels",
             ],
             argv=[
                 "python", "-m", "pip", "download", "--only-binary=:all:", "--no-cache-dir",
-                "--index-url", self._index, "--dest", "/wheels", "-r", "/req/requirements.in",
+                "--index-url", self._index, "--proxy", route.proxy_url,
+                "--dest", "/wheels", "-r", "/req/requirements.in",
             ],
         )  # fmt: skip
         await self._run(argv, "dependency_preparation_failed")
@@ -262,7 +314,7 @@ class DockerDependencyPreparer:
         name = f"aica-installer-{uuid.uuid4().hex[:10]}"
         argv = self._container(
             name,
-            network=False,
+            network="none",
             mounts=[
                 f"type=bind,src={tmp / 'wheels'},dst=/deps,readonly",
                 f"type=bind,src={tmp / 'site'},dst=/site",
@@ -296,7 +348,25 @@ class DockerDependencyPreparer:
             raise DependencyPolicyError("dependency_conflict")
         return tuple(packages)
 
-    def _verify(self, final: Path, key: str) -> DependencyBundle:
+    def _verify_declared_hashes(
+        self, requests: tuple[DependencyRequest, ...], packages: tuple[LockedPackage, ...]
+    ) -> None:
+        by_name = {p.name: p for p in packages}
+        for req in requests:
+            if not req.hashes:
+                continue
+            pkg = by_name.get(req.name)
+            if pkg is None:
+                raise DependencyPolicyError("dependency_wheel_unavailable")
+            if pkg.sha256 not in req.hashes:
+                raise DependencyPolicyError("dependency_hash_mismatch")
+
+    def _verify(
+        self,
+        final: Path,
+        key: str,
+        requests: tuple[DependencyRequest, ...] | None = None,
+    ) -> DependencyBundle:
         try:
             meta = json.loads((final / "lock.json").read_text())
             packages = tuple(LockedPackage(**p) for p in meta["packages"])
@@ -307,12 +377,22 @@ class DockerDependencyPreparer:
             "lock_sha256"
         ):
             raise DependencyPolicyError("dependency_bundle_corrupted")
+        if requests is not None and meta.get("requests") != [r.cache_token() for r in requests]:
+            raise DependencyPolicyError("dependency_bundle_corrupted")
         present = {p.name for p in (final / "wheels").iterdir() if p.suffix == ".whl"}
         if present != {p.filename for p in packages}:
             raise DependencyPolicyError("dependency_bundle_corrupted")
         for p in packages:
             if _sha256(final / "wheels" / p.filename) != p.sha256:
                 raise DependencyPolicyError("dependency_bundle_corrupted")
+        checks = meta.get("verification")
+        checked = (
+            sorted(str(c.get("filename")) for c in checks if isinstance(c, dict))
+            if isinstance(checks, list)
+            else None
+        )
+        if checked != sorted(p.filename for p in packages):
+            raise DependencyPolicyError("dependency_bundle_corrupted")  # never cross-checked
         site = final / "site"
         if not site.is_dir() or meta.get("site_sha256") != _tree_digest(site)[0]:
             raise DependencyPolicyError("dependency_bundle_corrupted")

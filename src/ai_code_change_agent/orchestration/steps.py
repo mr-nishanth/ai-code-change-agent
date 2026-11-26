@@ -10,12 +10,12 @@ import hashlib
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ai_code_change_agent.agents.coding.configuration import MultiRepoBrief, StoryContext
 from ai_code_change_agent.agents.coding.schemas import ImplementationPlan, ImplementationReport
@@ -56,7 +56,16 @@ from ai_code_change_agent.domain.changes.models import (
     CodeChangeAttempt,
 )
 from ai_code_change_agent.domain.changes.states import TERMINAL, AttemptStatus
-from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, validate_requests
+from ai_code_change_agent.domain.dependencies.manifests import (
+    CategorizedDependencies,
+    ManifestDiscoveryResult,
+    discover_repository_dependencies,
+    merge_dependency_requests,
+)
+from ai_code_change_agent.domain.dependencies.policy import (
+    DependencyPolicyError,
+    DependencyRequest,
+)
 from ai_code_change_agent.domain.repositories.command_policy import CommandKind
 from ai_code_change_agent.domain.repositories.models import MappingStatus, RepositoryStatus
 from ai_code_change_agent.domain.repositories.profile import RepositoryProfile
@@ -124,6 +133,73 @@ class DependencyLockDoc(BaseModel):
     key: str
     lock_sha256: str
     packages: list[dict[str, Any]]
+    sources: list[str] = Field(default_factory=list)
+    categories: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class SerializedDependencyRequest(BaseModel):
+    name: str
+    specifiers: list[str] = Field(default_factory=list)
+    extras: list[str] = Field(default_factory=list)
+    hashes: list[str] = Field(default_factory=list)
+
+    def to_request(self) -> DependencyRequest:
+        return DependencyRequest(
+            name=self.name,
+            specifiers=tuple(self.specifiers),
+            extras=tuple(self.extras),
+            hashes=tuple(self.hashes),
+        )
+
+    @classmethod
+    def from_request(cls, req: DependencyRequest) -> "SerializedDependencyRequest":
+        return cls(
+            name=req.name,
+            specifiers=list(req.specifiers),
+            extras=list(req.extras),
+            hashes=list(req.hashes),
+        )
+
+
+class RepositoryDependenciesDoc(BaseModel):
+    source_kind: Literal["uv.lock", "pyproject.toml", "requirements.txt", "none"] = "none"
+    sources: list[str] = Field(default_factory=list)
+    requires_python: str | None = None
+    runtime: list[SerializedDependencyRequest] = Field(default_factory=list)
+    test_dev: list[SerializedDependencyRequest] = Field(default_factory=list)
+    optional: dict[str, list[SerializedDependencyRequest]] = Field(default_factory=dict)
+    build_system: list[str] = Field(default_factory=list)
+    provisioned: list[SerializedDependencyRequest] = Field(default_factory=list)
+
+    @classmethod
+    def from_result(cls, res: ManifestDiscoveryResult) -> "RepositoryDependenciesDoc":
+        return cls(
+            source_kind=res.source_kind,
+            sources=list(res.sources),
+            requires_python=res.requires_python,
+            runtime=[SerializedDependencyRequest.from_request(r) for r in res.categories.runtime],
+            test_dev=[SerializedDependencyRequest.from_request(r) for r in res.categories.test_dev],
+            optional={
+                k: [SerializedDependencyRequest.from_request(r) for r in v]
+                for k, v in res.categories.optional.items()
+            },
+            build_system=list(res.build_system),
+            provisioned=[SerializedDependencyRequest.from_request(r) for r in res.provisioned],
+        )
+
+    def to_result(self) -> ManifestDiscoveryResult:
+        return ManifestDiscoveryResult(
+            source_kind=self.source_kind,
+            sources=tuple(self.sources),
+            requires_python=self.requires_python,
+            categories=CategorizedDependencies(
+                runtime=tuple(r.to_request() for r in self.runtime),
+                test_dev=tuple(r.to_request() for r in self.test_dev),
+                optional={k: tuple(r.to_request() for r in v) for k, v in self.optional.items()},
+            ),
+            build_system=tuple(self.build_system),
+            provisioned=tuple(r.to_request() for r in self.provisioned),
+        )
 
 
 class AutomaticDecisionDoc(BaseModel):
@@ -191,6 +267,7 @@ class StepDependencies:
     dependencies: DependencyPreparer | None = None
     approval_mode: str = "manual"  # composition passes WORKFLOW_APPROVAL_MODE (default automatic)
     max_dependency_packages: int = 30
+    dependency_index_url: str = "https://pypi.org/simple"  # the only index a manifest may name
     multirepo: Any = None  # Coordinator: child context and parent-level Jira reporting
     infra_retry_delays: tuple[float, ...] = (2.0, 8.0)  # transient Git host failures
 
@@ -296,12 +373,29 @@ class CodeChangeSteps:
                 await self._d.sandboxes.stop(sandbox)
             await self._d.runtime.destroy(handle)
 
-    async def _latest(self, a: CodeChangeAttempt, kind: ArtifactKind) -> tuple[str, str]:
+    async def _latest_optional(
+        self, a: CodeChangeAttempt, kind: ArtifactKind
+    ) -> tuple[str, str] | None:
         metas = [m for m in await self._d.artifacts.list(self._scope(a)) if m.kind is kind]
         if not metas:
-            raise InvalidTransitionError(f"{kind.value}_missing")
+            return None
         latest = max(metas, key=lambda m: (m.created_at, m.id))
         return latest.id, latest.sha256
+
+    async def _latest(self, a: CodeChangeAttempt, kind: ArtifactKind) -> tuple[str, str]:
+        latest = await self._latest_optional(a, kind)
+        if latest is None:
+            raise InvalidTransitionError(f"{kind.value}_missing")
+        return latest
+
+    async def _discovered(self, a: CodeChangeAttempt) -> ManifestDiscoveryResult:
+        latest = await self._latest_optional(a, ArtifactKind.REPOSITORY_DEPENDENCIES)
+        if latest is None:
+            return ManifestDiscoveryResult()
+        doc = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], RepositoryDependenciesDoc
+        )
+        return doc.to_result()
 
     # ----- steps -----------------------------------------------------------------------------
     async def prepare(self, attempt_id: uuid.UUID) -> StepResult:
@@ -332,13 +426,32 @@ class CodeChangeSteps:
             return StepResult(a.status.value)
         try:
             story = await self._story(a)
-            async with self._workspace(a, writable=False) as (_handle, sandbox):
+            async with self._workspace(a, writable=False) as (handle, sandbox):
+                discovered = await asyncio.to_thread(
+                    discover_repository_dependencies,
+                    self._d.runtime.tree_path(handle, "baseline"),
+                    max_packages=self._d.max_dependency_packages,
+                    expected_index_url=self._d.dependency_index_url,
+                )
+                if discovered.provisioned:
+                    story = replace(
+                        story,
+                        repository_dependencies=tuple(
+                            r.requirement() for r in discovered.provisioned
+                        ),
+                    )
                 plan = await self._d.agent.plan(
                     story,
                     sandbox,
                     thread_id=f"attempt:{a.id}:planning:{uuid.uuid4().hex[:8]}",  # fresh per run
                     checkpointer=self._d.agent_checkpointer,
                 )
+            await store_model(
+                self._d.artifacts,
+                self._scope(a),
+                ArtifactKind.REPOSITORY_DEPENDENCIES,
+                RepositoryDependenciesDoc.from_result(discovered),
+            )
             stored = await store_model(
                 self._d.artifacts, self._scope(a), ArtifactKind.IMPLEMENTATION_PLAN, plan
             )
@@ -387,10 +500,13 @@ class CodeChangeSteps:
         plan = await load_verified(
             self._d.artifacts, self._scope(a), a.plan_ref, a.plan_sha256, ImplementationPlan
         )
+        discovered = await self._discovered(a)
         profile = (await self._d.profiles.get(a.profile_version_id)).profile
         reasons: list[str] = []
         try:
-            validate_requests(plan.dependencies, max_packages=self._d.max_dependency_packages)
+            merge_dependency_requests(
+                discovered, plan.dependencies, max_packages=self._d.max_dependency_packages
+            )
         except DependencyPolicyError as exc:
             reasons.append(exc.code)
         if len(plan.changes) > profile.limits.max_files_changed:
@@ -430,9 +546,11 @@ class CodeChangeSteps:
             reasons.append("tests_not_executed_and_passed")
         return reasons
 
-    async def _bundle(self, plan: ImplementationPlan) -> DependencyBundle | None:
-        requests = validate_requests(
-            plan.dependencies, max_packages=self._d.max_dependency_packages
+    async def _bundle(
+        self, plan: ImplementationPlan, discovered: ManifestDiscoveryResult
+    ) -> DependencyBundle | None:
+        requests = merge_dependency_requests(
+            discovered, plan.dependencies, max_packages=self._d.max_dependency_packages
         )
         if not requests:
             return None
@@ -451,8 +569,9 @@ class CodeChangeSteps:
             plan = await load_verified(
                 self._d.artifacts, self._scope(a), a.plan_ref, a.plan_sha256, ImplementationPlan
             )
+            discovered = await self._discovered(a)
             story = await self._story(a)
-            bundle = await self._bundle(plan)
+            bundle = await self._bundle(plan, discovered)
             if bundle is not None:
                 await store_model(
                     self._d.artifacts,
@@ -462,8 +581,16 @@ class CodeChangeSteps:
                         key=bundle.key,
                         lock_sha256=bundle.lock_sha256,
                         packages=[p.__dict__ for p in bundle.packages],
+                        sources=list(discovered.sources),
+                        categories={
+                            "runtime": [r.requirement() for r in discovered.categories.runtime],
+                            "test_dev": [r.requirement() for r in discovered.categories.test_dev],
+                            "plan": list(plan.dependencies),
+                        },
                     ),
                 )
+            elif await self._latest_optional(a, ArtifactKind.DEPENDENCY_LOCK) is not None:
+                raise DependencyPolicyError("dependency_bundle_changed")
             async with self._workspace(
                 a, writable=True, dependency_dir=bundle.site_dir if bundle else None
             ) as (handle, sandbox):
@@ -519,7 +646,8 @@ class CodeChangeSteps:
             changes = doc.changes()
             loaded = await self._d.profiles.get(a.profile_version_id)
             commit = a.base_commit_sha
-            bundle = await self._bundle(plan)  # the same verified bundle (cache hit)
+            discovered = await self._discovered(a)
+            bundle = await self._bundle(plan, discovered)  # the same verified bundle (cache hit)
             if bundle is not None:  # validation must use exactly what the agent worked with
                 lock_ref, lock_sha = await self._latest(a, ArtifactKind.DEPENDENCY_LOCK)
                 used = await load_verified(
@@ -527,6 +655,8 @@ class CodeChangeSteps:
                 )
                 if used.lock_sha256 != bundle.lock_sha256:
                     raise DependencyPolicyError("dependency_bundle_changed")
+            elif await self._latest_optional(a, ArtifactKind.DEPENDENCY_LOCK) is not None:
+                raise DependencyPolicyError("dependency_bundle_changed")
 
             async def fresh_baseline() -> Any:
                 # Transient Git host failures (5xx, 429, timeouts) are retried with backoff here,

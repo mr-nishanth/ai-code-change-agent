@@ -235,3 +235,18 @@ def test_dependency_notes_are_stripped_but_requirements_stay_strict() -> None:
         PLAN.model_dump() | {"dependencies": ["httpx==0.28.1 (already installed)", "flask"]}
     )
     assert plan.dependencies == ["httpx==0.28.1", "flask"]
+
+
+def test_repository_dependencies_render_only_when_present() -> None:
+    from dataclasses import replace
+
+    without = planning_task(STORY)
+    assert "Repository manifest dependencies" not in without
+    with_deps = planning_task(
+        replace(STORY, repository_dependencies=("fastapi>=0.115", "pytest>=8.3"))
+    )
+    assert (
+        "Repository manifest dependencies (already queued for offline provisioning): "
+        "fastapi>=0.115, pytest>=8.3." in with_deps
+    )
+    assert "uv.lock, pyproject.toml, requirements*.txt" in PLANNING_SYSTEM

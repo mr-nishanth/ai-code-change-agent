@@ -261,7 +261,12 @@ def make(denied: set[str] | None = None) -> tuple[Coordinator, MemStore, Queue, 
 
 
 async def finish(
-    store: MemStore, coordinator: Coordinator, key: str, status: ChildStatus, contract: bool = True
+    store: MemStore,
+    coordinator: Coordinator,
+    key: str,
+    status: ChildStatus,
+    contract: bool = True,
+    failure_code: str = "validation_failed",
 ) -> None:
     child = next(c for c in store.children.values() if c.repository_key == key)
     fields: dict[str, Any] = {"status": status}
@@ -270,7 +275,7 @@ async def finish(
         if contract:
             fields |= {"contract_ref": "art_x", "contract_sha256": "a" * 64}
     else:
-        fields["failure_code"] = "validation_failed"
+        fields["failure_code"] = failure_code
     await store.update_child(
         child.id, frozenset({ChildStatus.QUEUED, ChildStatus.RUNNING}), **fields
     )
@@ -485,6 +490,27 @@ async def test_failed_child_with_successful_sibling_reports_partial_not_complete
     assert "Execution: PARTIALLY_COMPLETED" in text and "Execution: COMPLETED" not in text
     assert "Reason: validation_failed" in text and "retry-child" in text
     assert store.parents[parent.id].status is ParentStatus.PARTIALLY_COMPLETED
+
+
+@pytest.mark.parametrize(
+    "code", ["dependency_conflict", "dependency_hash_mismatch", "dependency_metadata_unavailable"]
+)
+async def test_a_dependency_failure_in_one_repository_keeps_the_sibling_and_retries_alone(
+    code: str,
+) -> None:
+    coordinator, store, queue, reporter = make()
+    story = "Repository: acme/backend-api\nRepository: acme/web-app\n"
+    await coordinator.start(uuid.uuid4(), "SHOP-101", "SHOP", parse_story(story))
+    await finish(store, coordinator, "backend-api", ChildStatus.COMPLETED)
+    await finish(store, coordinator, "web-app", ChildStatus.FAILED, failure_code=code)
+    text = reporter.texts[-1][1]
+    assert "Execution: PARTIALLY_COMPLETED" in text and f"Reason: {code}" in text
+    web = next(c for c in store.children.values() if c.repository_key == "web-app")
+    jobs_before = len(queue.jobs)
+    await coordinator.retry(web.id)
+    assert len(queue.jobs) == jobs_before + 1  # only the failed repository is re-queued
+    backend = next(c for c in store.children.values() if c.repository_key == "backend-api")
+    assert backend.status is ChildStatus.COMPLETED and backend.runs == 0
 
 
 async def test_missing_pr_url_is_reported_as_not_recorded() -> None:

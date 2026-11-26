@@ -30,6 +30,7 @@ K = ArtifactKind
 REFUSE_ON_SECRET: frozenset[ArtifactKind] = frozenset(
     {
         K.REPOSITORY_SNAPSHOT,
+        K.REPOSITORY_DEPENDENCIES,
         K.IMPLEMENTATION_PLAN,
         K.CHANGESET,
         K.DELIVERY_MANIFEST,

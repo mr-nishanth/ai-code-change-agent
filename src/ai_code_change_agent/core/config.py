@@ -138,6 +138,12 @@ class Settings(BaseSettings):
     dependency_max_packages: int = Field(default=60, ge=1, le=500)  # resolved wheels per bundle
     dependency_max_bytes: int = Field(default=300 * 1024 * 1024, ge=1024 * 1024, le=4 * 1024**3)
     dependency_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    # accept wheels whose sha256 the index does not publish (recorded "unverified"); off by default
+    dependency_allow_unverified_index: bool = False
+    # --internal Docker network of the resolver; its only egress is the allow-list proxy
+    dependency_resolver_network: str = Field(
+        default="aica-dep-resolver", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$"
+    )
 
     # ---- reference fetching (ADR-011): the agent's harness-side web fetch ---------------------
     # Empty list = the tool is not offered. Domains match exactly or as a parent of subdomains.

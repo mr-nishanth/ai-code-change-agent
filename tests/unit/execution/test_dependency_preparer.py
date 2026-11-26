@@ -9,9 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, validate_requests
+from ai_code_change_agent.domain.dependencies.policy import (
+    DependencyPolicyError,
+    DependencyRequest,
+    validate_requests,
+)
 from ai_code_change_agent.execution.docker.dependencies import DockerDependencyPreparer
 from ai_code_change_agent.execution.docker.process import ProcessResult
+from tests.support.dependency_fakes import TEST_NETWORK, TEST_PROXY, PublishedVerifier, StaticEgress
 
 IMAGE = "ai-code-change-agent/execution-python:0.2.0"
 
@@ -61,6 +66,8 @@ def preparer(tmp_path: Path, docker: FakeDocker, **kw: object) -> DockerDependen
         image=IMAGE,
         index_url="https://pypi.org/simple",
         runner=docker,
+        egress=kw.pop("egress", StaticEgress()),  # type: ignore[arg-type]
+        verifier=kw.pop("verifier", PublishedVerifier()),  # type: ignore[arg-type]
         uid=1000,
         gid=1000,
         **kw,  # type: ignore[arg-type]
@@ -69,6 +76,50 @@ def preparer(tmp_path: Path, docker: FakeDocker, **kw: object) -> DockerDependen
 
 def req(*names: str):  # type: ignore[no-untyped-def]
     return validate_requests(list(names), max_packages=10)
+
+
+async def test_a_wheel_whose_published_hash_differs_is_never_published(tmp_path: Path) -> None:
+    verifier = PublishedVerifier({"flask-3.1.0-py3-none-any.whl": "f" * 64})
+    with pytest.raises(DependencyPolicyError, match="dependency_hash_mismatch"):
+        await preparer(tmp_path, FakeDocker(), verifier=verifier).prepare(req("flask==3.1.0"))
+    assert [p.name for p in (tmp_path / "deps").iterdir() if not p.name.startswith(".")] == []
+
+
+async def test_unpublished_metadata_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(DependencyPolicyError, match="dependency_metadata_unavailable"):
+        await preparer(tmp_path, FakeDocker(), verifier=PublishedVerifier({})).prepare(
+            req("flask==3.1.0")
+        )
+
+
+async def test_a_cached_bundle_without_verification_records_is_rebuilt(tmp_path: Path) -> None:
+    docker = FakeDocker()
+    bundle = await preparer(tmp_path, docker).prepare(req("flask==3.1.0"))
+    assert bundle is not None
+    final = tmp_path / "deps" / bundle.key
+    meta = final / "lock.json"
+    final.chmod(0o755)
+    meta.chmod(0o644)
+    data = json.loads(meta.read_text())
+    data.pop("verification")
+    meta.write_text(json.dumps(data))
+    verifier = PublishedVerifier()
+    again = await preparer(tmp_path, FakeDocker(), verifier=verifier).prepare(req("flask==3.1.0"))
+    assert again is not None and verifier.calls == 1  # rebuilt and cross-checked again
+    assert [p for p in (tmp_path / "deps").iterdir() if p.name.startswith(".corrupt-")]
+
+
+async def test_stale_build_directories_of_a_dead_worker_are_swept(tmp_path: Path) -> None:
+    import os
+
+    root = tmp_path / "deps"
+    stale = root / ".tmp-dead-worker"
+    fresh = root / ".tmp-live-worker"
+    for d in (stale, fresh):
+        (d / "wheels").mkdir(parents=True)
+    os.utime(stale, (0, 0))
+    await preparer(tmp_path, FakeDocker(), timeout_seconds=10).prepare(req("flask==3.1.0"))
+    assert not stale.exists() and fresh.exists()
 
 
 async def test_nothing_requested_needs_no_bundle(tmp_path: Path) -> None:
@@ -95,7 +146,9 @@ async def test_a_bundle_is_locked_installed_offline_frozen_and_reused(tmp_path: 
     assert bundle.site_dir == str(final / "site") and (final / "site" / "flask").is_dir()
     assert not (final.stat().st_mode & stat.S_IWUSR)  # immutable
     resolver, installer = docker.calls
-    assert resolver[resolver.index("--network") + 1] == "bridge"
+    assert resolver[resolver.index("--network") + 1] == TEST_NETWORK  # internal, never bridge
+    assert resolver[resolver.index("--proxy") + 1] == TEST_PROXY
+    assert f"HTTPS_PROXY={TEST_PROXY}" in resolver
     assert "--only-binary=:all:" in resolver and resolver[resolver.index("--index-url") + 1] == (
         "https://pypi.org/simple"
     )
@@ -113,7 +166,12 @@ async def test_a_bundle_is_locked_installed_offline_frozen_and_reused(tmp_path: 
 async def test_the_cache_key_covers_requests_image_and_index(tmp_path: Path) -> None:
     a = preparer(tmp_path, FakeDocker())
     b = DockerDependencyPreparer(
-        root=tmp_path, image=IMAGE, index_url="https://mirror.example/simple", runner=FakeDocker()
+        root=tmp_path,
+        image=IMAGE,
+        index_url="https://mirror.example/simple",
+        runner=FakeDocker(),
+        egress=StaticEgress(),
+        verifier=PublishedVerifier(),
     )
     assert a.key(req("flask")) != a.key(req("flask==3.1.0")) != b.key(req("flask"))
     assert a.key(req("flask", "click")) == a.key(req("click", "flask"))
@@ -275,8 +333,39 @@ async def test_docker_unavailable(tmp_path: Path) -> None:
             raise OSError
 
     prep = DockerDependencyPreparer(
-        root=tmp_path, image=IMAGE, index_url="https://pypi.org/simple", runner=Broken()
+        root=tmp_path,
+        image=IMAGE,
+        index_url="https://pypi.org/simple",
+        runner=Broken(),
+        egress=StaticEgress(),
+        verifier=PublishedVerifier(),
     )
     with pytest.raises(DependencyPolicyError, match="dependency_preparation_failed"):
         await prep.prepare(req("x"))
     assert "pypi.org" in repr(prep)
+
+
+async def test_extras_and_declared_hashes_are_verified_and_keyed(tmp_path: Path) -> None:
+    wheel_bytes = b"UVICORN_WHEEL"
+    good_hash = hashlib.sha256(wheel_bytes).hexdigest()
+    docker = FakeDocker({"uvicorn-0.30.0-py3-none-any.whl": wheel_bytes})
+    prep = preparer(tmp_path, docker)
+
+    pinned = (DependencyRequest("uvicorn", (">=0.30",), extras=("standard",), hashes=(good_hash,)),)
+    other_pin = (
+        DependencyRequest("uvicorn", (">=0.30",), extras=("standard",), hashes=("0" * 64,)),
+    )
+    assert prep.key(pinned) != prep.key(other_pin)
+
+    bundle = await prep.prepare(pinned)
+    assert bundle is not None and bundle.packages[0].sha256 == good_hash
+
+    with pytest.raises(DependencyPolicyError, match="dependency_hash_mismatch"):
+        await prep.prepare(other_pin)
+    assert not (tmp_path / "deps" / prep.key(other_pin)).exists()
+
+
+async def test_invalid_requirement_stderr_is_classified(tmp_path: Path) -> None:
+    docker = FakeDocker(fail=b"ERROR: Invalid requirement: 'bad=='")
+    with pytest.raises(DependencyPolicyError, match="dependency_request_invalid"):
+        await preparer(tmp_path, docker).prepare(req("x"))
