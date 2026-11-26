@@ -87,3 +87,21 @@ What the run exercised:
 - per-repository cost: $0.4261 backend, $0.0089 client.
 
 The backend cost includes a planning loop (176 structured-output retries) that is now prevented; see LLM-COST-TRACKING.md, "Runaway-cost guards".
+'
+
+## Verified live run: KAN-10 (2026-11-26)
+
+Story "Shared vehicle lookup contract across three connectors", created in Jira project KAN at 12:47:31 UTC; parent `baddad59-2ce6-4019-ab9d-e27ebbf19b32` COMPLETED at 12:51:49 UTC (about 4.5 minutes). Haiku (`claude-haiku-5-5`), automatic approval mode, `$2` per phase.
+
+| Repository | Role | Attempt | Order (worker time) | Tests (offline) | Contract sha256 | Draft PR |
+|---|---|---|---|---|---|---|
+| reynolds_connector | backend | `111a8a7e` | 18:17:39 to 18:18:57 | 16 passed | `a66b3aea7e26...` | reynolds_connector#2 |
+| automate_connector | client | `a2d47163` | 18:19:04 to 18:20:38 | 22 passed | `d17cd99962e8...` | automate_connector#3 |
+| autoSoft_connector | worker | `2aa6eb60` | 18:20:44 to 18:21:50 | 18 passed | (no dependents) | autoSoft_connector#2 |
+
+- **Order:** each child started only after its upstream job succeeded, and each downstream plan used the upstream contract (the client'\''s plan quotes the backend'\''s VehicleRecord contract; the worker'\''s the client'\''s interface). The contract artifacts'\'' content hashes equal the hashes stored on the children.
+- **Dependencies:** the client'\''s plan requested `httpx`, `pytest` and `tenacity`. A bundle (key `18d20a90...`, 13 wheels including `tenacity==9.2.1`) was resolved through the internal resolver network and egress proxy, and every wheel'\''s sha256 matched PyPI'\''s published PEP 691 hash (9 of 13 have a PEP 740 attestation published, recorded but not verified). The bundle is read-only and validation reused it (cache hit).
+- **GitHub (read back through the API):** three open **draft** PRs on new `aica/kan-10-*` branches against `master`, one commit each, no auto-merge, exactly one KAN-10 PR per repository.
+- **Jira (read back through the API):** exactly one comment (`10010`) with three repository results, three PR links, Validation PASSED, the two published contract hashes, total LLM cost $0.0265; `jira_report=SUCCEEDED` and `jira_comment_id=10010` persisted on the parent.
+- **Cost:** reynolds $0.0099, automate $0.0100, autosoft $0.0067 (36 model calls in total). The research tools were registered but the agents did not call them in this run (the Story needed no external documentation); agent-driven use is shown separately in ADR-011.
+'
