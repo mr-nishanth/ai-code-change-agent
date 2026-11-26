@@ -1,0 +1,5 @@
+from app.greeting import greet
+
+
+def test_greet_returns_hello() -> None:
+    assert greet("Ada") == "Hello, Ada!"

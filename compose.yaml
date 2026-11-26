@@ -1,0 +1,57 @@
+# Local development stack for ai-code-change-agent (independent of any other project).
+# PostgreSQL holds the domain tables (public schema) and LangGraph checkpoints (langgraph schema).
+# The worker is NOT a service here: it runs on the host with `uv run ai-code-change worker`
+# because it controls the Docker daemon for execution sandboxes (see docs/ARCHITECTURE.md).
+name: ai-code-change-agent
+services:
+  postgres:
+    image: postgres:16
+    container_name: acca-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: acca
+      POSTGRES_PASSWORD: acca_dev_only
+      POSTGRES_DB: ai_code_change_agent
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - acca_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acca -d ai_code_change_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: acca-api
+    # Least privilege: the API only receives what webhook intake needs (values are interpolated
+    # from .env by compose). No GitHub App, LLM or Jira REST credentials enter this container.
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+psycopg://acca:acca_dev_only@postgres:5432/ai_code_change_agent
+      JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-}
+      JIRA_PROJECT_KEYS: ${JIRA_PROJECT_KEYS:-}
+      JIRA_STORY_ISSUE_TYPES: ${JIRA_STORY_ISSUE_TYPES:-Story}
+      JIRA_WEBHOOK_EVENT: ${JIRA_WEBHOOK_EVENT:-jira:issue_created}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  acca_pgdata:

@@ -1,0 +1,6 @@
+"""Small greeting helper used as a generic fixture repository."""
+
+
+def greet(name: str) -> str:
+    """Return a greeting for `name`."""
+    return f"Hello, {name}!"

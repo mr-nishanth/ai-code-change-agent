@@ -1,0 +1,13 @@
+# Tools available to validation commands inside the workspace image (Python family of the platform
+# command policy: pytest, ruff, mypy). Add a tool here only if CommandPolicy allows its executable.
+pytest
+ruff
+mypy
+# Web stack for repositories whose approved plan builds a FastAPI service (added for KAN-7, whose
+# stored plan declares FastAPI/Uvicorn/Pydantic at runtime and httpx for FastAPI's TestClient).
+# Installed at BUILD time only; the sandbox stays network-less (ADR C2). Dynamic per-repository
+# provisioning is proposed in docs/decisions/ADR-010-dynamic-dependency-provisioning.md.
+fastapi
+uvicorn
+pydantic
+httpx
