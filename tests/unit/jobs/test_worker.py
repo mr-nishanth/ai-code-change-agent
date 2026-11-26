@@ -1,0 +1,143 @@
+"""Worker behaviour over an in-memory queue double."""
+
+import asyncio
+import uuid
+from typing import Any
+
+import pytest
+
+from ai_code_change_agent.application.jobs.queue import (
+    Job,
+    JobFailedError,
+    JobRetryableError,
+    JobStatus,
+)
+from ai_code_change_agent.application.jobs.worker import Worker, backoff_seconds
+
+
+class MemoryQueue:
+    def __init__(self, jobs: list[Job] | None = None, *, keep_lease: bool = True) -> None:
+        self.jobs = list(jobs or [])
+        self.keep_lease = keep_lease
+        self.completed: list[uuid.UUID] = []
+        self.failed: list[tuple[uuid.UUID, str, int | None]] = []
+        self.beats = 0
+
+    async def enqueue(
+        self, kind: str, payload: dict[str, Any], *, dedupe_key: str, max_attempts: int
+    ) -> bool:
+        self.jobs.append(Job(uuid.uuid4(), kind, payload, 0, max_attempts))
+        return True
+
+    async def claim(self, owner: str, lease_seconds: int) -> Job | None:
+        return self.jobs.pop(0) if self.jobs else None
+
+    async def heartbeat(self, job_id: uuid.UUID, owner: str, lease_seconds: int) -> bool:
+        self.beats += 1
+        return self.keep_lease
+
+    async def complete(self, job_id: uuid.UUID, owner: str) -> bool:
+        self.completed.append(job_id)
+        return True
+
+    async def fail(
+        self, job_id: uuid.UUID, owner: str, code: str, *, retry_in_seconds: int | None
+    ) -> JobStatus:
+        self.failed.append((job_id, code, retry_in_seconds))
+        return JobStatus.QUEUED if retry_in_seconds is not None else JobStatus.DEAD
+
+
+def job(kind: str = "k.one", attempts: int = 1) -> Job:
+    return Job(uuid.uuid4(), kind, {}, attempts, 3)
+
+
+def worker(queue: MemoryQueue, handlers: dict[str, Any], beat: float = 30) -> Worker:
+    return Worker(queue, handlers, lease_seconds=60, heartbeat_seconds=beat, poll_seconds=0.01)
+
+
+async def test_success_completes_the_job() -> None:
+    seen: list[Job] = []
+
+    async def ok(j: Job) -> None:
+        seen.append(j)
+
+    q = MemoryQueue([job()])
+    assert await worker(q, {"k.one": ok}).run_once() is not None
+    assert len(seen) == 1 and len(q.completed) == 1 and q.failed == []
+    assert await worker(q, {"k.one": ok}).run_once() is None  # nothing left
+
+
+@pytest.mark.parametrize(
+    ("exc", "code", "retry"),
+    [(JobRetryableError("jira_unavailable"), "jira_unavailable", 30),
+     (RuntimeError("raw text never stored"), "RuntimeError", 30),
+     (JobFailedError("repository_unknown"), "repository_unknown", None)],
+)  # fmt: skip
+async def test_failures_are_classified(exc: Exception, code: str, retry: int | None) -> None:
+    async def bad(j: Job) -> None:
+        raise exc
+
+    q = MemoryQueue([job()])
+    await worker(q, {"k.one": bad}).run_once()
+    assert q.failed[0][1:] == (code, retry) and q.completed == []
+
+
+async def test_an_unknown_kind_is_dead_at_once() -> None:
+    q = MemoryQueue([job("k.unknown")])
+    await worker(q, {}).run_once()
+    assert q.failed[0][1:] == ("no_handler", None)
+
+
+async def test_a_lost_lease_cancels_the_handler_and_records_nothing() -> None:
+    started = asyncio.Event()
+
+    async def slow(j: Job) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    q = MemoryQueue([job()], keep_lease=False)
+    await worker(q, {"k.one": slow}, beat=0.01).run_once()
+    assert started.is_set() and q.completed == [] and q.failed == [] and q.beats == 1
+
+
+async def test_heartbeats_keep_long_jobs_alive() -> None:
+    async def medium(j: Job) -> None:
+        await asyncio.sleep(0.05)
+
+    q = MemoryQueue([job()])
+    await worker(q, {"k.one": medium}, beat=0.01).run_once()
+    assert q.beats >= 2 and len(q.completed) == 1
+
+
+async def test_run_loop_respects_concurrency_and_stops() -> None:
+    running = 0
+    peak = 0
+
+    async def handler(j: Job) -> None:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.02)
+        running -= 1
+
+    q = MemoryQueue([job() for _ in range(6)])
+    w = Worker(
+        q,
+        {"k.one": handler},
+        lease_seconds=60,
+        heartbeat_seconds=30,
+        concurrency=2,
+        poll_seconds=0.01,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    while len(q.completed) < 6:  # noqa: ASYNC110 - polling a test double
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+    assert peak == 2 and len(q.completed) == 6
+
+
+def test_backoff_is_exponential_and_capped() -> None:
+    assert [backoff_seconds(n) for n in (1, 2, 3)] == [30, 60, 120]
+    assert backoff_seconds(30) == 900
