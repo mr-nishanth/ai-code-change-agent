@@ -92,7 +92,7 @@ The worker controls a container runtime, so it is privileged control plane. Opti
 
 Do not mount the Docker socket into a general-purpose container, and never into a sandbox.
 
-## Multi-repository Stories, toolchains and research (S2045)
+## Multi-repository Stories, toolchains and research
 
 ```
 Jira Story --webhook--> API --job--> worker: IntakeHandler

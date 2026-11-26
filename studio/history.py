@@ -240,7 +240,7 @@ async def attempts(limit: int = 50) -> dict[str, Any]:
                 "unknown_usage_calls": stats["unknown"] if stats else 0,
                 "tokens_in": stats["in"] if stats else 0,
                 "tokens_out": stats["out"] if stats else 0,
-                # None: no ledger yet (attempts before S2044)
+                # None: no ledger yet (attempts before cost tracking)
                 "cost_usd": f"{stats['cost']:.6f}" if stats else None,
                 "stage_costs": {k: f"{v:.6f}" for k, v in stats["stages"].items()} if stats else {},
                 "models": sorted(stats["models"]) if stats else [],

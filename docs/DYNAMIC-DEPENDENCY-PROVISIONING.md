@@ -1,6 +1,6 @@
-# Dynamic dependency provisioning (S2042)
+# Dynamic dependency provisioning
 
-Status: **implemented in S2043** in the simplified, automatic form recorded in [ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md): there is no human dependency approval; the automatic PLAN policy validates requests. The design below remains the reference; the roadmap items not yet built are the per-attempt image digest pin, a resolver egress firewall and an offline vulnerability audit.
+Status: **implemented** in the simplified, automatic form recorded in [ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md): there is no human dependency approval; the automatic PLAN policy validates requests. The design below remains the reference; the roadmap items not yet built are the per-attempt image digest pin, a resolver egress firewall and an offline vulnerability audit.
 
 Core principle: **the agent may request dependencies; only trusted infrastructure acquires, verifies and prepares them. The coding sandbox stays offline.**
 

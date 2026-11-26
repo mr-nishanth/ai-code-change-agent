@@ -1,4 +1,4 @@
-# Multi-repository Stories (S2045)
+# Multi-repository Stories
 
 One Jira Story can change several authorised repositories (backend, web, mobile, libraries). Each repository is changed by its own **child execution**. A **parent execution** coordinates them deterministically; no model makes coordination or authorisation decisions.
 

@@ -1,4 +1,4 @@
-"""LLM usage capture, pricing, persistence semantics and the terminal cost reports (S2044)."""
+"""LLM usage capture, pricing, persistence semantics and the terminal cost reports."""
 
 import json
 import uuid

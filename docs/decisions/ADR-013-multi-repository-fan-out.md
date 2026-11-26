@@ -1,6 +1,6 @@
 # ADR-013: Multi-repository Stories by parent/child fan-out
 
-Status: accepted (2026-11-26, S2045)
+Status: accepted (2026-11-26)
 
 ## Decision
 

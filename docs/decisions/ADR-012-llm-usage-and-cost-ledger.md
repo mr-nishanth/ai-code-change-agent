@@ -1,6 +1,6 @@
 # ADR-012: LLM usage and cost ledger
 
-Status: accepted (2026-11-25, S2044)
+Status: accepted (2026-11-25)
 
 ## Context
 

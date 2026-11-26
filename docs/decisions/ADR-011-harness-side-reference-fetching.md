@@ -1,6 +1,6 @@
 # ADR-011: Harness-side reference fetching for the coding agent
 
-- **Status:** Accepted (owner request, S2043) and implemented.
+- **Status:** Accepted (owner request) and implemented.
 - **Date:** 2026-11-25
 - **Amends:** C2 (agent tools) and the `tools=[]` guard in `tests/unit/test_architecture.py`.
 

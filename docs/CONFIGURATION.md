@@ -56,7 +56,7 @@ Requested names that are **deliberately absent**, because nothing uses them:
 - `LANGGRAPH_CHECKPOINT_CONFIGURATION`: replaced by `LANGGRAPH_CHECKPOINT_SCHEMA`.
 
 
-## Automated pipeline (S2043)
+## Automated pipeline
 
 | Variable | Default | Secret | Used by |
 |---|---|---|---|
@@ -85,7 +85,7 @@ The API container needs none of these. It still receives only the webhook settin
 The worker exports exactly these variables at start-up (`core/tracing.py`), removes legacy `LANGCHAIN_PROJECT`/`LANGCHAIN_SESSION` destinations and flushes traces at shutdown. Agent runs are named `coding-agent-<phase>` and carry `thread_id` (`attempt:<id>:<phase>`), `phase` metadata and tags, which child runs inherit. The API process never traces.
 
 
-## LLM cost tracking (S2044)
+## LLM cost tracking
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -108,7 +108,7 @@ Agent harness (from the Deep Agents docs review):
 - Every phase run gets a fresh agent thread, so a crash re-run never appends to stale history.
 
 
-## Multi-repository, toolchains, research and cost guards (S2045)
+## Multi-repository, toolchains, research and cost guards
 
 | Variable | Default | Notes |
 |---|---|---|

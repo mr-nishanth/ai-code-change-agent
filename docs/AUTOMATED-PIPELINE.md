@@ -1,4 +1,4 @@
-# Automated Jira-to-draft-PR pipeline (S2043)
+# Automated Jira-to-draft-PR pipeline
 
 An Ops user creates a Jira Story that names a repository. The platform plans, prepares dependencies, implements, validates, opens a **draft** pull request and comments on the Story, with no human step. The only human decision is reviewing and merging the draft PR. Nothing is ever merged automatically.
 

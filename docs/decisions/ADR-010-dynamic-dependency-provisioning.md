@@ -1,11 +1,11 @@
 # ADR-010: Dynamic dependency provisioning by trusted infrastructure
 
-- **Status:** Accepted by the owner in S2043 and implemented in its simplified form (below).
+- **Status:** Accepted by the owner and implemented in its simplified form (below).
 - **Date:** 2026-11-25
 - **Amends:** decision C2 (docs/ARCHITECTURE-DECISIONS.md)
 - **Details:** [DYNAMIC-DEPENDENCY-PROVISIONING.md](../DYNAMIC-DEPENDENCY-PROVISIONING.md)
 
-## Implemented form (S2043)
+## Implemented form
 
 - **No human dependency approval.** The plan's `dependencies` list (requirement strings) is validated by `domain/dependencies/policy.py`, which refuses URLs, paths, VCS refs, extras, markers, options, duplicates and over-limit counts. The automatic PLAN policy rejects invalid requests.
 - `execution/docker/dependencies.py::DockerDependencyPreparer` (port `application/dependencies/ports.py`):

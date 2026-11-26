@@ -25,7 +25,7 @@ Known residual risks:
 4. Revocation timing for already-issued GitHub installation tokens is GitHub behaviour and has not been verified.
 5. The model sees repository content, which may contain prompt injection. Controls are the quoting, the sandbox and independent validation; automatic policy gates and independent validation check every plan and result, and a human reviews every draft PR before merge.
 
-## S2045 additions
+## Multi-repository, research and cost guards
 
 - **Multi-repository authorisation:** every declared repository is resolved through the registry before any work. One failure blocks the whole Story: no clone, token or model call. A child's GitHub token is scoped to its own repository and never reaches an agent. Workspaces are never shared.
 - **Contracts:** they are read-only context for dependents. They are stored immutably, hash-checked on every use and refused if they contain a secret.

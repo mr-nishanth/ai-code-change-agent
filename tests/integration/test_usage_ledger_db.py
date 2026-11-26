@@ -1,4 +1,4 @@
-"""PostgreSQL usage ledger: idempotent inserts, append-only rows, joined report rows (S2044)."""
+"""PostgreSQL usage ledger: idempotent inserts, append-only rows, joined report rows."""
 
 import uuid
 from collections.abc import AsyncIterator

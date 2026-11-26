@@ -1,4 +1,4 @@
-# Toolchains and documentation research (S2045)
+# Toolchains and documentation research
 
 ## Toolchain execution images
 

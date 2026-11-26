@@ -1,4 +1,4 @@
-# LLM API usage and cost tracking (S2044)
+# LLM API usage and cost tracking
 
 Every model call made by the coding agent is captured and priced. The worker prints the cost in the terminal when an attempt finishes or crashes, and prints a session summary when it stops. The amounts are **LLM API cost only**: Docker, the database, GitHub, Jira and servers are not measured.
 
@@ -109,7 +109,7 @@ call_cost = input x input_rate + output x output_rate + cache_write_5m x w5 + ca
 - **Model:** every call used `claude-haiku-5-5`; no escalation.
 - **Pricing:** no call crossed the 100K long-context threshold.
 
-## Runaway-cost guards (S2045, any model)
+## Runaway-cost guards (any model)
 
 On KAN-9 the model kept sending one field in the wrong shape, and the SDK retried the structured answer 176 times ($0.40). These guards apply to every model (Haiku, Sonnet, Opus, Bedrock):
 
