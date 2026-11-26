@@ -11,6 +11,8 @@ not by pip arguments: a process in the resolver that ignores the proxy has no ro
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -27,6 +29,17 @@ _log = get_logger("resolver_network")
 DEFAULT_RESOLVER_NETWORK = "aica-dep-resolver"
 PROXY_SCRIPT = Path(__file__).with_name("egress_proxy.py")
 _PORT = 3128
+_HOST = socket.gethostname()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    return True
 
 
 @dataclass(frozen=True)
@@ -95,14 +108,40 @@ class ResolverEgress:
             _log.error("resolver_network_create_failed", output=out[-500:])
             raise DependencyPolicyError("dependency_preparation_failed")
 
+    async def reap_orphans(self) -> list[str]:
+        """Remove proxy containers whose owning worker process on THIS host is dead (killed
+        mid-preparation). Proxies of live workers, and of workers on other hosts, are never
+        touched; those expire on their own (--lifetime)."""
+        code, out = await self._docker_run(
+            "ps", "-a", "--filter", "label=aica.role=egress",
+            "--filter", f"label=aica.owner.host={_HOST}",
+            "--format", '{{.Names}} {{.Label "aica.owner.pid"}}',
+        )  # fmt: skip
+        if code != 0:
+            return []
+        removed: list[str] = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not parts[1].isdigit() or not parts[0].startswith("aica-egress-"):
+                continue
+            pid = int(parts[1])
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+            if (await self._docker_run("rm", "-f", parts[0]))[0] == 0:
+                removed.append(parts[0])
+                _log.warning("egress_proxy_orphan_removed", container=parts[0], owner_pid=pid)
+        return removed
+
     @asynccontextmanager
     async def route(self) -> AsyncIterator[ResolverRoute]:
         await self._ensure_network()
+        await self.reap_orphans()
         name = f"aica-egress-{uuid.uuid4().hex[:10]}"
         allow = [arg for h in sorted(self._allow) for arg in ("--allow", h)]
         code, out = await self._docker_run(
             "run", "-d", "--rm", "--pull", "never", "--name", name,
             "--label", "aica.managed=true", "--label", "aica.role=egress",
+            "--label", f"aica.owner.host={_HOST}", "--label", f"aica.owner.pid={os.getpid()}",
             "--network", self._network,
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "64", "--memory", "128m", "--user", "65534:65534",

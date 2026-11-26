@@ -51,13 +51,17 @@ class WheelVerification:
     sha256: str
     published_sha256: str | None
     source: Source
+    # PEP 740: the index lists a provenance (attestation) URL for this file. Recorded for audit
+    # only; the attestation itself is NOT cryptographically verified here (see ADR-010).
+    attestation_published: bool = False
 
-    def as_dict(self) -> dict[str, str | None]:
+    def as_dict(self) -> dict[str, str | bool | None]:
         return {
             "filename": self.filename,
             "sha256": self.sha256,
             "published_sha256": self.published_sha256,
             "source": self.source,
+            "attestation_published": self.attestation_published,
         }
 
 
@@ -71,6 +75,21 @@ def _https_fetch(url: str) -> tuple[int, str, bytes]:
                 if len(body) > _MAX_BYTES:
                     raise DependencyPolicyError(DependencyFailureCode.METADATA_UNAVAILABLE)
             return resp.status_code, resp.headers.get("content-type", ""), bytes(body)
+
+
+def attested_files(content_type: str, body: bytes) -> frozenset[str]:
+    """Filenames for which a PEP 691 JSON page lists a PEP 740 provenance URL."""
+    if content_type.split(";")[0].strip() != _JSON:
+        return frozenset()
+    import json
+
+    data = json.loads(body)
+    files = data.get("files", []) if isinstance(data, dict) else []
+    return frozenset(
+        f["filename"]
+        for f in files
+        if isinstance(f, dict) and isinstance(f.get("filename"), str) and f.get("provenance")
+    )
 
 
 def published_hashes(page_url: str, content_type: str, body: bytes) -> dict[str, str]:
@@ -112,7 +131,7 @@ class MetadataVerifier:
         self._allow_unverified = allow_unverified_index
         self._fetch = fetch or _https_fetch
 
-    def _page(self, name: str) -> tuple[str, dict[str, str]]:
+    def _page(self, name: str) -> tuple[str, dict[str, str], frozenset[str]]:
         url = urljoin(self._index, f"{canonicalize_name(name)}/")
         try:
             status, ctype, body = self._fetch(url)
@@ -126,18 +145,19 @@ class MetadataVerifier:
             raise DependencyPolicyError(DependencyFailureCode.METADATA_UNAVAILABLE)
         try:
             hashes = published_hashes(url, ctype, body)
+            attested = attested_files(ctype, body)
         except ValueError:
             raise DependencyPolicyError(DependencyFailureCode.METADATA_UNAVAILABLE) from None
         source = "pep691_json" if ctype.split(";")[0].strip() == _JSON else "pep503_html"
-        return source, hashes
+        return source, hashes, attested
 
     def verify(self, packages: Iterable[LockedPackage]) -> tuple[WheelVerification, ...]:
         results: list[WheelVerification] = []
-        pages: dict[str, tuple[str, dict[str, str]]] = {}
+        pages: dict[str, tuple[str, dict[str, str], frozenset[str]]] = {}
         for p in packages:
             if p.name not in pages:
                 pages[p.name] = self._page(p.name)
-            source, hashes = pages[p.name]
+            source, hashes, attested = pages[p.name]
             published = hashes.get(p.filename)
             if published is None:
                 if not self._allow_unverified:
@@ -149,5 +169,10 @@ class MetadataVerifier:
             if published != p.sha256:
                 _log.error("wheel_hash_mismatch", filename=p.filename, source=source)
                 raise DependencyPolicyError(DependencyFailureCode.HASH_MISMATCH)
-            results.append(WheelVerification(p.filename, p.sha256, published, source))  # type: ignore[arg-type]
+            results.append(
+                WheelVerification(
+                    p.filename, p.sha256, published, source,  # type: ignore[arg-type]
+                    attestation_published=p.filename in attested,
+                )
+            )  # fmt: skip
         return tuple(results)

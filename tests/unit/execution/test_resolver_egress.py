@@ -92,3 +92,36 @@ async def test_a_missing_network_is_created_internal_and_proxy_failure_fails_clo
 def test_an_empty_allow_list_is_rejected() -> None:
     with pytest.raises(ValueError, match="allowed host"):
         ResolverEgress(runner=Docker(), image="img", allow_hosts=frozenset())
+
+
+class PsDocker(Docker):
+    def __init__(self, listing: str) -> None:
+        super().__init__()
+        self.listing = listing
+
+    async def run(self, argv: Sequence[str], *, deadline: float, max_output: int) -> ProcessResult:
+        if list(argv)[1] == "ps":
+            self.calls.append(list(argv))
+            return ProcessResult(
+                exit_code=0, stdout=self.listing.encode(), stderr=b"", truncated=False,
+                timed_out=False,
+            )  # fmt: skip
+        return await super().run(argv, deadline=deadline, max_output=max_output)
+
+
+async def test_only_proxies_of_dead_local_workers_are_reaped() -> None:
+    import os
+
+    dead = 2**22 + 12345  # beyond any pid in use
+    listing = (
+        f"aica-egress-dead {dead}\naica-egress-live {os.getppid()}\n"
+        f"aica-egress-mine {os.getpid()}\nother-container {dead}\naica-egress-bad x\n"
+    )
+    docker = PsDocker(listing)
+    egress = ResolverEgress(runner=docker, image="img", allow_hosts=ALLOW)
+    assert await egress.reap_orphans() == ["aica-egress-dead"]
+    ps = docker.calls[0]
+    assert "label=aica.role=egress" in ps and any(
+        a.startswith("label=aica.owner.host=") for a in ps
+    )
+    assert [c for c in docker.calls if c[1] == "rm"] == [["docker", "rm", "-f", "aica-egress-dead"]]

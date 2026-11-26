@@ -99,3 +99,21 @@ def test_published_hashes_ignores_malformed_entries() -> None:
         {"files": ["x", {"filename": "a.whl", "hashes": {"sha256": "short"}}, {"filename": 1}]}
     ).encode()
     assert published_hashes("https://i/simple/a/", JSON_CT, body) == {}
+
+
+def test_pep740_attestation_availability_is_recorded_not_claimed_verified() -> None:
+    body = json.dumps(
+        {
+            "files": [
+                {
+                    "filename": WHEEL,
+                    "hashes": {"sha256": SHA},
+                    "provenance": "https://pypi.org/integrity/six/1.16.0/x/provenance",
+                }
+            ]
+        }
+    ).encode()
+    (res,) = MetadataVerifier(INDEX, fetch=fetcher(200, JSON_CT, body)).verify([PKG])
+    assert res.attestation_published and res.as_dict()["attestation_published"] is True
+    (plain,) = MetadataVerifier(INDEX, fetch=fetcher(200, JSON_CT, json_page())).verify([PKG])
+    assert not plain.attestation_published

@@ -1,4 +1,4 @@
-# ruff: noqa: S607, ASYNC221 - test drives the docker CLI
+# ruff: noqa: S607, ASYNC221, ASYNC240 - test drives the docker CLI
 """Real Docker: the resolver's only way out is the allow-list egress proxy (ADR-010).
 
 A container on the resolver route has no direct route to the internet, the Docker host
@@ -30,6 +30,7 @@ def t(label, f):
 t("direct_ip", lambda: socket.create_connection(("1.1.1.1", 443), timeout=3))
 t("direct_metadata", lambda: socket.create_connection(("169.254.169.254", 80), timeout=3))
 t("direct_host", lambda: socket.create_connection(("host.docker.internal", 5432), timeout=3))
+t("direct_docker_api", lambda: socket.create_connection(("host.docker.internal", 2375), timeout=3))
 t("direct_pypi", lambda: socket.create_connection(("pypi.org", 443), timeout=3))
 P = os.environ["HTTPS_PROXY"]
 op = urllib.request.build_opener(urllib.request.ProxyHandler({"https": P, "http": P}))
@@ -70,6 +71,7 @@ async def test_resolver_route_allows_only_the_index_through_the_proxy() -> None:
         "direct_ip": "BLOCKED",
         "direct_metadata": "BLOCKED",
         "direct_host": "BLOCKED",
+        "direct_docker_api": "BLOCKED",
         "direct_pypi": "BLOCKED",
         "proxy_index": "OPEN" if _index_reachable() else "BLOCKED",
         "proxy_other_host": "BLOCKED",
@@ -93,3 +95,24 @@ def _index_reachable() -> bool:
     except Exception:
         return False
     return True
+
+
+async def test_a_proxy_left_by_a_sigkilled_worker_is_removed_by_the_next_route() -> None:
+    import signal
+    import sys
+    from pathlib import Path
+
+    crashed = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "tests.support.egress_crash_worker", IMAGE, NETWORK],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=120,
+        check=False,
+    )  # fmt: skip
+    assert crashed.returncode == -signal.SIGKILL, crashed.stderr[-2000:]
+    orphan = crashed.stdout.split()[0]
+    assert _ok("docker", "container", "inspect", orphan)  # left running by the dead worker
+    egress = ResolverEgress(
+        runner=SubprocessRunner(), image=IMAGE, allow_hosts=egress_hosts("https://pypi.org/simple"),
+        network=NETWORK,
+    )  # fmt: skip
+    async with egress.route():
+        assert not _ok("docker", "container", "inspect", orphan)  # reaped before use
