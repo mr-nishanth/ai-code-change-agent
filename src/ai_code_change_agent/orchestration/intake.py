@@ -14,10 +14,12 @@ from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
+    REPORT_JOB,
     Coordinator,
     MultiRepoBlockedError,
+    ReportRetryableError,
 )
-from ai_code_change_agent.application.multirepo.models import ChildStatus
+from ai_code_change_agent.application.multirepo.models import ChildStatus, ReportState
 from ai_code_change_agent.application.repositories.resolver import (
     RepositoryResolver,
     build_resolution_request,
@@ -27,6 +29,7 @@ from ai_code_change_agent.domain.changes.multirepo import DeclarationError, pars
 INTAKE = "code_change.intake"
 RESUME = "code_change.resume"
 CHILD = CHILD_JOB
+PARENT_REPORT = REPORT_JOB
 REPOSITORY_FIELD = "repository"  # logical name of the configured Jira custom field
 Launch = Callable[[uuid.UUID], Awaitable[Any]]
 
@@ -154,6 +157,24 @@ class ChildHandler:
         finished = await self._changes.get_attempt(attempt.id)
         if finished.terminal:
             await self._coordinator.child_finished(child.id, finished)
+
+
+class ParentReportHandler:
+    """Retries the aggregated Jira comment of a multi-repository parent (never re-runs a child).
+    A retryable outcome raises, so the job queue backs off and runs it again; a worker crash
+    leaves the job leased, and the next claim reconciles with Jira before any new POST."""
+
+    def __init__(self, *, coordinator: Coordinator) -> None:
+        self._coordinator = coordinator
+
+    async def __call__(self, job: Job) -> None:
+        try:
+            parent_id = uuid.UUID(str(job.payload["parent_id"]))
+        except (KeyError, ValueError):
+            raise JobFailedError("payload_invalid") from None
+        state = await self._coordinator.report(parent_id)
+        if state is ReportState.RETRYABLE_FAILURE:
+            raise ReportRetryableError("jira_report_retryable")
 
 
 class ResumeHandler:

@@ -1,9 +1,10 @@
 """PostgreSQL store for multi-repository parents and children (compare-and-set updates)."""
 
 import uuid
+from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -12,6 +13,8 @@ from ai_code_change_agent.application.multirepo.models import (
     ChildStatus,
     Parent,
     ParentStatus,
+    ReportClaim,
+    ReportState,
 )
 from ai_code_change_agent.persistence.models.multirepo import (
     CodeChangeChildModel,
@@ -32,6 +35,10 @@ def _parent(m: CodeChangeParentModel) -> Parent:
         dict(m.declaration),
         m.report_round,
         m.jira_report,
+        m.jira_comment_id,
+        m.jira_report_attempts,
+        m.jira_report_error,
+        m.completed_at,
     )
 
 
@@ -177,6 +184,9 @@ class PostgresMultiRepoStore:
         if fields.get("reopen"):
             values["completed_at"] = None
             values["jira_report"] = None
+            values["jira_comment_id"] = None
+            values["jira_report_attempts"] = 0
+            values["jira_report_error"] = None
             values["report_round"] = CodeChangeParentModel.report_round + 1
         async with self._sessions() as session, session.begin():
             done = (
@@ -192,27 +202,61 @@ class PostgresMultiRepoStore:
             ).scalar_one_or_none()
         return done is not None
 
-    async def claim_report(self, parent_id: uuid.UUID) -> bool:
+    async def claim_report(self, parent_id: uuid.UUID, stale_seconds: int) -> ReportClaim | None:
+        m = CodeChangeParentModel
+        claimable = or_(
+            m.jira_report.is_(None),
+            m.jira_report.in_([ReportState.PENDING.value, ReportState.RETRYABLE_FAILURE.value]),
+            and_(
+                m.jira_report == ReportState.IN_PROGRESS.value,
+                m.jira_report_at < func.now() - timedelta(seconds=stale_seconds),
+            ),
+        )
         async with self._sessions() as session, session.begin():
-            done = (
+            previous = (
                 await session.execute(
-                    update(CodeChangeParentModel)
-                    .where(
-                        CodeChangeParentModel.id == parent_id,
-                        CodeChangeParentModel.jira_report.is_(None),
-                    )
-                    .values(jira_report="POSTING")
-                    .returning(CodeChangeParentModel.id)
+                    select(m.jira_report).where(m.id == parent_id).with_for_update()
                 )
             ).scalar_one_or_none()
-        return done is not None
+            row = (
+                await session.execute(
+                    update(m)
+                    .where(m.id == parent_id, claimable)
+                    .values(
+                        jira_report=ReportState.IN_PROGRESS.value,
+                        jira_report_attempts=m.jira_report_attempts + 1,
+                        jira_report_at=func.now(),
+                    )
+                    .returning(m.report_round, m.jira_report_attempts)
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        return ReportClaim(row[0], ReportState(previous or ReportState.PENDING), row[1])
 
-    async def finish_report(self, parent_id: uuid.UUID, posted: bool) -> None:
+    async def finish_report(
+        self,
+        parent_id: uuid.UUID,
+        state: ReportState,
+        *,
+        comment_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        values: dict[str, Any] = {
+            "jira_report": state.value,
+            "jira_report_error": error,
+            "jira_report_at": func.now(),
+        }
+        if comment_id is not None:
+            values["jira_comment_id"] = comment_id
         async with self._sessions() as session, session.begin():
             await session.execute(
                 update(CodeChangeParentModel)
-                .where(CodeChangeParentModel.id == parent_id)
-                .values(jira_report="POSTED" if posted else None)  # a failed post may be retried
+                .where(
+                    CodeChangeParentModel.id == parent_id,
+                    CodeChangeParentModel.jira_report == ReportState.IN_PROGRESS.value,
+                )
+                .values(**values)
             )
 
     async def set_request_status(self, request_id: uuid.UUID, status: str) -> None:

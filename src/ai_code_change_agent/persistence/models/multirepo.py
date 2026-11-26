@@ -22,6 +22,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 from ai_code_change_agent.persistence.models.base import Base
 
 PARENT_STATES = ("RUNNING", "COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "BLOCKED")
+REPORT_STATES = (
+    "PENDING", "IN_PROGRESS", "SUCCEEDED", "RETRYABLE_FAILURE", "PERMANENT_FAILURE", "DISABLED",
+)  # fmt: skip
 CHILD_STATES = ("WAITING", "QUEUED", "RUNNING", "COMPLETED", "FAILED", "REJECTED", "BLOCKED")
 
 
@@ -31,7 +34,15 @@ def _in(values: tuple[str, ...]) -> str:
 
 class CodeChangeParentModel(Base):
     __tablename__ = "code_change_parents"
-    __table_args__ = (CheckConstraint(_in(PARENT_STATES), name="status_valid"),)
+    __table_args__ = (
+        CheckConstraint(_in(PARENT_STATES), name="status_valid"),
+        CheckConstraint(
+            "jira_report IS NULL OR jira_report IN ("
+            + ", ".join(repr(s) for s in REPORT_STATES)
+            + ")",
+            name="jira_report_valid",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
     request_id: Mapped[uuid.UUID] = mapped_column(
@@ -40,7 +51,11 @@ class CodeChangeParentModel(Base):
     status: Mapped[str] = mapped_column(String(32))
     declaration: Mapped[dict[str, Any]] = mapped_column(JSONB)
     report_round: Mapped[int] = mapped_column(Integer, server_default="0")
-    jira_report: Mapped[str | None] = mapped_column(String(16))
+    jira_report: Mapped[str | None] = mapped_column(String(24))  # ReportState; NULL = PENDING
+    jira_comment_id: Mapped[str | None] = mapped_column(String(32))
+    jira_report_attempts: Mapped[int] = mapped_column(Integer, server_default="0")
+    jira_report_error: Mapped[str | None] = mapped_column(String(120))
+    jira_report_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

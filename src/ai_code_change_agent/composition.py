@@ -62,9 +62,11 @@ from ai_code_change_agent.integrations.web.search import AnthropicDocumentSearch
 from ai_code_change_agent.orchestration.intake import (
     CHILD,
     INTAKE,
+    PARENT_REPORT,
     RESUME,
     ChildHandler,
     IntakeHandler,
+    ParentReportHandler,
     ResumeHandler,
 )
 from ai_code_change_agent.orchestration.langgraph.checkpointer import postgres_checkpointer
@@ -325,9 +327,9 @@ def build_reference_tools(
 
 
 def execution_images(settings: Settings) -> dict[str, str]:
-    """Toolchain family -> execution image: python from WORKSPACE_IMAGE, others from
-    WORKSPACE_IMAGES. A profile whose toolchain has no image is BLOCKED before any work."""
-    return {"python": _image(settings), **settings.workspace_images}
+    """Toolchain family -> execution image. Repository execution is Python only, so the single
+    entry is WORKSPACE_IMAGE; a profile declaring another toolchain is BLOCKED before any work."""
+    return {"python": _image(settings)}
 
 
 def build_sandbox_manager(settings: Settings) -> SandboxManager:
@@ -486,6 +488,7 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             CHILD: ChildHandler(
                 coordinator=coordinator, changes=changes, start=costs.around(runner.start)
             ),
+            PARENT_REPORT: ParentReportHandler(coordinator=coordinator),
         }
         worker = Worker(
             PostgresJobQueue(sessions),

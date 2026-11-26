@@ -45,7 +45,7 @@ The rebuilt tree must equal baseline + changes. Also checked: path safety, prote
 | Dependency failure | `dependency_*` code (wheel unavailable, conflict, Python unsupported, limit, corrupted bundle) → attempt FAILED, Jira comment; nothing falls back to network |
 | Validation failure | Bounded repair with the validator's feedback, then FAILED; nothing is published |
 | GitHub timeout or unknown outcome | The publisher re-reads remote state before every write and reconciles; create-only refs; no duplicate branch, commit or PR |
-| Jira comment | At most one per attempt outcome (`jira_report` artifact marker); a reporting failure never changes the outcome |
+| Jira comment | At most one per attempt outcome (`jira_report` artifact marker); multi-repository parents: one per report round, with a durable lifecycle and Report-ID reconciliation ([MULTI-REPOSITORY.md](MULTI-REPOSITORY.md#jira-reporting-parent-story)); a reporting failure never changes the outcome |
 | Security or policy failures | Never retried automatically |
 | Re-running a Story | A new attempt is created only by a new intake job; it adopts the newest published profile |
 

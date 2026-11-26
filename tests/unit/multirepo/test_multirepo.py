@@ -8,14 +8,18 @@ import pytest
 
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
+    REPORT_JOB,
     Coordinator,
     MultiRepoBlockedError,
+    report_marker,
 )
 from ai_code_change_agent.application.multirepo.models import (
     Child,
     ChildStatus,
     Parent,
     ParentStatus,
+    ReportClaim,
+    ReportState,
 )
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
@@ -26,6 +30,7 @@ from ai_code_change_agent.domain.repositories.resolution import (
     ResolutionOutcome,
     ResolutionResult,
 )
+from ai_code_change_agent.integrations.jira.reporting import CommentResult, CommentStatus
 
 STORY = """Implement order tracking across the existing applications.
 
@@ -93,6 +98,7 @@ class MemStore:
         self.children: dict[uuid.UUID, Child] = {}
         self.request_status: dict[uuid.UUID, str] = {}
         self.reports = 0
+        self.stale = False  # simulate an IN_PROGRESS claim whose worker crashed
 
     async def create(self, parent: Parent, children: list[Child]) -> tuple[Parent, list[Child]]:
         found = await self.find_by_request(parent.request_id)
@@ -142,17 +148,33 @@ class MemStore:
         self.parents[parent_id] = replace(p, status=f.get("status", p.status), jira_report=jira)
         return True
 
-    async def claim_report(self, parent_id: uuid.UUID) -> bool:
+    async def claim_report(self, parent_id: uuid.UUID, stale_seconds: int) -> ReportClaim | None:
         p = self.parents[parent_id]
-        if p.jira_report is not None:
-            return False
-        self.parents[parent_id] = replace(p, jira_report="POSTING")
-        return True
-
-    async def finish_report(self, parent_id: uuid.UUID, posted: bool) -> None:
-        self.reports += int(posted)
+        previous = ReportState(p.jira_report or "PENDING")
+        stale = previous is ReportState.IN_PROGRESS and self.stale
+        if previous not in (ReportState.PENDING, ReportState.RETRYABLE_FAILURE) and not stale:
+            return None
+        attempts = p.jira_report_attempts + 1
         self.parents[parent_id] = replace(
-            self.parents[parent_id], jira_report="POSTED" if posted else None
+            p, jira_report="IN_PROGRESS", jira_report_attempts=attempts
+        )
+        return ReportClaim(p.report_round, previous, attempts)
+
+    async def finish_report(
+        self,
+        parent_id: uuid.UUID,
+        state: ReportState,
+        *,
+        comment_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.reports += int(state is ReportState.SUCCEEDED)
+        p = self.parents[parent_id]
+        self.parents[parent_id] = replace(
+            p,
+            jira_report=state.value,
+            jira_comment_id=comment_id or p.jira_comment_id,
+            jira_report_error=error,
         )
 
     async def set_request_status(self, request_id: uuid.UUID, status: str) -> None:
@@ -188,12 +210,37 @@ class Resolver:
 
 
 class Reporter:
+    """Fake Jira: records POSTs; outcomes scripted per call; comments searchable by text."""
+
     def __init__(self) -> None:
         self.texts: list[tuple[str, str]] = []
+        self.outcomes: list[CommentResult] = []  # next POST results (default: 201)
+        self.lookup: CommentResult | None = None  # forced lookup result (e.g. 503)
+        self.lookups = 0
+        self.lost_response = False  # Jira creates the comment but the response is lost
 
     async def report(self, issue_key: str, text: str) -> str:
         self.texts.append((issue_key, text))
         return "POSTED"
+
+    async def post_comment(self, issue_key: str, text: str) -> CommentResult:
+        if self.outcomes:
+            result = self.outcomes.pop(0)
+            if result.status is not CommentStatus.POSTED and not self.lost_response:
+                return result
+            self.texts.append((issue_key, text))
+            return result
+        self.texts.append((issue_key, text))
+        return CommentResult(CommentStatus.POSTED, comment_id=str(10000 + len(self.texts)))
+
+    async def find_comment(self, issue_key: str, marker: str) -> CommentResult | None:
+        self.lookups += 1
+        if self.lookup is not None:
+            return self.lookup
+        for i, (key, text) in enumerate(self.texts):
+            if key == issue_key and marker in text:
+                return CommentResult(CommentStatus.POSTED, comment_id=str(10001 + i))
+        return None
 
 
 class Changes:
@@ -311,3 +358,160 @@ async def test_too_many_repositories_and_cycles_are_refused() -> None:
     with pytest.raises(MultiRepoBlockedError) as err:
         await coordinator.start(uuid.uuid4(), "SHOP-2", "SHOP", parse_story(cyc))
     assert "dependency_cycle" in err.value.report and queue.jobs == {}
+
+
+# ---- Jira reporting lifecycle -----------------------------------------------------------------
+
+
+async def finished_parent(
+    outcomes: list[CommentResult] | None = None, *, lost_response: bool = False
+) -> tuple[Coordinator, MemStore, Queue, Reporter, Parent]:
+    coordinator, store, queue, reporter = make()
+    reporter.outcomes = list(outcomes or [])
+    reporter.lost_response = lost_response
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(STORY))
+    for key in ("backend-api", "web-app", "mobile-app"):
+        await finish(store, coordinator, key, ChildStatus.COMPLETED)
+    return coordinator, store, queue, reporter, store.parents[parent.id]
+
+
+R = CommentStatus
+
+
+async def test_success_posts_once_to_the_parent_story_and_persists_the_comment_id() -> None:
+    _, _store, _, reporter, parent = await finished_parent()
+    assert [k for k, _ in reporter.texts] == ["SHOP-100"]
+    text = reporter.texts[0][1]
+    assert report_marker(parent.id, parent.report_round) in text
+    assert parent.jira_report == "SUCCEEDED" and parent.jira_comment_id == "10001"
+    assert reporter.lookups == 0  # a first attempt never needs reconciliation
+
+
+@pytest.mark.parametrize("code", [401, 403, 404])
+async def test_auth_and_permission_errors_are_permanent_and_not_retried(code: int) -> None:
+    result = CommentResult(R.PERMANENT, http_status=code, error=f"http_{code}")
+    coordinator, _, queue, reporter, parent = await finished_parent([result])
+    assert parent.jira_report == "PERMANENT_FAILURE" and parent.jira_report_error == f"http_{code}"
+    assert parent.status is ParentStatus.COMPLETED  # execution status is untouched
+    assert not any(k.startswith(REPORT_JOB) for k in queue.jobs)
+    assert await coordinator.report(parent.id) is ReportState.PERMANENT_FAILURE
+    assert reporter.texts == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        CommentResult(R.RETRYABLE, http_status=429, error="http_429"),
+        CommentResult(R.RETRYABLE, http_status=503, error="http_503"),
+        CommentResult(R.RETRYABLE, error="timeout"),
+    ],
+)
+async def test_transient_failures_schedule_a_report_job_and_retry_reconciles_first(
+    result: CommentResult,
+) -> None:
+    coordinator, store, queue, reporter, parent = await finished_parent([result])
+    assert parent.jira_report == "RETRYABLE_FAILURE"
+    jobs = [k for k in queue.jobs if k.startswith(REPORT_JOB)]
+    assert jobs == [f"{REPORT_JOB}:{parent.id}:{parent.report_round}"]
+    assert await coordinator.report(parent.id) is ReportState.SUCCEEDED
+    assert reporter.lookups == 1 and len(reporter.texts) == 1
+    assert store.parents[parent.id].status is ParentStatus.COMPLETED
+
+
+async def test_timeout_after_jira_created_the_comment_never_posts_a_duplicate() -> None:
+    lost = CommentResult(R.RETRYABLE, error="timeout")
+    coordinator, store, _, reporter, parent = await finished_parent([lost], lost_response=True)
+    assert len(reporter.texts) == 1 and parent.jira_report == "RETRYABLE_FAILURE"
+    assert await coordinator.report(parent.id) is ReportState.SUCCEEDED
+    assert len(reporter.texts) == 1  # found by its report id, not posted again
+    assert store.parents[parent.id].jira_comment_id == "10001"
+
+
+async def test_worker_crash_after_jira_accepted_is_reconciled_from_jira() -> None:
+    coordinator, store, _, reporter, parent = await finished_parent()
+    # simulate: POST landed, then the worker died before finish_report was committed
+    store.parents[parent.id] = replace(parent, jira_report="IN_PROGRESS", jira_comment_id=None)
+    assert await coordinator.report(parent.id) is ReportState.IN_PROGRESS  # live claim: hands off
+    store.stale = True  # the claim outlived REPORT_STALE_SECONDS: its worker is gone
+    assert await coordinator.report(parent.id) is ReportState.SUCCEEDED
+    assert len(reporter.texts) == 1 and store.parents[parent.id].jira_comment_id == "10001"
+
+
+async def test_worker_crash_before_the_post_posts_exactly_once_on_recovery() -> None:
+    coordinator, store, _, reporter, parent = await finished_parent(
+        [CommentResult(R.RETRYABLE, error="transport_error")]
+    )
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="IN_PROGRESS")
+    store.stale = True
+    assert await coordinator.report(parent.id) is ReportState.SUCCEEDED
+    assert reporter.lookups == 1 and len(reporter.texts) == 1
+
+
+async def test_failed_jira_lookup_never_posts_blindly() -> None:
+    coordinator, store, _, reporter, parent = await finished_parent(
+        [CommentResult(R.RETRYABLE, error="timeout")]
+    )
+    reporter.lookup = CommentResult(R.RETRYABLE, http_status=503, error="lookup_http_503")
+    assert await coordinator.report(parent.id) is ReportState.RETRYABLE_FAILURE
+    assert reporter.texts == []
+    assert store.parents[parent.id].jira_report_error == "lookup_http_503"
+
+
+async def test_retries_are_bounded_then_permanent() -> None:
+    flaky = [CommentResult(R.RETRYABLE, http_status=503, error="http_503")] * 10
+    coordinator, store, _, _reporter, parent = await finished_parent(flaky)
+    states = [await coordinator.report(parent.id) for _ in range(8)]
+    assert states[-1] is ReportState.PERMANENT_FAILURE
+    final = store.parents[parent.id]
+    assert final.jira_report_attempts == 6
+    assert (final.jira_report_error or "").startswith("retries_")
+
+
+async def test_duplicate_report_calls_produce_one_comment() -> None:
+    coordinator, _, _, reporter, parent = await finished_parent()
+    for _ in range(3):
+        await coordinator.report(parent.id)
+        await coordinator.advance(parent.id)
+    assert len(reporter.texts) == 1
+
+
+async def test_failed_child_with_successful_sibling_reports_partial_not_completed() -> None:
+    coordinator, store, _, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(STORY))
+    await finish(store, coordinator, "backend-api", ChildStatus.COMPLETED)
+    await finish(store, coordinator, "web-app", ChildStatus.COMPLETED)
+    await finish(store, coordinator, "mobile-app", ChildStatus.FAILED)
+    text = reporter.texts[-1][1]
+    assert "Execution: PARTIALLY_COMPLETED" in text and "Execution: COMPLETED" not in text
+    assert "Reason: validation_failed" in text and "retry-child" in text
+    assert store.parents[parent.id].status is ParentStatus.PARTIALLY_COMPLETED
+
+
+async def test_missing_pr_url_is_reported_as_not_recorded() -> None:
+    coordinator, store, _, reporter = make()
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(STORY))
+    for key in ("backend-api", "web-app", "mobile-app"):
+        await finish(store, coordinator, key, ChildStatus.COMPLETED)
+    assert reporter.texts  # sanity
+    child = next(c for c in store.children.values() if c.repository_key == "web-app")
+    parent, children = await store.load(child.parent_id)
+    children = [replace(c, pr_url=None) if c.id == child.id else c for c in children]
+    text = await coordinator.summary(parent, children, "SHOP-100")
+    assert "Draft PR: not recorded" in text
+
+
+async def test_report_job_raises_for_retryable_so_the_queue_backs_off() -> None:
+    from ai_code_change_agent.application.jobs.queue import JobFailedError
+    from ai_code_change_agent.orchestration.intake import ParentReportHandler
+
+    coordinator, store, _, _, parent = await finished_parent(
+        [CommentResult(R.RETRYABLE, http_status=429, error="http_429")] * 2
+    )
+    handler = ParentReportHandler(coordinator=coordinator)
+    job: Any = type("J", (), {"payload": {"parent_id": str(parent.id)}})()
+    with pytest.raises(Exception, match="jira_report_retryable"):
+        await handler(job)
+    await handler(job)  # third POST succeeds after reconciliation found nothing
+    assert store.parents[parent.id].jira_report == "SUCCEEDED"
+    with pytest.raises(JobFailedError):
+        await handler(type("J", (), {"payload": {}})())

@@ -19,7 +19,7 @@ from ai_code_change_agent.domain.repositories.resolution import ResolutionOutcom
 from ai_code_change_agent.domain.repositories.resolution import ResolutionRequest
 from ai_code_change_agent.persistence.session import create_engine, create_session_factory
 from tests.integration.conftest import libpq, query, run_alembic
-from tests.support.registry_fixtures import FIXTURES, nestjs_backend, new_repo
+from tests.support.registry_fixtures import FIXTURES, django_service, new_repo
 
 pytestmark = pytest.mark.integration
 ACTOR = "cli:itest"
@@ -38,11 +38,11 @@ def sql(url: str, statement: str, params: tuple[object, ...] = ()) -> None:
 
 
 async def onboard(
-    f: async_sessionmaker[AsyncSession], key: str = "nest-backend", project: str = "SHOP"
+    f: async_sessionmaker[AsyncSession], key: str = "django-service", project: str = "SHOP"
 ) -> None:
     svc = build_registry_service(f)
     await svc.register_repository(new_repo(key), actor=ACTOR)
-    await svc.create_version(key, {**nestjs_backend(), "repository_key": key}, actor=ACTOR)
+    await svc.create_version(key, {**django_service(), "repository_key": key}, actor=ACTOR)
     await svc.publish_version(key, 1, actor=ACTOR)
     await svc.map_project(project, key, actor=ACTOR)
     await svc.enable(key, actor=ACTOR)
@@ -54,9 +54,9 @@ async def test_a_story_url_resolves_through_the_unique_locator(
     """Gate D.2: owner/name and GitHub URLs are looked up by the stored canonical locator."""
     await onboard(factory)
     resolver = build_repository_resolver(factory)
-    for ref in ("acme/nest-backend", "https://github.com/ACME/nest-backend.git"):
+    for ref in ("acme/django-service", "https://github.com/ACME/django-service.git"):
         res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", (ref,)))
-        assert res.outcome is O.RESOLVED and res.repository_key == "nest-backend", ref
+        assert res.outcome is O.RESOLVED and res.repository_key == "django-service", ref
     res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("acme/unknown",)))
     assert res.outcome is O.UNKNOWN_REPOSITORY and res.detail == "reference_not_registered"
 
@@ -66,10 +66,10 @@ async def test_register_publish_map_resolve_disable_flow(
 ) -> None:
     await onboard(factory)
     resolver = build_repository_resolver(factory)
-    res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("nest-backend",)))
+    res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("django-service",)))
     assert res.outcome is O.RESOLVED and res.profile_version == 1
     assert (await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP"))).resolved
-    await build_registry_service(factory).disable("nest-backend", actor=ACTOR)
+    await build_registry_service(factory).disable("django-service", actor=ACTOR)
     assert (
         await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP"))
     ).outcome is O.DISABLED_REPOSITORY
@@ -143,7 +143,7 @@ async def test_failed_operations_roll_back_completely(
         database_url, "SELECT count(*) FROM repository_aliases WHERE alias = 'shop-api2'"
     ) == [(0,)]
     await svc.create_version(
-        "shop-api", {**nestjs_backend(), "repository_key": "shop-api"}, actor=ACTOR
+        "shop-api", {**django_service(), "repository_key": "shop-api"}, actor=ACTOR
     )
     sql(database_url, "SELECT 1")  # connectivity sanity
     with pytest.raises(InvalidStateError):
@@ -169,9 +169,11 @@ async def test_concurrent_version_creation_numbers_are_unique_and_gapless(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
     svc = build_registry_service(factory)
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
-    doc = nestjs_backend()
-    await asyncio.gather(*[svc.create_version("nest-backend", doc, actor=ACTOR) for _ in range(5)])
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
+    doc = django_service()
+    await asyncio.gather(
+        *[svc.create_version("django-service", doc, actor=ACTOR) for _ in range(5)]
+    )
     assert [
         r[0]
         for r in query(
@@ -206,10 +208,10 @@ async def test_published_versions_are_immutable_and_drafts_only_publishable(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
     svc = build_registry_service(factory)
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
-    await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
-    await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
-    await svc.publish_version("nest-backend", 1, actor=ACTOR)
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
+    await svc.create_version("django-service", django_service(), actor=ACTOR)
+    await svc.create_version("django-service", django_service(), actor=ACTOR)
+    await svc.publish_version("django-service", 1, actor=ACTOR)
     for stmt in (
         "UPDATE repository_profile_versions SET content = '{}'::jsonb WHERE version = 1",
         "UPDATE repository_profile_versions SET content_sha256 = repeat('a', 64) WHERE version = 1",
@@ -277,7 +279,7 @@ async def test_active_version_must_belong_to_the_same_repository(
     svc = build_registry_service(factory)
     for key in ("repo-one", "repo-two"):
         await svc.register_repository(new_repo(key), actor=ACTOR)
-        await svc.create_version(key, {**nestjs_backend(), "repository_key": key}, actor=ACTOR)
+        await svc.create_version(key, {**django_service(), "repository_key": key}, actor=ACTOR)
     other = query(
         database_url,
         "SELECT v.id FROM repository_profile_versions v JOIN repositories r ON r.id = v.repository_id WHERE r.repository_key = 'repo-two'",
@@ -379,11 +381,11 @@ async def test_invalid_profile_is_rejected_before_any_write(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
     svc = build_registry_service(factory)
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
-    bad = nestjs_backend()
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
+    bad = django_service()
     bad["commands"][1]["argv"] = ["curl", "http://evil.invalid"]
     with pytest.raises(RegistryValidationError):
-        await svc.create_version("nest-backend", bad, actor=ACTOR)
+        await svc.create_version("django-service", bad, actor=ACTOR)
     assert query(database_url, "SELECT count(*) FROM repository_profile_versions") == [(0,)]
 
 
@@ -407,7 +409,7 @@ def test_fresh_history_roundtrip_and_head(database_url: str) -> None:
     up = run_alembic(database_url, "upgrade", "head")
     assert up.returncode == 0, up.stderr[-1500:]
     heads = run_alembic(database_url, "heads")
-    assert heads.stdout.strip().startswith("0003")
+    assert heads.stdout.strip().startswith("0004")
     check = run_alembic(database_url, "check")
     assert check.returncode == 0, check.stdout[-800:] + check.stderr[-800:]
     assert uuid.uuid4()
@@ -435,25 +437,25 @@ async def test_read_paths_and_lifecycle_operations_on_postgres(
 ) -> None:
     await onboard(factory)
     svc = build_registry_service(factory)
-    await svc.add_alias("nest-backend", "nest", actor=ACTOR)
-    await svc.create_version("nest-backend", {**nestjs_backend()}, actor=ACTOR)
-    await svc.publish_version("nest-backend", 2, actor=ACTOR, activate=False)
-    repo, versions, aliases, mappings = await svc.show_repository("nest-backend")
+    await svc.add_alias("django-service", "api", actor=ACTOR)
+    await svc.create_version("django-service", {**django_service()}, actor=ACTOR)
+    await svc.publish_version("django-service", 2, actor=ACTOR, activate=False)
+    repo, versions, aliases, mappings = await svc.show_repository("django-service")
     assert [v.version for v in versions] == [1, 2] and [v.published for v in versions] == [
         True,
         True,
     ]
-    assert aliases == ["nest", "nest-backend"] and [m.jira_project_key for m in mappings] == [
+    assert aliases == ["api", "django-service"] and [m.jira_project_key for m in mappings] == [
         "SHOP"
     ]
     assert repo.active_profile_version_id == versions[0].id and repo.row_version >= 3
-    await svc.activate_version("nest-backend", 2, actor=ACTOR)
-    await svc.activate_version("nest-backend", 1, actor=ACTOR)
+    await svc.activate_version("django-service", 2, actor=ACTOR)
+    await svc.activate_version("django-service", 1, actor=ACTOR)
     assert [m.status.value for m in await svc.list_mappings(project_key="SHOP")] == ["ACTIVE"]
-    assert len(await svc.list_mappings(key="nest-backend")) == 1
-    await svc.unmap_project("SHOP", "nest-backend", actor=ACTOR)
-    await svc.map_project("SHOP", "nest-backend", actor=ACTOR)
-    events = await svc.audit_history("nest-backend", limit=500)
+    assert len(await svc.list_mappings(key="django-service")) == 1
+    await svc.unmap_project("SHOP", "django-service", actor=ACTOR)
+    await svc.map_project("SHOP", "django-service", actor=ACTOR)
+    events = await svc.audit_history("django-service", limit=500)
     assert len(events) == query(database_url, "SELECT count(*) FROM registry_audit_events")[0][0]
     assert (
         events[0].occurred_at is not None and events[0].action.value == "project_mapping.activated"
@@ -461,5 +463,5 @@ async def test_read_paths_and_lifecycle_operations_on_postgres(
     assert len(await svc.audit_history(None, limit=2)) == 2
     resolver = build_repository_resolver(factory)
     assert (
-        await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("nest",)))
+        await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("api",)))
     ).profile_version == 1

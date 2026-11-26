@@ -1,6 +1,6 @@
 # Multi-repository Stories
 
-One Jira Story can change several authorised repositories (backend, web, mobile, libraries). Each repository is changed by its own **child execution**. A **parent execution** coordinates them deterministically; no model makes coordination or authorisation decisions.
+One Jira Story can change several authorised **Python** repositories (for example a backend API plus a Python client, SDK or worker). Other languages (Node.js, React/Next.js, Android, Kotlin/Java, Flutter, iOS/Swift) are out of scope. Each repository is changed by its own **child execution**. A **parent execution** coordinates them deterministically; no model makes coordination or authorisation decisions.
 
 ## Story format
 
@@ -12,13 +12,13 @@ Repositories:
   Responsibility: create tracking endpoints and response schemas
   Depends on: none
 
-- Repository: <owner>/web-app
-  Role: frontend
-  Responsibility: implement the order tracking interface
+- Repository: <owner>/python-client
+  Role: client
+  Responsibility: add a typed client method for the tracking endpoint
   Depends on: backend-api
 
 Dependencies:            (optional, same meaning as "Depends on")
-- mobile-app depends on backend-api
+- python-client depends on backend-api
 ```
 
 - **Number of markers:**
@@ -35,11 +35,11 @@ Dependencies:            (optional, same meaning as "Depends on")
 Story -> intake: parse markers -> resolve EVERY repository -> validate the dependency DAG
       -> parent (code_change_parents) + one child per repository (code_change_children)
       -> queue the children whose dependencies are complete (job code_change.child, dedupe key)
-child: own attempt -> own workspace + sandbox (its profile's toolchain image) -> own Deep Agent
+child: own attempt -> own workspace + sandbox (the Python execution image) -> own Deep Agent
        thread -> plan -> automatic PLAN gate -> implement -> independent validation
        -> draft PR (token scoped to that one repository) -> contract artifact (if published)
 parent: when every child is final -> COMPLETED | PARTIALLY_COMPLETED | FAILED
-        -> one aggregated Jira comment per report round (claimed in the database)
+        -> one aggregated Jira comment per report round, on the parent Story (durable lifecycle below)
 ```
 
 - **Blocked before any work:** if any repository is unknown, DISABLED, unmapped or has no profile, or a dependency is unknown or cyclic, the parent is **BLOCKED** before anything runs (no clone, workspace, token or model call). One Jira comment then lists exactly what to fix. Repositories are never registered from Story text.
@@ -59,6 +59,18 @@ parent: when every child is final -> COMPLETED | PARTIALLY_COMPLETED | FAILED
 - **Retry:** `uv run ai-code-change changes retry-child <child-id>` re-runs only that child, plus the children it blocked. It starts a new attempt and branch; history is kept. The parent then reports again in a new round.
 - **Replays:** a replayed webhook or intake reuses the existing parent. Every status change is compare-and-set, and every child job has a dedupe key.
 - **Worker crash:** the job is reclaimed when its lease expires. The child resumes its own attempt, and a stale workspace from the dead run is removed first.
+
+## Jira reporting (parent Story)
+
+The aggregated result is posted to the **parent Story** (the issue the webhook came from), never to another issue. It lists every repository, its status, branch and draft PR (or `not recorded`), failure reason and `retry-child` command, published contracts, runs, the total LLM cost, the completion time and a **Report ID** (`aica-report-<parent-id>-r<round>`).
+
+- **Execution status vs reporting status:** `code_change_parents.status` says what the code change did; `jira_report` says whether Jira has the comment. A reporting failure never changes the execution status and never re-runs a child or creates a PR.
+- **Lifecycle** (`jira_report`): `NULL` (pending) -> `IN_PROGRESS` -> `SUCCEEDED` | `RETRYABLE_FAILURE` | `PERMANENT_FAILURE` (`DISABLED` when `JIRA_REPORTING_ENABLED=false`). The Jira comment id, the attempt count, the last error class and the time are stored with it.
+- **Classification:** 201 = success (comment id stored). 400/401/403/404 and an invalid issue key are permanent. 429, 5xx, timeouts and network errors are retryable.
+- **Idempotency:** the POST is never retried blindly. Before any second POST of a round (after a timeout, a 429/5xx, or a claim left `IN_PROGRESS` by a crashed worker for more than 5 minutes), the worker reads the issue's comments and looks for the round's Report ID. Found: the existing comment id is stored and nothing is posted. Lookup failed: nothing is posted, and the report stays retryable.
+- **Retries:** a retryable outcome enqueues one `code_change.parent_report` job per round in the PostgreSQL job queue, which retries it with backoff. After 6 attempts the report becomes `PERMANENT_FAILURE` (error `retries_exhausted:...`).
+- **Rounds:** `retry-child` opens a new round, so earlier comments of the Story stay as history and the new outcome gets one new comment.
+- **Limits:** the lookup reads the newest 100 comments of the issue. Comments posted before this lifecycle existed have no Report ID; KAN-9's final comment (10009) was reconciled by hand.
 
 ## Verified (2026-11-26, KAN-9, claude-haiku-5-5)
 

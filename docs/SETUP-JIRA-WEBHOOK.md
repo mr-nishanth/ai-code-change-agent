@@ -45,4 +45,4 @@ Configure one Jira webhook that sends Story creation events to the API.
 
 ## Reporting (optional)
 
-`JIRA_REPORTING_ENABLED=true` adds one outcome comment through `POST /rest/api/3/issue/{key}/comment`. The API token's account needs the **Add Comments** permission in `KAN`. This has not been verified, and the setting stays false until you verify it.
+`JIRA_REPORTING_ENABLED=true` adds one outcome comment through `POST /rest/api/3/issue/{key}/comment`. The API token's account needs the **Add Comments** permission in `KAN`. Verified live on KAN-7, KAN-8 and KAN-9. Multi-repository parents also read the issue comments (`GET /rest/api/3/issue/{key}/comment`) to reconcile an uncertain POST, so the account also needs **Browse Projects**.
