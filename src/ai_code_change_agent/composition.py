@@ -322,7 +322,11 @@ def build_reference_tools(
         )
 
     def tools(thread_id: str) -> list[BaseTool]:
-        out = [build_reference_tool(fetcher, max_calls=settings.reference_max_fetches)]
+        out = [
+            build_reference_tool(
+                fetcher, max_calls=settings.reference_max_fetches, thread_id=thread_id
+            )
+        ]
         if searcher is not None:
 
             async def record(result: SearchResult) -> None:
@@ -332,7 +336,11 @@ def build_reference_tools(
             out.insert(
                 0,
                 build_search_tool(
-                    searcher, max_calls=settings.reference_max_searches, on_result=record
+                    searcher,
+                    max_calls=settings.reference_max_searches,
+                    on_result=record,
+                    allowed=(lambda: usage.search_allowed(thread_id)) if usage else None,
+                    thread_id=thread_id,
                 ),
             )
         return out

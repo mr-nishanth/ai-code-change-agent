@@ -13,9 +13,11 @@ it to the listed sites.
 """
 
 import asyncio
+import codecs
 import ipaddress
 import socket
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
@@ -143,23 +145,45 @@ class HttpReferenceFetcher:
                     raise ReferenceRefusedError("reference_unavailable") from None
         raise ReferenceRefusedError("reference_too_many_redirects")
 
+    async def _read_html(self, response: httpx.Response) -> tuple[str, bool]:
+        """Stream HTML through the text extractor, keeping only extracted text in memory. Many
+        documentation pages carry megabytes of inline scripts before <body>; the raw stream is
+        bounded at 8x REFERENCE_MAX_BYTES, the extracted text at max_chars."""
+        raw_cap = self._max_bytes * 8
+        decoder = codecs.getincrementaldecoder(response.encoding or "utf-8")(errors="replace")
+        parser = _Text()
+        seen = 0
+        truncated = False
+        async for chunk in response.aiter_bytes():
+            seen += len(chunk)
+            parser.feed(decoder.decode(chunk))
+            if seen > raw_cap or sum(map(len, parser.parts)) > self._max_chars * 2:
+                truncated = True
+                break
+        else:
+            parser.feed(decoder.decode(b"", final=True))
+        parser.close()
+        lines = (" ".join(line.split()) for line in "".join(parser.parts).splitlines())
+        return "\n".join(line for line in lines if line), truncated
+
     async def _read(self, url: str, response: httpx.Response) -> ReferenceDocument:
         if response.status_code != 200:
             raise ReferenceRefusedError(f"reference_http_{response.status_code}")
         content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
         if not content_type.startswith(_TEXT_TYPES):
             raise ReferenceRefusedError("reference_content_type_not_text")
-        data = bytearray()
         truncated = False
-        async for chunk in response.aiter_bytes():
-            data.extend(chunk)
-            if len(data) > self._max_bytes:
-                del data[self._max_bytes :]
-                truncated = True
-                break
-        text = data.decode(response.encoding or "utf-8", errors="replace")
         if "html" in content_type:
-            text = html_to_text(text)
+            text, truncated = await self._read_html(response)
+        else:
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > self._max_bytes:
+                    del data[self._max_bytes :]
+                    truncated = True
+                    break
+            text = data.decode(response.encoding or "utf-8", errors="replace")
         if len(text) > self._max_chars:
             text, truncated = text[: self._max_chars], True
         _log.info(
@@ -169,4 +193,6 @@ class HttpReferenceFetcher:
             chars=len(text),
             truncated=truncated,
         )
-        return ReferenceDocument(url, content_type, text, truncated)
+        return ReferenceDocument(
+            url, content_type, text, truncated, datetime.now(UTC).isoformat(timespec="seconds")
+        )

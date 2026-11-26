@@ -238,6 +238,7 @@ class BudgetGuard(AsyncCallbackHandler):
     def __init__(self, prices: PriceTable, budget_usd: Decimal) -> None:
         self._prices = prices
         self._budget = budget_usd
+        self.budget = budget_usd
         self.spent = Decimal(0)
         self.unpriced_calls = 0
 
@@ -282,6 +283,12 @@ class UsageTracker:
         self.provider = provider
         self.model = model
         self.session_id = session_id or uuid.uuid4()
+        self._guards: dict[str, BudgetGuard] = {}  # per phase run (thread id)
+
+    def search_allowed(self, thread_id: str) -> bool:
+        """False once the phase run's budget is spent: searches are refused like model calls."""
+        guard = self._guards.get(thread_id)
+        return guard is None or guard.spent < guard.budget
 
     async def record_search(self, thread_id: str, result: Any) -> None:
         """A documentation search made by the harness (Anthropic web search): its tokens plus the
@@ -292,11 +299,19 @@ class UsageTracker:
             if result.input_tokens is not None and result.output_tokens is not None
             else None
         )
-        cost = None
-        if usage is not None and result.model:
-            priced = self.prices.price(result.model, usage)
+        fee = WEB_SEARCH_USD_PER_REQUEST * result.searches
+        cost = None  # ledger: only a real price is recorded
+        guard_cost = fee  # guard: never free; unpriced models charged at the highest rate
+        if usage is not None:
+            priced = self.prices.price(result.model, usage) if result.model else None
             if priced is not None:
-                cost = priced.total + WEB_SEARCH_USD_PER_REQUEST * result.searches
+                cost = priced.total + fee
+                guard_cost = cost
+            elif (worst := self.prices.conservative(usage)) is not None:
+                guard_cost = worst.total + fee
+        guard = self._guards.get(thread_id)
+        if guard is not None:
+            guard.spent += guard_cost  # searches count against the phase budget
         record = LlmCallRecord(
             call_id=uuid.uuid4(),
             session_id=self.session_id,
@@ -304,7 +319,7 @@ class UsageTracker:
             stage="research",
             provider="anthropic",
             model=result.model or self.model,
-            succeeded=True,
+            succeeded=getattr(result, "error", None) is None,
             usage=usage,
             cost_usd=cost,
             pricing_version=self.prices.version,
@@ -316,9 +331,11 @@ class UsageTracker:
 
     def handlers(self, thread_id: str) -> Sequence[BaseCallbackHandler]:
         attempt, stage = stage_of(thread_id)
-        guards: list[BaseCallbackHandler] = (
-            [BudgetGuard(self.prices, self.phase_budget_usd)] if self.phase_budget_usd else []
-        )
+        guards: list[BaseCallbackHandler] = []
+        if self.phase_budget_usd:
+            guard = BudgetGuard(self.prices, self.phase_budget_usd)
+            self._guards[thread_id] = guard
+            guards.append(guard)
         return [
             *guards,
             UsageCallbackHandler(

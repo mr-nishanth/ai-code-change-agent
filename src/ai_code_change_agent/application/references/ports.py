@@ -21,6 +21,7 @@ class ReferenceDocument:
     content_type: str
     text: str
     truncated: bool
+    retrieved_at: str = ""  # ISO 8601, UTC
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class SearchResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     searches: int = 0
+    error: str | None = None  # the provider ran (and billed) the request but returned an error
 
 
 class ReferenceSearcher(Protocol):

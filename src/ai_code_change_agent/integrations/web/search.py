@@ -94,13 +94,15 @@ class AnthropicDocumentSearch:
         except anthropic.APIError:
             raise ReferenceRefusedError("search_unavailable") from None
         hits: list[SearchHit] = []
+        error: str | None = None
         blocks: list[Any] = list(response.content)
         for block in blocks:
             if getattr(block, "type", None) != "web_search_tool_result":
                 continue
             content = block.content
-            if not isinstance(content, list):  # an error object, not results
-                raise ReferenceRefusedError(f"search_{getattr(content, 'error_code', 'error')}")
+            if not isinstance(content, list):  # an error object: billed, so still recorded
+                error = f"search_{getattr(content, 'error_code', 'error')}"
+                continue
             for item in content:
                 url = str(getattr(item, "url", ""))
                 host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
@@ -125,4 +127,5 @@ class AnthropicDocumentSearch:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             searches=int(getattr(server, "web_search_requests", 0) or 0),
+            error=error,
         )

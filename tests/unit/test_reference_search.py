@@ -3,11 +3,8 @@
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from ai_code_change_agent.agents.coding.tools import build_search_tool
 from ai_code_change_agent.application.references.ports import (
-    ReferenceRefusedError,
     SearchHit,
     SearchResult,
 )
@@ -76,8 +73,32 @@ async def test_a_search_error_object_is_refused() -> None:
             )
         ]
     )
-    with pytest.raises(ReferenceRefusedError, match="search_max_uses_exceeded"):
-        await s.search("x")
+    r = await s.search("x")  # billed by the provider, so returned (and recorded), not raised
+    assert r.error == "search_max_uses_exceeded" and r.hits == () and r.input_tokens == 1000
+
+
+async def test_a_billed_search_error_is_recorded_and_refused_to_the_agent() -> None:
+    s, _ = provider(
+        [SimpleNamespace(type="web_search_tool_result", content=SimpleNamespace(error_code="x"))]
+    )
+    seen: list[SearchResult] = []
+
+    async def record(r: SearchResult) -> None:
+        seen.append(r)
+
+    tool = build_search_tool(s, max_calls=3, on_result=record)
+    assert (await tool.ainvoke({"query": "q"})) == "REFUSED: search_x"
+    assert len(seen) == 1 and seen[0].error == "search_x"
+
+
+async def test_searches_stop_once_the_phase_cost_budget_is_spent() -> None:
+    state = {"ok": True}
+    searcher = FakeSearcher()
+    tool = build_search_tool(searcher, max_calls=5, allowed=lambda: state["ok"])
+    await tool.ainvoke({"query": "a"})
+    state["ok"] = False
+    out = await tool.ainvoke({"query": "b"})
+    assert out.startswith("REFUSED: phase_cost_budget_exhausted") and searcher.queries == ["a"]
 
 
 def test_host_matching_is_exact_or_subdomain() -> None:

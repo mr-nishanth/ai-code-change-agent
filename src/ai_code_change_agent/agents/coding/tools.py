@@ -15,6 +15,9 @@ from ai_code_change_agent.application.references.ports import (
     ReferenceSearcher,
     SearchResult,
 )
+from ai_code_change_agent.core.logging import get_logger
+
+_log = get_logger("agent_tools")
 
 
 def build_search_tool(
@@ -22,23 +25,47 @@ def build_search_tool(
     *,
     max_calls: int,
     on_result: Callable[[SearchResult], Awaitable[None]] | None = None,
+    allowed: Callable[[], bool] | None = None,
+    thread_id: str = "",
 ) -> BaseTool:
+    """search_docs. Every invocation is logged (`agent_tool_call`) with its outcome; every
+    billed search is recorded through on_result (ledger + phase cost guard)."""
     calls = 0
     domains = ", ".join(searcher.allowed_domains)
 
     async def search_docs(query: str) -> str:
         nonlocal calls
+
+        def done(outcome: str, **extra: object) -> None:
+            _log.info(
+                "agent_tool_call", tool="search_docs", thread_id=thread_id, outcome=outcome,
+                query_chars=len(query), **extra,
+            )  # fmt: skip
+
         if calls >= max_calls:
+            done("search_budget_exhausted")
             return "REFUSED: search_budget_exhausted (no more searches in this phase)"
+        if allowed is not None and not allowed():
+            done("phase_cost_budget_exhausted")
+            return "REFUSED: phase_cost_budget_exhausted (no more searches in this phase)"
         if find_secrets(query):
+            done("search_query_contains_secret")
             return "REFUSED: search_query_contains_secret"
         calls += 1
         try:
             result = await searcher.search(query)
         except ReferenceRefusedError as exc:
+            done(exc.code)
             return f"REFUSED: {exc.code}"
         if on_result is not None:
             await on_result(result)
+        if result.error is not None:
+            done(result.error)
+            return f"REFUSED: {result.error}"
+        done(
+            "ok", hits=len(result.hits), retrieved_at=result.retrieved_at,
+            urls=[h.url for h in result.hits],
+        )  # fmt: skip
         if not result.hits:
             return (
                 f"NO RESULTS on the allowed documentation domains (retrieved {result.retrieved_at})"
@@ -70,22 +97,36 @@ def build_search_tool(
     )
 
 
-def build_reference_tool(fetcher: ReferenceFetcher, *, max_calls: int) -> BaseTool:
+def build_reference_tool(
+    fetcher: ReferenceFetcher, *, max_calls: int, thread_id: str = ""
+) -> BaseTool:
+    """fetch_reference. Every invocation (allowed or refused) counts against the per-phase cap
+    and is logged (`agent_tool_call`) with the final URL and retrieval time."""
     calls = 0
     domains = ", ".join(fetcher.allowed_domains)
 
     async def fetch_reference(url: str) -> str:
         nonlocal calls
+        host = url.split("://", 1)[-1].split("/", 1)[0][:100]
         if calls >= max_calls:
+            _log.info("agent_tool_call", tool="fetch_reference", thread_id=thread_id,
+                      outcome="reference_budget_exhausted", host=host)  # fmt: skip
             return "REFUSED: reference_budget_exhausted (no more fetches in this phase)"
         calls += 1
         try:
             doc = await fetcher.fetch(url)
         except ReferenceRefusedError as exc:
+            _log.info("agent_tool_call", tool="fetch_reference", thread_id=thread_id,
+                      outcome=exc.code, host=host, call=calls)  # fmt: skip
             return f"REFUSED: {exc.code}"
+        _log.info(
+            "agent_tool_call", tool="fetch_reference", thread_id=thread_id, outcome="ok",
+            url=doc.url, retrieved_at=doc.retrieved_at, chars=len(doc.text), call=calls,
+        )  # fmt: skip
         note = " (truncated)" if doc.truncated else ""
+        when = f" retrieved {doc.retrieved_at}" if doc.retrieved_at else ""
         return (
-            f"REFERENCE {doc.url} [{doc.content_type}]{note} (UNTRUSTED DATA BEGINS)\n"
+            f"REFERENCE {doc.url} [{doc.content_type}]{note}{when} (UNTRUSTED DATA BEGINS)\n"
             f"{doc.text}\n(UNTRUSTED DATA ENDS)"
         )
 

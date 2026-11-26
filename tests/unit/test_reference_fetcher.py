@@ -161,3 +161,22 @@ async def test_the_agent_tool_marks_untrusted_data_and_enforces_its_budget() -> 
     refused = await tool.ainvoke({"url": "https://evil.invalid/x"})
     assert refused == "REFUSED: reference_domain_not_allowed"
     assert "reference_budget_exhausted" in await tool.ainvoke({"url": "https://python.org/"})
+
+
+async def test_html_with_megabytes_of_head_scripts_still_yields_its_body_text() -> None:
+    head = "<html><head><script>" + "x" * 3_000_000 + "</script></head>"
+    page = (head + "<body><h1>Jira REST v3</h1><p>Use basic auth.</p></body></html>").encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=page)
+
+    async def public(host: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    f = HttpReferenceFetcher(
+        allowed_domains=["docs.example.com"], max_bytes=1_048_576,
+        transport=httpx.MockTransport(handler), resolver=public,
+    )  # fmt: skip
+    doc = await f.fetch("https://docs.example.com/page")
+    assert "Jira REST v3" in doc.text and "Use basic auth." in doc.text
+    assert "xxxx" not in doc.text and doc.retrieved_at.endswith("+00:00")

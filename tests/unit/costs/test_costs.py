@@ -403,3 +403,35 @@ def test_bedrock_usage_and_ids_are_understood() -> None:
     table = PriceTable()
     assert table.price(reported.model, reported.usage) is None  # reports: unknown, not guessed
     assert table.estimate(reported.model, reported.usage) is not None  # guards: list price
+
+
+async def test_searches_are_charged_to_the_phase_cost_guard_and_stop_further_calls() -> None:
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    import pytest
+
+    from ai_code_change_agent.application.costs.usage import BudgetExceededError, BudgetGuard
+
+    a = uuid.uuid4()
+    thread = f"attempt:{a}:planning:x"
+    store = MemoryStore()
+    tracker = UsageTracker(
+        store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=Decimal("0.05")
+    )
+    (guard, *_) = tracker.handlers(thread)
+    assert isinstance(guard, BudgetGuard) and tracker.search_allowed(thread)
+    search = SimpleNamespace(
+        model="unpriced-model", input_tokens=10_000, output_tokens=100, searches=5, error=None
+    )
+    await tracker.record_search(thread, search)  # unpriced: conservative rate + $0.05 fees
+    assert guard.spent >= Decimal("0.05") and not tracker.search_allowed(thread)
+    with pytest.raises(BudgetExceededError):
+        await guard.on_chat_model_start({}, [])
+    (record,) = store.records
+    assert record.stage == "research" and record.cost_usd is None  # ledger: no invented price
+    failed = SimpleNamespace(
+        model=HAIKU, input_tokens=100, output_tokens=1, searches=1, error="search_x"
+    )
+    await tracker.record_search(thread, failed)
+    assert store.records[-1].succeeded is False and store.records[-1].cost_usd is not None
