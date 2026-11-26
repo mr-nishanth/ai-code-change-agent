@@ -206,6 +206,30 @@ async def test_the_phase_cost_budget_stops_the_next_model_call() -> None:
         await guard.on_chat_model_start({}, [])
 
 
+async def test_budget_guard_never_treats_an_unpriced_model_as_free() -> None:
+    from decimal import Decimal
+
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    from ai_code_change_agent.application.costs.pricing import PriceTable
+    from ai_code_change_agent.application.costs.usage import BudgetExceededError, BudgetGuard
+
+    guard = BudgetGuard(PriceTable(), Decimal("0.01"))
+    msg = AIMessage(
+        content="x",
+        response_metadata={
+            "model": "some-future-model",
+            "usage": {"input_tokens": 1000, "output_tokens": 1000},
+        },
+    )
+    await guard.on_llm_end(LLMResult(generations=[[ChatGeneration(message=msg)]]))
+    assert guard.unpriced_calls == 1
+    assert guard.spent == Decimal("0.024")  # charged at the most expensive configured rate (Opus)
+    with pytest.raises(BudgetExceededError):
+        await guard.on_chat_model_start({}, [])
+
+
 def test_dependency_notes_are_stripped_but_requirements_stay_strict() -> None:
     plan = ImplementationPlan.model_validate(
         PLAN.model_dump() | {"dependencies": ["httpx==0.28.1 (already installed)", "flask"]}

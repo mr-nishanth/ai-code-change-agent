@@ -15,7 +15,7 @@ On Haiku 5.5, adaptive thinking is on by default and effort defaults to `medium`
 
 ## Compatibility test
 
-`var/s2044_deepagent_compat.py` is run by hand; it makes real model calls. It runs the production `CodingAgent` with the configured model against a real `DockerSandbox` on a throwaway workspace:
+A local, untracked script under `var/` is run by hand; it makes real model calls. It runs the production `CodingAgent` with the configured model against a real `DockerSandbox` on a throwaway workspace:
 
 - Planning uses the read-only sandbox and returns a structured `ImplementationPlan`.
 - Implementation uses the writable sandbox, edits files, runs commands and returns a structured `ImplementationReport`.

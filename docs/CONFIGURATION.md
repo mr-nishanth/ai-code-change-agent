@@ -108,12 +108,11 @@ Agent harness (from the Deep Agents docs review):
 - Every phase run gets a fresh agent thread, so a crash re-run never appends to stale history.
 
 
-## Multi-repository, toolchains, research and cost guards
+## Multi-repository, research and cost guards
 
 | Variable | Default | Notes |
 |---|---|---|
 | MULTI_REPO_MAX_REPOSITORIES | 5 | Repositories per Story (2-20). See [MULTI-REPOSITORY.md](MULTI-REPOSITORY.md) |
-| WORKSPACE_IMAGES | (empty) | Further toolchain images as `family=image` pairs, e.g. `node=ai-code-change-agent/execution-node:0.1.0`. The python image stays `WORKSPACE_IMAGE` |
 | REFERENCE_SEARCH_ENABLED | true | `search_docs` (Anthropic web search, worker side) when the provider is anthropic |
 | REFERENCE_MAX_SEARCHES | 5 | Searches per agent phase |
 | DEEP_AGENT_MAX_MODEL_CALLS | 80 | Hard cap on model calls per agent phase run, for any model |

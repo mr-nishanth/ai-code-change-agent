@@ -1,4 +1,4 @@
-"""Standard repository profiles built from a toolchain, for any repository key.
+"""Standard Python repository profiles, for any repository key.
 
 Operators onboard a repository with `ai-code-change repositories init-profile <key>` instead of
 hand-writing a profile. The result is an ordinary profile document: it is still validated by the
@@ -11,9 +11,8 @@ from ai_code_change_agent.domain.repositories.profile import CommandSpec, Reposi
 # The platform's standard test command per toolchain (must be allowed by CommandPolicy).
 DEFAULT_TEST_COMMANDS: dict[str, tuple[str, ...]] = {
     "python": ("python", "-m", "pytest", "-q"),
-    "node": ("npm", "test"),  # runs the repository's own package.json "test" script
 }
-DEFAULT_LANGUAGES: dict[str, str] = {"python": "Python", "node": "JavaScript"}
+DEFAULT_LANGUAGES: dict[str, str] = {"python": "Python"}
 
 
 def standard_profile(

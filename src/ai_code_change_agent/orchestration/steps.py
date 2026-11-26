@@ -288,7 +288,7 @@ class CodeChangeSteps:
                 handle,
                 self._d.runtime.tree_path(handle, "work"),
                 writable=writable,
-                toolchain=toolchain,  # the profile's execution image (python, node, ...)
+                toolchain=toolchain,  # the Python execution image
             )
             yield handle, sandbox
         finally:

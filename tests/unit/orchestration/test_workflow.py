@@ -15,7 +15,7 @@ from ai_code_change_agent.orchestration.langgraph.ports import GateState, StepRe
 from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
 from ai_code_change_agent.orchestration.steps import dependency_preparation
 from tests.support.changes import python_profile
-from tests.support.registry_fixtures import nestjs_backend
+from tests.support.registry_fixtures import unfamiliar_framework
 from tests.support.workflow import make_rig
 
 S = AttemptStatus
@@ -96,8 +96,10 @@ async def test_a_rejected_plan_ends_the_workflow(tmp_path: Any) -> None:
     assert [s.writable for s in rig.sandboxes.started] == [False]  # never implemented
 
 
-async def test_a_toolchain_without_an_execution_image_blocks_the_attempt(tmp_path: Any) -> None:
-    rig = await make_rig(tmp_path, profile=nestjs_backend() | {"repository_key": "shop-service"})
+async def test_a_profile_without_the_python_toolchain_blocks_the_attempt(tmp_path: Any) -> None:
+    rig = await make_rig(
+        tmp_path, profile=unfamiliar_framework() | {"repository_key": "shop-service"}
+    )
     await rig.runner.start(rig.attempt_id)
     att = await rig.deps.changes.get_attempt(rig.attempt_id)
     assert att.status is S.BLOCKED and att.failure_code == "no_execution_image_for_toolchain"

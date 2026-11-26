@@ -229,7 +229,8 @@ class BudgetExceededError(RuntimeError):
 
 class BudgetGuard(AsyncCallbackHandler):
     """Stops a phase run before its next model call once its priced cost reaches the budget.
-    Works for any priced model; calls without a known price fall back to the model-call cap."""
+    Works for any model: a call whose model has no price is charged at the most expensive
+    configured rate (never as zero), and the model-call cap still applies on top."""
 
     raise_error = True
     run_inline = True
@@ -238,6 +239,7 @@ class BudgetGuard(AsyncCallbackHandler):
         self._prices = prices
         self._budget = budget_usd
         self.spent = Decimal(0)
+        self.unpriced_calls = 0
 
     async def on_chat_model_start(self, serialized: Any, messages: Any, **_: Any) -> None:
         if self.spent >= self._budget:
@@ -253,6 +255,9 @@ class BudgetGuard(AsyncCallbackHandler):
                         cost = self._prices.estimate(  # Bedrock ids: list-price estimate
                             reported.model, reported.usage, inference_geo=reported.inference_geo
                         )
+                        if cost is None:
+                            self.unpriced_calls += 1
+                            cost = self._prices.conservative(reported.usage)
                         if cost is not None:
                             self.spent += cost.total
                     return

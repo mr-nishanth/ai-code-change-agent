@@ -123,9 +123,7 @@ class Settings(BaseSettings):
     # ---- execution sandbox and artifacts ---------------------------------------------------
     workspace_root: str | None = None
     artifact_root: str | None = None
-    workspace_image: str | None = None  # the python toolchain's execution image
-    # Further toolchains: "node=ai-code-change-agent/execution-node:0.1.0,..." (family=image).
-    workspace_images: Annotated[dict[str, str], NoDecode] = Field(default_factory=dict)
+    workspace_image: str | None = None  # the Python execution image (the only toolchain)
     workspace_cpu_limit: float = Field(default=1.0, gt=0, le=16)
     workspace_memory_limit_mb: int = Field(default=2048, ge=128, le=65_536)
     workspace_pids_limit: int = Field(default=256, ge=16, le=4096)
@@ -233,27 +231,6 @@ class Settings(BaseSettings):
         if not path.is_absolute() or ".." in path.parts:
             msg = "paths must be absolute and must not contain '..'"
             raise ValueError(msg)
-        return value
-
-    @field_validator("workspace_images", mode="before")
-    @classmethod
-    def _images(cls, value: object) -> object:
-        if isinstance(value, str):
-            pairs = [p.strip() for p in value.split(",") if p.strip()]
-            out: dict[str, str] = {}
-            for pair in pairs:
-                family, sep, image = pair.partition("=")
-                family, image = family.strip(), image.strip()
-                if not sep or not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", family):
-                    msg = "WORKSPACE_IMAGES must be family=image pairs, e.g. node=org/img:1.0"
-                    raise ValueError(msg)
-                out[family] = image
-            value = out
-        if isinstance(value, dict):
-            for image in value.values():
-                if not _IMAGE.fullmatch(str(image)):
-                    msg = "WORKSPACE_IMAGES must contain plain image references"
-                    raise ValueError(msg)
         return value
 
     @field_validator("workspace_image")
