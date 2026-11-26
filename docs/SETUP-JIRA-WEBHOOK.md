@@ -1,6 +1,6 @@
 # Jira webhook setup
 
-This project reuses the existing Jira site and webhook secret, migrated from the previous project's `.env` under new variable names. **The external Jira configuration has not been changed.** The only change is the callback path, which must be updated in Jira when you deploy this project.
+Configure one Jira webhook that sends Story creation events to the API.
 
 | Item | Value |
 |---|---|
@@ -10,7 +10,6 @@ This project reuses the existing Jira site and webhook secret, migrated from the
 | Event | `jira:issue_created` (`JIRA_WEBHOOK_EVENT`) |
 | Webhook name and JQL | Not visible to this project; check in Jira (Settings, System, WebHooks). Recommended JQL: `project in (<your keys>) AND issuetype = Story` |
 | Callback URL | `https://<public-host>/webhooks/jira` (placeholder until deployment; locally behind a tunnel such as ngrok to `127.0.0.1:8000`) |
-| Previous path | `/integrations/jira/webhook` (old project) |
 | HMAC secret | `JIRA_WEBHOOK_SECRET` (the same secret value as before; configure the same value in the Jira webhook "Secret" field) |
 
 ## Request contract

@@ -1,6 +1,6 @@
 # GitHub App setup
 
-The existing GitHub App is reused. **No App settings, permissions, installations or repository selections were changed.** No new App was created.
+Create a GitHub App, install it on the repositories the platform may change, and give its id, installation id and private key path to the worker.
 
 | Item | Value |
 |---|---|
@@ -44,8 +44,4 @@ The second command is a read-only identity lookup plus a local DISABLED registry
 
 ## Verification status
 
-- **Done in this project:** configuration and private key file validated locally (no network); unit and fake-transport tests.
-- **Done earlier, in the previous project (same App and code):**
-  - one draft PR (smoke test; close it when no longer needed);
-  - one read-only pinned baseline read whose hash matched an independent clone.
-- **Not done in this project:** any real GitHub call, by instruction.
+Live: repository registration, pinned baselines and draft PRs on four repositories (KAN-7, KAN-8, KAN-9).

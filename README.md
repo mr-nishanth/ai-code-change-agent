@@ -24,7 +24,6 @@ Python and Node toolchains are supported. Android, Flutter and iOS are not yet.
 | [docs/LLM-COST-TRACKING.md](docs/LLM-COST-TRACKING.md) | Cost ledger, reports, runaway-cost guards |
 | [docs/DEEP-AGENT-STUDIO.md](docs/DEEP-AGENT-STUDIO.md) | React UI to watch the agent live |
 | [docs/SETUP-GITHUB-APP.md](docs/SETUP-GITHUB-APP.md) · [docs/SETUP-JIRA-WEBHOOK.md](docs/SETUP-JIRA-WEBHOOK.md) · [docs/EXTERNAL-INTEGRATIONS.md](docs/EXTERNAL-INTEGRATIONS.md) | External setup |
-| [docs/history/](docs/history/) | Earlier reports (POC, readiness, migration) |
 
 ## Quick start
 
