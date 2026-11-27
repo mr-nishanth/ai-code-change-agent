@@ -2,6 +2,9 @@
 
 import uuid
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from ai_code_change_agent.application.workspaces.models import ChangeOp, FileChange
 from ai_code_change_agent.domain.repositories.profile import RepositoryProfile
@@ -167,3 +170,100 @@ async def test_a_change_that_cannot_be_applied_fails_rebuild_integrity(tmp_path:
     )
     rebuild = next(c for c in report.checks if c.kind is CheckKind.REBUILD_INTEGRITY)
     assert rebuild.status is CheckStatus.FAILED and not report.passed
+
+
+# ----- command outcomes (timeout, missing executable, crash) and separate quality commands -----
+
+QUALITY_ARGV = {
+    "test": ("python", "-m", "pytest", "-q"),
+    "lint": ("ruff", "check", "app"),
+    "format": ("ruff", "format", "--check", "app"),
+    "types": ("mypy", "app"),
+}
+QUALITY_KIND = {"test": "test", "lint": "lint", "format": "format_check", "types": "lint"}
+
+
+def quality_profile() -> RepositoryProfile:
+    """A profile with separate test, ruff check, ruff format --check and mypy commands."""
+    doc = python_profile(capabilities=["test_run", "lint_run", "format_check"])
+    doc["commands"] = [
+        {
+            "id": cid,
+            "kind": QUALITY_KIND[cid],
+            "toolchain": "python",
+            "argv": list(argv),
+            "network": "none",
+            "timeout_seconds": 120,
+        }
+        for cid, argv in QUALITY_ARGV.items()
+    ]
+    return RepositoryProfile.model_validate(doc)
+
+
+def outcome_for(target: str, result: ProcessResult | BaseException) -> Any:
+    """Every validation container passes except the one running `target`'s argv."""
+    argv = list(QUALITY_ARGV[target])
+    ok = ProcessResult(0, b"ok", b"", False, False)
+    return lambda cli: result if cli[-len(argv) :] == argv else ok
+
+
+TIMED_OUT = ProcessResult(None, b"partial output", b"", False, True)
+EXIT_FAILED = ProcessResult(1, b"check failed", b"", False, False)
+NOT_FOUND = ProcessResult(127, b"", b"exec: executable file not found", False, False)
+
+
+@pytest.mark.parametrize("target", list(QUALITY_ARGV))
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [(EXIT_FAILED, "FAILED"), (TIMED_OUT, "TIMED_OUT"), (NOT_FOUND, "ERROR")],
+    ids=["fails", "times_out", "exit_127"],
+)
+async def test_each_validation_command_failing_or_not_running_fails_closed(
+    tmp_path: Path, target: str, result: ProcessResult, status: str
+) -> None:
+    runtime, runner = make_runtime(tmp_path)
+    runner.on_run = outcome_for(target, result)
+    report = await ValidationEngine(runtime).validate(_input(GOOD, quality_profile()))
+    assert report.decision is Decision.FAILED and not report.passed
+    by_id = {c.command_id: c.status for c in report.commands}
+    assert by_id == {cid: (status if cid == target else "PASSED") for cid in QUALITY_ARGV}
+    commands = next(c for c in report.checks if c.kind is CheckKind.COMMANDS)
+    assert commands.status is CheckStatus.FAILED and f"{target}={status}" in str(commands.detail)
+    tests = next(c for c in report.checks if c.kind is CheckKind.REQUIRED_TESTS)
+    assert tests.status is (CheckStatus.FAILED if target == "test" else CheckStatus.PASSED)
+    assert f"command {target} ({status})" in report.feedback()
+    assert list((tmp_path / "ws").glob("*/ws_*")) == []  # destroyed even on failure
+
+
+async def test_a_docker_crash_while_running_tests_fails_rebuild_integrity(tmp_path: Path) -> None:
+    runtime, runner = make_runtime(tmp_path)
+    runner.on_run = outcome_for("test", OSError("docker daemon went away"))
+    report = await ValidationEngine(runtime).validate(_input(GOOD, quality_profile()))
+    assert not report.passed and report.commands == []
+    rebuild = next(c for c in report.checks if c.kind is CheckKind.REBUILD_INTEGRITY)
+    assert rebuild.status is CheckStatus.FAILED and rebuild.detail == "docker_unavailable"
+    assert list((tmp_path / "ws").glob("*/ws_*")) == []
+
+
+async def test_an_unexpected_runtime_error_propagates_and_still_destroys_the_workspace(
+    tmp_path: Path,
+) -> None:
+    runtime, runner = make_runtime(tmp_path)
+    runner.on_run = outcome_for("test", RuntimeError("runner bug"))
+    with pytest.raises(RuntimeError, match="runner bug"):
+        await ValidationEngine(runtime).validate(_input(GOOD, quality_profile()))
+    assert list((tmp_path / "ws").glob("*/ws_*")) == []
+
+
+async def test_the_engine_refuses_a_profile_without_a_test_command(tmp_path: Path) -> None:
+    """The toolchain default is added by the profile reader; the engine itself never treats a
+    profile without a test command as passing (defence in depth)."""
+    runtime, _runner = make_runtime(tmp_path)
+    doc = python_profile(capabilities=["lint_run"])
+    doc["commands"] = [c for c in doc["commands"] if c["kind"] != "test"]
+    report = await ValidationEngine(runtime).validate(
+        _input(GOOD, RepositoryProfile.model_validate(doc))
+    )
+    assert not report.passed and [c.command_id for c in report.commands] == ["lint"]
+    tests = next(c for c in report.checks if c.kind is CheckKind.REQUIRED_TESTS)
+    assert tests.status is CheckStatus.FAILED and tests.detail == "profile_defines_no_test_command"

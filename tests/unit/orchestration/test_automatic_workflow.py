@@ -12,6 +12,7 @@ from ai_code_change_agent.application.dependencies.ports import DependencyBundle
 from ai_code_change_agent.domain.changes.models import ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, DependencyRequest
+from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps
 from tests.support import workflow
 from tests.support.changes import python_profile
@@ -335,3 +336,87 @@ async def test_discovered_manifest_without_preparer_fails_closed(tmp_path: Path)
     att = await rig.deps.changes.get_attempt(rig.attempt_id)
     assert att.failure_code == "dependency_preparation_unavailable"
     assert rig.publisher.requests == []
+
+
+# ----- the publishing boundary: no validation failure mode ever reaches the publisher -----------
+
+_QUALITY_ARGV = {
+    "test": ("python", "-m", "pytest", "-q"),
+    "lint": ("ruff", "check", "app"),
+    "format": ("ruff", "format", "--check", "app"),
+    "types": ("mypy", "app"),
+}
+_QUALITY_KIND = {"test": "test", "lint": "lint", "format": "format_check", "types": "lint"}
+_OK = ProcessResult(0, b"ok", b"", False, False)
+_KEY = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n"
+
+
+def _quality_profile() -> dict[str, Any]:
+    profile = python_profile(capabilities=["test_run", "lint_run", "format_check"])
+    profile["commands"] = [
+        {
+            "id": cid,
+            "kind": _QUALITY_KIND[cid],
+            "toolchain": "python",
+            "argv": list(argv),
+            "network": "none",
+            "timeout_seconds": 120,
+        }
+        for cid, argv in _QUALITY_ARGV.items()
+    ]
+    return profile
+
+
+def _container(target: str, result: ProcessResult | BaseException) -> Any:
+    argv = list(_QUALITY_ARGV[target])
+    return lambda cli: result if cli[-len(argv) :] == argv else _OK
+
+
+_EXIT_1 = ProcessResult(1, b"failed", b"", False, False)
+
+Boundary = tuple[str | None, ProcessResult | BaseException | None, dict[str, bytes] | None, str]
+BOUNDARY: dict[str, Boundary] = {
+    "timeout": ("test", ProcessResult(None, b"", b"", False, True), None, "validation_failed"),
+    "test_failure": ("test", _EXIT_1, None, "validation_failed"),
+    "ruff_failure": ("lint", _EXIT_1, None, "validation_failed"),
+    "format_failure": ("format", _EXIT_1, None, "validation_failed"),
+    "mypy_failure": ("types", _EXIT_1, None, "validation_failed"),
+    "lint_timeout": ("lint", ProcessResult(None, b"", b"", False, True), None, "validation_failed"),
+    "executable_missing": (
+        "test",
+        ProcessResult(127, b"", b"not found", False, False),
+        None,
+        "validation_failed",
+    ),
+    "docker_crash": ("test", OSError("daemon gone"), None, "validation_failed"),
+    "runtime_error": ("test", RuntimeError("runner bug"), None, "runtimeerror"),
+    "secret_detected": (None, None, {"app/greeting.py": _KEY}, "validation_failed"),
+    "protected_file_modified": (
+        None,
+        None,
+        {"app/greeting.py": b"x = 1\n", ".github/workflows/ci.yml": b"x"},
+        "validation_failed",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(BOUNDARY))
+async def test_no_validation_failure_mode_reaches_the_publisher(tmp_path: Path, case: str) -> None:
+    target, result, edits, code = BOUNDARY[case]
+    rig = await make_rig(
+        tmp_path, approval_mode="automatic", max_repairs=0, profile=_quality_profile()
+    )
+    if target is not None and result is not None:
+        rig.deps.runtime._runner.on_run = _container(target, result)  # type: ignore[attr-defined]
+    if edits is not None:
+        rig.agent.edits = [edits]
+    status = await run(rig)
+    assert status is S.FAILED  # never COMPLETED
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == code
+    assert rig.publisher.requests == []
+    assert att.manifest_sha256 is None  # no delivery manifest, so nothing could be approved
+    assert ArtifactKind.DELIVERY_MANIFEST not in await kinds(rig)
+    assert [a.gate for a in await rig.deps.changes.approvals(rig.attempt_id)] == [ApprovalGate.PLAN]
+    ((_, text),) = rig.reporter.reports
+    assert code in text
