@@ -1,7 +1,7 @@
 """The DynamoDB change adapter against Floci (DYNAMODB-ACCESS-PATTERNS.md 2, C1-C11).
 
-Scenarios ported from the change part of `tests/integration/test_jobs_and_changes_db.py` (which
-stays until PostgreSQL is removed), plus the races the row locks used to serialise. Each test runs
+Scenarios ported from the change part of the former PostgreSQL test `test_jobs_and_changes_db.py`
+(git history), plus the races the row locks used to serialise. Each test runs
 on its own `s2116-<uuid>` table through `CodeChangeService` wired to `DynamoChangeUnitOfWork`;
 requests are seeded with `request_item`, as intake will write them."""
 

@@ -4,20 +4,12 @@ saver as the parent workflow.
 `dynamodb_checkpointer` is the DynamoDB saver (`langgraph-checkpoint-aws`, DM 9.4): the checkpoint
 table, strongly consistent reads (a resume job may run on another worker right after the checkpoint
 was written) and mandatory S3 offload for payloads over the library's 358,400-byte threshold, under
-the `checkpoints/` key prefix of the application bucket. `postgres_checkpointer` (checkpoints in
-their own PostgreSQL schema) is the current saver until the composition switches."""
+the `checkpoints/` key prefix of the application bucket."""
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-
-import psycopg
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph_checkpoint_aws.checkpoint.dynamodb import (  # type: ignore[import-untyped]
     DynamoDBSaver,
 )
-from psycopg.rows import dict_row
-from psycopg.sql import SQL, Identifier
 
 from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.integrations.aws import AwsClients
@@ -55,30 +47,3 @@ def dynamodb_checkpointer(clients: AwsClients, settings: Settings) -> BaseCheckp
 
 def checkpoint_ttl_seconds(settings: Settings) -> int:
     return settings.checkpoint_ttl_days * SECONDS_PER_DAY
-
-
-def libpq_url(database_url: str) -> str:
-    """SQLAlchemy URL (postgresql+psycopg://) to a libpq conninfo URL."""
-    return database_url.replace("postgresql+psycopg://", "postgresql://", 1)
-
-
-@asynccontextmanager
-async def postgres_checkpointer(
-    database_url: str, schema: str
-) -> AsyncIterator[AsyncPostgresSaver]:
-    url = libpq_url(database_url)
-    async with await psycopg.AsyncConnection.connect(url, autocommit=True) as admin:
-        await admin.execute(SQL("CREATE SCHEMA IF NOT EXISTS {}").format(Identifier(schema)))
-    conn = await psycopg.AsyncConnection.connect(
-        url,
-        autocommit=True,
-        prepare_threshold=0,
-        row_factory=dict_row,
-        options=f"-c search_path={schema}",
-    )
-    try:
-        saver = AsyncPostgresSaver(conn)
-        await saver.setup()
-        yield saver
-    finally:
-        await conn.close()

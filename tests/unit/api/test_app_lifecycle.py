@@ -25,7 +25,7 @@ def test_the_api_starts_without_a_database_url_and_wires_the_webhook_on_dynamodb
     cfg = Settings.model_validate(
         {"app_env": "test", "jira_webhook_secret": SECRET, "jira_project_keys": PROJECT}
     )
-    assert cfg.database_url is None
+    assert not hasattr(cfg, "database_url")
     app = create_app(cfg)
     with TestClient(app):
         assert isinstance(app.state.webhook_service, ReceiveJiraWebhook)

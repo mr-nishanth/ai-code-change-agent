@@ -20,7 +20,6 @@ from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 _PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,31}")
-_SCHEMA = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _AWS_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}")
 _DYNAMODB_TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
 _SQS_QUEUE = re.compile(r"[A-Za-z0-9_-]{1,80}")
@@ -30,7 +29,6 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DOCKER_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}(:[A-Za-z0-9._-]{1,128})?(@sha256:[0-9a-f]{64})?")
 _EMPTY_IS_UNSET = (
-    "database_url",
     "jira_base_url",
     "jira_email",
     "jira_api_token",
@@ -75,10 +73,6 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
     log_json: bool = True
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
-
-    # ---- database ---------------------------------------------------------------------------
-    database_url: SecretStr | None = None
-    langgraph_checkpoint_schema: str = "langgraph"  # workflow state, separate from domain tables
 
     # ---- AWS: DynamoDB, SQS and S3 (integrations/aws/clients.py) ------------------------------
     # ACCA_-prefixed names so the standard AWS_* variables of a shell never configure the app.
@@ -345,14 +339,6 @@ class Settings(BaseSettings):
             msg = "DEPENDENCY_INDEX_URL must be an https:// package index URL without credentials"
             raise ValueError(msg)
         return value.rstrip("/")
-
-    @field_validator("langgraph_checkpoint_schema")
-    @classmethod
-    def _schema(cls, value: str) -> str:
-        if not _SCHEMA.fullmatch(value) or value == "public":
-            msg = "LANGGRAPH_CHECKPOINT_SCHEMA must be a lower-case schema name other than public"
-            raise ValueError(msg)
-        return value
 
     @model_validator(mode="after")
     def _coherent(self) -> "Settings":

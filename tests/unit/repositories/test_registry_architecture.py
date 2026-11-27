@@ -103,8 +103,7 @@ def test_no_vendor_centric_names_in_registry_code() -> None:
         "domain/repositories",
         "application/repositories",
         "application/git_providers",
-        "persistence/models/registry.py",
-        "persistence/repositories/registry_store.py",
+        "persistence/dynamodb/registry_store.py",
         "cli",
     ):
         target = SRC / sub
@@ -113,10 +112,14 @@ def test_no_vendor_centric_names_in_registry_code() -> None:
             assert not pattern.search(f.read_text()), f
 
 
-def test_secrets_are_not_modelled_as_columns() -> None:
-    from ai_code_change_agent.persistence.models import Base
-
+def test_secrets_are_not_modelled_as_item_attributes() -> None:
+    """No attribute the DynamoDB registry store writes or reads is named like a secret."""
     banned = re.compile(r"token|password|secret|credential|private_key|api_key", re.IGNORECASE)
-    for table in Base.metadata.tables.values():
-        if table.name.startswith(("repositor", "registry")):
-            assert not [c.name for c in table.columns if banned.search(c.name)], table.name
+    tree = ast.parse((SRC / "persistence" / "dynamodb" / "registry_store.py").read_text())
+    names = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "access_reference" in names  # the store does write attribute names as literals
+    assert not {n for n in names if banned.search(n)}

@@ -190,7 +190,7 @@ def test_default_registry_services_use_dynamodb(monkeypatch: pytest.MonkeyPatch)
     assert resolver is not None
 
 
-def test_the_cli_has_no_postgresql_code() -> None:
+def test_the_cli_has_no_sql_database_code() -> None:
     for path in CLI_SRC.glob("*.py"):
         text = path.read_text()
         for word in ("Postgres", "SqlAlchemy", "sqlalchemy", "create_engine", "DATABASE_URL"):

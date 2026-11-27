@@ -22,7 +22,6 @@ LOCAL = "http://127.0.0.1:4566"
 PROD = {
     "app_env": "production",
     "llm_provider": "bedrock",
-    "database_url": "postgresql+psycopg://u:p@h/db",
     "jira_webhook_secret": "x",
     "jira_project_keys": "SHOP",
 }

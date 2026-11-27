@@ -1,11 +1,11 @@
 """DynamoDB + SQS on Floci: worker crashes never lose a job or run it twice concurrently.
 
-Ports `tests/integration/test_worker_crash_db.py` (a real SIGKILL while a child job is leased, via
+Ports the former PostgreSQL test `test_worker_crash_db.py` (a real SIGKILL while a child job is leased, via
 `tests/support/job_crash_worker.py`), then 100 randomised kill/restart iterations with fast
 settings: a "kill" cancels the whole worker (its claim loops, handlers and heartbeats) and throws
 away its queue object with the receipt handles, as a dead process would; nothing is released.
 (`tests/integration/test_crash_recovery.py` covers dependency bundles on disk, not the database or
-the queue, so it needs no DynamoDB port and keeps running unchanged.)"""
+the queue, so it needs no DynamoDB port and runs unchanged.)"""
 
 import asyncio
 import random

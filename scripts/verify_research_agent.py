@@ -1,7 +1,8 @@
 """Live check: does the real planning agent use search_docs and fetch_reference by itself?
 
-Makes REAL model calls (cost: a few cents with claude-haiku-5-5) and needs Docker, PostgreSQL and
-the execution image. It never writes to Jira or GitHub. Usage:
+Makes REAL model calls (cost: a few cents with claude-haiku-5-5) and needs Docker, the local Floci
+emulator (DynamoDB, with the tables bootstrapped) and the execution image. It never writes to Jira
+or GitHub. Usage:
 
     uv run python scripts/verify_research_agent.py <path-to-a-python-repo-checkout>
 
@@ -19,8 +20,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import text
-
 from ai_code_change_agent.agents.coding.agent import CodingAgent
 from ai_code_change_agent.agents.coding.configuration import CodingAgentConfig, StoryContext
 from ai_code_change_agent.application.costs.usage import UsageTracker
@@ -30,19 +29,18 @@ from ai_code_change_agent.composition import (
     build_price_table,
     build_reference_tools,
     build_sandbox_manager,
+    build_usage_store,
 )
 from ai_code_change_agent.core.config import get_settings
-from ai_code_change_agent.persistence.repositories.usage_store import PostgresUsageStore
-from ai_code_change_agent.persistence.session import create_engine, create_session_factory
+from ai_code_change_agent.integrations.aws import AwsClients
 
 
 async def main(work: str) -> None:
     s = get_settings()
-    engine = create_engine(s.database_url.get_secret_value())
-    sessions = create_session_factory(engine)
+    store = build_usage_store(s, AwsClients(s))
     attempt = uuid.uuid4()
     usage = UsageTracker(
-        PostgresUsageStore(sessions),
+        store,
         build_price_table(s),
         provider=s.llm_provider,
         model=s.llm_model or "-",
@@ -102,28 +100,30 @@ async def main(work: str) -> None:
         )
     finally:
         await mgr.stop(sandbox)
-    async with engine.connect() as c:
-        rows = (
-            await c.execute(
-                text(
-                    "select stage, model, succeeded, cost_usd, input_tokens, output_tokens "
-                    "from llm_usage_records where session_id = :a order by created_at"
-                ),
-                {"a": usage.session_id},
-            )
-        ).all()
-        print(
-            json.dumps(
-                {
-                    "event": "ledger",
-                    "session": str(usage.session_id),
-                    "thread": thread,
-                    "rows": [[str(x) for x in r] for r in rows],
-                }
-            ),
-            flush=True,
-        )
-    await engine.dispose()
+    rows = await store.rows(session_id=usage.session_id)
+    print(
+        json.dumps(
+            {
+                "event": "ledger",
+                "session": str(usage.session_id),
+                "thread": thread,
+                "rows": [
+                    [
+                        str(x)
+                        for x in (
+                            r.record.stage,
+                            r.record.model,
+                            r.record.succeeded,
+                            r.record.cost_usd,
+                            r.record.usage,
+                        )
+                    ]
+                    for r in rows
+                ],
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

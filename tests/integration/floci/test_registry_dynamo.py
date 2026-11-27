@@ -1,7 +1,6 @@
 """The DynamoDB registry adapter against Floci (DYNAMODB-ACCESS-PATTERNS.md 5, R1-R20).
 
-Scenarios ported from `tests/integration/test_registry_database.py` (which stays until PostgreSQL is
-removed). Each test runs on its own `s2116-<uuid>` table through `RepositoryRegistryService` and
+Scenarios ported from the former PostgreSQL test `test_registry_database.py` (git history). Each test runs on its own `s2116-<uuid>` table through `RepositoryRegistryService` and
 `RepositoryResolver` wired to `DynamoRegistryUnitOfWork`."""
 
 import asyncio

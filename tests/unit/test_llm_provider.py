@@ -17,7 +17,6 @@ def s(**kw: object) -> Settings:
 
 
 PROD = {
-    "database_url": "postgresql://x",
     "jira_webhook_secret": "s" * 32,
     "jira_project_keys": "SHOP",
 }
@@ -98,7 +97,6 @@ def test_bedrock_is_allowed_in_beta_and_production(
     monkeypatch.delenv("ACCA_AWS_ENDPOINT_URL")  # real AWS only outside development/test
     settings = bedrock(
         app_env=env,
-        database_url="postgresql://x",
         jira_webhook_secret="s" * 32,
         jira_project_keys="SHOP",
     )

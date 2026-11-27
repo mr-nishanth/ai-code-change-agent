@@ -1,5 +1,5 @@
-"""Durable job queue port. Adapters: `DynamoSqsJobQueue` (DynamoDB state, SQS delivery, outbox
-relayed by the worker's dispatcher role) and `PostgresJobQueue` (until the composition switch)."""
+"""Durable job queue port. Adapter: `DynamoSqsJobQueue` (DynamoDB state, SQS delivery, outbox
+relayed by the worker's dispatcher role)."""
 
 import uuid
 from dataclasses import dataclass

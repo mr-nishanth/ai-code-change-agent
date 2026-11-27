@@ -26,10 +26,12 @@ def test_defaults_are_safe() -> None:
 def test_unprefixed_names_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JIRA_PROJECT_KEYS", "SHOP, OPS")
     monkeypatch.setenv("MAX_CONCURRENT_JOBS", "4")
-    monkeypatch.setenv("APP_DATABASE_URL", "postgresql://old-name-is-ignored")
+    monkeypatch.setenv("APP_DATABASE_URL", "postgres://old-name-is-ignored")
+    monkeypatch.setenv("DATABASE_URL", "postgres://no-longer-a-setting")
     loaded = s()
     assert loaded.jira_project_keys == frozenset({"SHOP", "OPS"})
-    assert loaded.max_concurrent_jobs == 4 and loaded.database_url is None
+    assert loaded.max_concurrent_jobs == 4
+    assert "database_url" not in Settings.model_fields and not hasattr(loaded, "database_url")
 
 
 @pytest.mark.parametrize(
@@ -49,7 +51,6 @@ def test_unprefixed_names_are_read_from_the_environment(monkeypatch: pytest.Monk
         {"workspace_root": "relative/dir"},
         {"artifact_root": "/a/../b"},
         {"workspace_image": "img; rm -rf /"},
-        {"langgraph_checkpoint_schema": "public"},
         {"job_lease_seconds": 60, "job_heartbeat_seconds": 40},
         {"max_concurrent_jobs": 0},
         {"workspace_network_policy": "bridge"},
@@ -84,7 +85,7 @@ def test_production_requires_its_core_settings(monkeypatch: pytest.MonkeyPatch) 
         jira_webhook_secret="x",
         jira_project_keys="SHOP",
     )
-    assert ok.jira_webhook_configured and ok.database_url is None  # DynamoDB only
+    assert ok.jira_webhook_configured and not hasattr(ok, "database_url")  # DynamoDB only
 
 
 def test_reference_limits_default_to_the_documented_values() -> None:
@@ -127,7 +128,6 @@ def test_reference_limits_are_read_from_the_environment(monkeypatch: pytest.Monk
 # ---- AWS (DynamoDB, SQS, S3) -----------------------------------------------------------------
 PROD = {
     "llm_provider": "bedrock",
-    "database_url": "postgresql+psycopg://u:p@h/db",
     "jira_webhook_secret": "x",
     "jira_project_keys": "SHOP",
 }

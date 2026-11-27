@@ -67,7 +67,7 @@ def result(message: AIMessage) -> LLMResult:
 
 
 class MemoryStore:
-    """Same idempotency as the PostgreSQL ledger: call id and provider message id are unique."""
+    """Same idempotency as the DynamoDB ledger: call id and provider message id are unique."""
 
     def __init__(self) -> None:
         self.records: list[LlmCallRecord] = []
@@ -477,9 +477,9 @@ class AcceptingStore:
 async def test_a_replayed_accounting_event_is_handed_to_the_ledger_which_owns_the_dedupe() -> None:
     """The tracker does no cross-handler dedupe: a resumed phase run builds new handlers, so a
     replayed provider message reaches the store again under a new call id with its provider
-    message id intact. The PostgreSQL ledger refuses it on uq_llm_usage_records_provider_message_id
-    (tests/integration/test_usage_ledger_db.py::test_the_ledger_is_idempotent_append_only_and_
-    survives_restarts); this pins the tracker side of that contract."""
+    message id intact. The DynamoDB ledger refuses it on its provider message id guard item
+    (tests/integration/floci/test_usage_dynamo.py::
+    test_a_replayed_call_or_provider_message_records_nothing); this pins the tracker side of that contract."""
     store, a = AcceptingStore(), uuid.uuid4()
     tracker = UsageTracker(
         store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=D("1")

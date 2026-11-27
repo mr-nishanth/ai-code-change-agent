@@ -50,6 +50,23 @@ def test_sdk_imports_are_confined() -> None:
     }
 
 
+def test_nothing_imports_a_sql_driver_orm_or_migration_tool() -> None:
+    """DynamoDB is the only application database: no path to PostgreSQL in src or studio."""
+    banned = (
+        "sqlalchemy",
+        "psycopg",
+        "psycopg2",
+        "asyncpg",
+        "alembic",
+        "langgraph.checkpoint.postgres",
+    )
+    sources = [*files(), *sorted((ROOT / "studio").rglob("*.py")), *(ROOT / "scripts").glob("*.py")]
+    assert len(sources) > 50 and any(p.parent.name == "studio" for p in sources)
+    for p in sources:
+        for name in imports(p):
+            assert not any(name == b or name.startswith(b + ".") for b in banned), (p, name)
+
+
 def test_there_is_exactly_one_agent_and_it_holds_no_credentials() -> None:
     agent_files = files("agents")
     assert {p.parent.name for p in agent_files if p.name == "agent.py"} == {"coding"}

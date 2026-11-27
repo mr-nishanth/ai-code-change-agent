@@ -1,7 +1,6 @@
 """The DynamoDB webhook intake adapter against Floci (DYNAMODB-ACCESS-PATTERNS.md 1, W1-W7).
 
-Scenarios ported from `tests/integration/test_webhook_repository.py` (which stays until PostgreSQL is
-removed). Each test runs on its own `s2116-<uuid>` table; counts come from a consistent scan."""
+Scenarios ported from the former PostgreSQL test `test_webhook_repository.py` (git history). Each test runs on its own `s2116-<uuid>` table; counts come from a consistent scan."""
 
 import asyncio
 import json

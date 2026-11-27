@@ -1,30 +1,11 @@
 # Local development stack for ai-code-change-agent (independent of any other project).
 # The application stores everything in DynamoDB, SQS and S3: locally the Floci emulator
 # (infra/docker-compose.yml, its own compose project and the external `acca-floci` network; start it
-# and run its bootstrap first). The `postgres` service is no longer used by the application and
-# nothing depends on it; it is removed with the rest of PostgreSQL later.
+# and run its bootstrap first). There is no database service: PostgreSQL is not part of the stack.
 # The worker is NOT a service here: it runs on the host with `uv run ai-code-change worker`
 # because it controls the Docker daemon for execution sandboxes (see docs/ARCHITECTURE.md).
 name: ai-code-change-agent
 services:
-  postgres:
-    image: postgres:16
-    container_name: acca-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: acca
-      POSTGRES_PASSWORD: acca_dev_only
-      POSTGRES_DB: ai_code_change_agent
-    ports:
-      - "127.0.0.1:5435:5432"
-    volumes:
-      - acca_pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U acca -d ai_code_change_agent"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   api:
     build:
       context: .
@@ -62,5 +43,7 @@ networks:
     external: true
     name: acca-floci
 
-volumes:
-  acca_pgdata:
+# The former `acca_pgdata` volume is deliberately not declared: nothing uses it, and
+# `docker compose down --volumes` never removes an undeclared volume. An `acca-postgres` container
+# left by an earlier checkout counts as an orphan here: do not pass `--remove-orphans` while it
+# must keep running.

@@ -1,6 +1,6 @@
 """The DynamoDB usage ledger and cost queries against Floci (DYNAMODB-ACCESS-PATTERNS.md 6, U1-U5).
 
-Ported from `tests/integration/test_usage_ledger_db.py` (which stays until PostgreSQL is removed):
+Ported from the former PostgreSQL test `test_usage_ledger_db.py` (git history):
 idempotent, append-only inserts that survive a restart. The reports a worker prints are compared
 with `golden/usage_reports.txt`, which the PostgreSQL store produced once from the same fixture
 (`tests/support/cost_ledger.py`); the SQL path is not run here. Each test runs on its own

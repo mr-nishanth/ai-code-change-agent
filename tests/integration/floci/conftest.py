@@ -16,11 +16,6 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(pytest.mark.floci)
 
 
-@pytest.fixture(autouse=True)
-def clean_db() -> None:
-    """Overrides the integration suite's autouse fixture: Floci tests never touch PostgreSQL."""
-
-
 def _docker(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 - fixed docker argv in a test helper
         ["docker", *args],  # noqa: S607

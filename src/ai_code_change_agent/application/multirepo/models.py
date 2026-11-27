@@ -1,4 +1,4 @@
-"""Parent and child execution records (persisted in PostgreSQL)."""
+"""Parent and child execution records (persisted in DynamoDB)."""
 
 import uuid
 from dataclasses import dataclass

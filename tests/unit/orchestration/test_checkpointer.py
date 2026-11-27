@@ -17,7 +17,6 @@ from ai_code_change_agent.orchestration.langgraph.runner import _config
 PROD = {
     "app_env": "production",
     "llm_provider": "bedrock",
-    "database_url": "postgresql+psycopg://u:p@h/db",
     "jira_webhook_secret": "x",
     "jira_project_keys": "SHOP",
 }

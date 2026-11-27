@@ -153,7 +153,7 @@ async def test_container_runs_unprivileged_with_a_read_only_root(
 async def test_container_cannot_see_the_host_or_secrets(
     rt: DockerWorkspaceRuntime, sample: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://leak:leak@h/db")
+    monkeypatch.setenv("DATABASE_URL", "db://leak:leak@h/db")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "LEAKED-AWS")
     monkeypatch.setenv("GITHUB_TOKEN", "LEAKED-GH")
     h = await make(rt, sample)

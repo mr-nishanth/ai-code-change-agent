@@ -1,7 +1,6 @@
 """The DynamoDB + SQS job queue against Floci (DYNAMODB-DATA-MODEL.md 8, J1-J8).
 
-The contract of `tests/integration/test_jobs_and_changes_db.py` (which stays until PostgreSQL is
-removed), plus the outbox relay, the sweep, duplicate/late messages and the DLQ. Leases and retries
+The contract of the former PostgreSQL test `test_jobs_and_changes_db.py` (git history), plus the outbox relay, the sweep, duplicate/late messages and the DLQ. Leases and retries
 are real (a few seconds) instead of SQL clock edits: the message's visibility follows the lease.
 Each test has its own `s2116-<uuid>` table, queue and DLQ."""
 

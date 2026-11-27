@@ -1,6 +1,6 @@
 """Floci coverage for the container-backed services: ECR, ECS, RDS, Lambda and API Gateway.
 
-These tests make Floci start real sibling containers (registry, ECS tasks, PostgreSQL, Lambda
+These tests make Floci start real sibling containers (registry, ECS tasks, an RDS database, Lambda
 runtimes), so they need Docker as well as Floci and skip with a reason when either is missing or a
 required image cannot be pulled. Every resource is uniquely named and deleted in `finally`; every
 wait is bounded. `docker login` writes only to a temporary DOCKER_CONFIG, never to ~/.docker."""
@@ -10,6 +10,8 @@ import io
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import zipfile
 from collections.abc import Iterator
@@ -17,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import psycopg
 import pytest
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
@@ -226,6 +227,24 @@ def _rds_volumes(resource_id: str) -> list[str]:
     return listed.stdout.split()
 
 
+def _rds_container(resource_id: str) -> str:
+    """The database container Floci started for the instance (the one mounting its data volume)."""
+    for volume in _rds_volumes(resource_id):
+        ps = _docker("ps", "--filter", f"volume={volume}", "--format", "{{.Names}}")
+        assert ps.returncode == 0, ps.stderr
+        if names := ps.stdout.split():
+            return names[0]
+    raise AssertionError(f"no running container mounts the volume of {resource_id}")
+
+
+def _speaks_postgres_wire_protocol(port: int) -> bool:
+    """An SSLRequest (the protocol's first message) through Floci's host-side proxy port: a
+    PostgreSQL server answers one byte, S or N. No database driver is needed."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(struct.pack("!ii", 8, 80877103))
+        return conn.recv(1) in (b"S", b"N")
+
+
 def test_rds_postgres_create_connect_query_delete(floci: str, docker_ready: None) -> None:
     _ensure_image(RDS_POSTGRES_IMAGE)
     rds = floci_client("rds")
@@ -255,21 +274,21 @@ def test_rds_postgres_create_connect_query_delete(floci: str, docker_ready: None
         assert port in RDS_PORTS
         assert _rds_volumes(resource_id), "expected the instance's data volume"
 
-        with (
-            psycopg.connect(
-                host="127.0.0.1",
-                port=port,
-                user=user,
-                password=password,
-                dbname="postgres",
-                connect_timeout=5,
-            ) as conn,
-            conn.cursor() as cur,
-        ):
-            cur.execute("CREATE TABLE acca_probe (id int PRIMARY KEY, note text NOT NULL)")
-            cur.execute("INSERT INTO acca_probe VALUES (1, 'floci')")
-            cur.execute("SELECT note FROM acca_probe WHERE id = 1")
-            assert cur.fetchone() == ("floci",)
+        assert _speaks_postgres_wire_protocol(port)
+        # The SQL round trip runs psql inside the instance's own container over TCP (password
+        # authentication with the master credentials), so the test needs no PostgreSQL driver.
+        sql = (
+            "CREATE TABLE acca_probe (id int PRIMARY KEY, note text NOT NULL); "
+            "INSERT INTO acca_probe VALUES (1, 'floci'); "
+            "SELECT note FROM acca_probe WHERE id = 1"
+        )
+        psql = _docker(
+            "exec", "-e", f"PGPASSWORD={password}", _rds_container(resource_id),
+            "psql", "-h", "127.0.0.1", "-U", user, "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+            "-tA", "-c", sql,
+        )  # fmt: skip
+        assert psql.returncode == 0, psql.stderr[-500:]
+        assert psql.stdout.strip().splitlines()[-1] == "floci"
 
         rds.delete_db_instance(DBInstanceIdentifier=instance, SkipFinalSnapshot=True)
         deleted = True

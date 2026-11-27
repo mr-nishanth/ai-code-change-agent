@@ -1,7 +1,7 @@
 """The operator CLI on DynamoDB, SQS and S3 against Floci (default composition, no injection).
 
-Ported from the CLI parts of `tests/integration/test_registry_database.py` and
-`tests/integration/test_workflow_persistence_db.py`. Each test points the CLI's Settings at its own
+Ported from the CLI parts of the former PostgreSQL tests `test_registry_database.py` and
+`test_workflow_persistence_db.py` (git history). Each test points the CLI's Settings at its own
 `s2116-<uuid>` table and job queue (+ DLQ) through `ACCA_*` variables with an explicit loopback
 endpoint; `AWS_PROFILE` and `AWS_ENDPOINT_URL` are set to unusable values (by `app_table`) to prove the
 CLI never reads them."""

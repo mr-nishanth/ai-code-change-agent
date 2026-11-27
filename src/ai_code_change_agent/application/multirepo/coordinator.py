@@ -48,7 +48,7 @@ REPORT_STALE_SECONDS = 300  # an IN_PROGRESS claim older than this belongs to a 
 
 
 class ReportRetryableError(Exception):
-    """Raised by the report job so the PostgreSQL job queue retries it with backoff."""
+    """Raised by the report job so the job queue retries it with backoff."""
 
 
 def report_marker(parent_id: uuid.UUID, report_round: int) -> str:

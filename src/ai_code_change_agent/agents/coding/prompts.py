@@ -57,7 +57,7 @@ dependencies declared in the repository's manifests (uv.lock, pyproject.toml, re
 listed below when present. Check which Python packages are importable in the sandbox (for example
 `python -c "import fastapi"`). List in `dependencies` only additional packages or stricter
 compatible pins the implementation or its tests need that are missing from both the sandbox and
-the repository manifest, as a plain requirement such as `flask` or `sqlalchemy==2.0.36` (no URLs,
+the repository manifest, as a plain requirement such as `flask` or `httpx==0.28.1` (no URLs,
 paths, extras, markers or comments). Leave it EMPTY when everything needed is already importable
 or covered by the repository manifest; never duplicate already-installed packages unless tightening
 a constraint. The platform prepares the combined set, offline, before implementation; nothing else

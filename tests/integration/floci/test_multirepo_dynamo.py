@@ -1,6 +1,6 @@
 """The DynamoDB multi-repository store against Floci (DYNAMODB-ACCESS-PATTERNS.md 3, M1-M11).
 
-Ported from `tests/integration/test_parent_report_db.py` (which stays until PostgreSQL is removed):
+Ported from the former PostgreSQL test `test_parent_report_db.py` (git history):
 the durable Jira report lifecycle, now driven by an injected clock instead of rewriting
 `jira_report_at` in SQL; plus the create, compare-and-set and attempt-link behaviour the SQL
 constraints and index used to give. Each test runs on its own `s2116-<uuid>` table."""
