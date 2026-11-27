@@ -15,7 +15,7 @@ HTTP request (timeouts, 5xx) keep the token, which makes them idempotent."""
 import asyncio
 import uuid
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer  # type: ignore[import-untyped]
 from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[import-untyped]
@@ -120,13 +120,15 @@ class Table:
         names: Mapping[str, str] | None = None,
         values: Mapping[str, Any] | None = None,
         on_failed: Failure | None = None,
+        return_values: Literal["ALL_NEW", "ALL_OLD"] = "ALL_NEW",
     ) -> Item:
-        """Apply an update expression; returns the item after the update (`ALL_NEW`)."""
+        """Apply an update expression; returns the item after (`ALL_NEW`, the default) or before
+        (`ALL_OLD`, empty when the item did not exist) the update."""
         request = {
             "TableName": self.name,
             "Key": serialize_item(key.as_dict()),
             "UpdateExpression": update,
-            "ReturnValues": "ALL_NEW",
+            "ReturnValues": return_values,
             **expression_args(condition=condition, names=names, values=values),
             **_failure_args(on_failed),
         }
