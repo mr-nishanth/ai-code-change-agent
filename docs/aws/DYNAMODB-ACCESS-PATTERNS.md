@@ -1,15 +1,18 @@
-# S2116 DynamoDB access patterns (derived from code)
+# DynamoDB access patterns (derived from code)
 
-Status: design input for S2116, 2026-11-27. Read-only analysis of branch
-`feature/s2116-dynamodb-aws-alignment` at `26ce3fd`. Every row comes from a repository method in
+Status: approved design input (owner, 2026-11-27). Read-only analysis of the PostgreSQL implementation
+at commit `26ce3fd`; every file:line reference points at that commit. DynamoDB starts empty: no
+record is migrated, there is no dual-write period and no backend flag. The SQL adapters, models and
+Alembic migrations cited below are deleted when DynamoDB becomes the only database (ADR-015); git
+history keeps them. Every row comes from a repository method in
 `src/ai_code_change_agent/persistence` or from a direct SQL caller (studio). Paths below are relative
 to `src/ai_code_change_agent/` unless they start with `studio/` or `tests/`. Key names refer to
-[S2116-DYNAMODB-DATA-MODEL.md](S2116-DYNAMODB-DATA-MODEL.md).
+[DYNAMODB-DATA-MODEL.md](DYNAMODB-DATA-MODEL.md).
 
 Legend:
 
 - **Frequency**: per Story (one Jira delivery), per attempt, per LLM call, per job, per heartbeat, or
-  operator (CLI, rare). Measured volume in the local database on 2026-11-27: 5 deliveries,
+  operator (CLI, rare). Measured volume in the local database on 2026-11-27 (sizing only; none of it is migrated): 5 deliveries,
   5 requests, 19 attempts, 19 approvals, 25 jobs, 4 repositories, 8 profile versions, 4 mappings,
   36 audit events, 339 usage rows (about 18 per attempt), 2 parents, 5 children, 948 LangGraph
   checkpoints with a largest blob of 1,246,727 bytes.
@@ -153,7 +156,7 @@ Adapter: `persistence/repositories/usage_store.py` (`PostgresUsageStore`). Ports
 
 | # | Operation (file:line) | Current op | Purpose | Frequency | Consistency | Size | Proposed |
 |---|---|---|---|---|---|---|---|
-| L1 | `orchestration/langgraph/checkpointer.py:18-37` | `AsyncPostgresSaver` in schema `langgraph` (ADR C8), `setup()` at worker start (`composition.py:468`) | Workflow graph (`thread_id = attempt:<aid>`, `orchestration/langgraph/runner.py:9-10`) and Deep Agent phase threads (`attempt:<aid>:planning:<run>`, `attempt:<aid>:implementation:<repairs>:<run>`, `orchestration/steps.py:447,603-604`) | every super-step: hundreds per attempt (948 checkpoints, 2,350 writes for 19 attempts) | **strong**: a resume job on another worker reads the checkpoint the previous run wrote | blobs up to 1.2 MB measured | `DynamoDBSaver` from `langgraph-checkpoint-aws==1.3.0`, table `acca-checkpoints`, `consistent_read=True`, S3 offload for payloads over 350 KB. Verified on Floci (data model section 6) |
+| L1 | `orchestration/langgraph/checkpointer.py:18-37` | `AsyncPostgresSaver` in schema `langgraph` (ADR C8), `setup()` at worker start (`composition.py:468`) | Workflow graph (`thread_id = attempt:<aid>`, `orchestration/langgraph/runner.py:9-10`) and Deep Agent phase threads (`attempt:<aid>:planning:<run>`, `attempt:<aid>:implementation:<repairs>:<run>`, `orchestration/steps.py:447,603-604`) | every super-step: hundreds per attempt (948 checkpoints, 2,350 writes for 19 attempts) | **strong**: a resume job on another worker reads the checkpoint the previous run wrote | blobs up to 1.2 MB measured | `DynamoDBSaver` from `langgraph-checkpoint-aws==1.3.0`, table `acca-checkpoints`, `consistent_read=True`, S3 offload for payloads over 358,400 bytes (350 KiB; data model section 9.2). Verified on Floci (data model section 6) |
 | L2 | `runner.py:18-23` `aget_state` then `ainvoke`; `runner.py:26-30` `Command(resume=True)`; `runner.py:32-39` interrupts | Saver reads/writes | Start once, resume after a gate (`orchestration/langgraph/nodes.py:43` `interrupt`) | per job | strong | - | Same saver API; verified interrupt/resume across two saver instances |
 | L3 | `studio/live.py:86-93` | `SELECT thread_id, max(checkpoint_id) FROM checkpoints WHERE thread_id LIKE 'attempt:<aid>:%' AND checkpoint_ns = '' GROUP BY thread_id` | Find an attempt's agent threads | dev only | eventual OK | - | DynamoDBSaver keys threads as `CHECKPOINT_<thread_id>` (no prefix query). Write a thread index item `ATTEMPT#<aid>/THREAD#<thread_id>` when a phase run starts; studio queries `begins_with(SK,'THREAD#')` |
 | L4 | `studio/live.py:33-46,104` | Read-only `AsyncPostgresSaver`, `aget_state` per thread | Show live agent state | dev only | eventual OK | - | Same DynamoDBSaver (read-only use) |

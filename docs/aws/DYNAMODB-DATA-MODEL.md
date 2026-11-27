@@ -1,7 +1,10 @@
-# S2116 DynamoDB data model, job model and checkpointer
+# DynamoDB data model, job model and checkpointer
 
-Status: **design, awaiting owner approval** (2026-11-27). Branch `feature/s2116-dynamodb-aws-alignment`.
-Inputs: [S2116-DYNAMODB-ACCESS-PATTERNS.md](S2116-DYNAMODB-ACCESS-PATTERNS.md) (every access pattern,
+Status: **approved by the owner** (2026-11-27). Branch `feature/dynamodb-aws-alignment`. DynamoDB starts
+empty: no data is migrated from PostgreSQL, there is no dual-write period, no backend flag and no
+PostgreSQL fallback. PostgreSQL leaves the runtime in one cut (ADR-015). Implementation audit:
+[S2116-IMPLEMENTATION-AUDIT.md](S2116-IMPLEMENTATION-AUDIT.md).
+Inputs: [DYNAMODB-ACCESS-PATTERNS.md](DYNAMODB-ACCESS-PATTERNS.md) (every access pattern,
 with file:line), live probes against Floci 2.5.0 on `127.0.0.1:4566` with dummy credentials (section 10),
 and the Floci documentation at tag `2.5.0` (`github.com/floci-io/floci`, `docs/services/*.md`, cited as
 `file:line`). Nothing here touches real AWS, GitHub, Jira or a model.
@@ -15,11 +18,11 @@ roles, no static repository allowlist; no one-to-one table conversion.
 
 | Resource | Name (setting) | Purpose |
 |---|---|---|
-| DynamoDB table | `acca-<env>-app`, locally `acca-local-app` (`DYNAMODB_TABLE_NAME`); called `acca-app` below | All domain state, registry, usage ledger, job state, uniqueness guards, outbox |
-| DynamoDB table | `acca-<env>-checkpoints`, locally `acca-local-checkpoints` (`DYNAMODB_CHECKPOINT_TABLE_NAME`); called `acca-checkpoints` below | LangGraph checkpoints, schema owned by `langgraph-checkpoint-aws` (`PK`/`SK` strings, TTL attribute `ttl`) |
-| SQS standard queue | `acca-<env>-jobs`; locally the existing S2115 queue `acca-local-jobs` (`SQS_JOB_QUEUE_URL`) | Job delivery: body `{"job_id": "<uuid>"}` only |
+| DynamoDB table | `acca-<env>-app`, locally `acca-local-app` (`ACCA_DYNAMODB_TABLE_NAME`); called `acca-app` below | All domain state, registry, usage ledger, job state, uniqueness guards, outbox |
+| DynamoDB table | `acca-<env>-checkpoints`, locally `acca-local-checkpoints` (`ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME`); called `acca-checkpoints` below | LangGraph checkpoints, schema owned by `langgraph-checkpoint-aws` (`PK`/`SK` strings, TTL attribute `ttl`) |
+| SQS standard queue | `acca-<env>-jobs`; locally the existing S2115 queue `acca-local-jobs` (`ACCA_SQS_JOB_QUEUE_NAME`) | Job delivery: body `{"job_id": "<uuid>"}` only |
 | SQS standard queue | `acca-<env>-jobs-dlq`; locally the existing `acca-local-jobs-dlq` | Poison messages (`maxReceiveCount` 20) |
-| S3 bucket | `acca-<env>-artifacts`; locally the existing `acca-local-artifacts` (`S3_BUCKET_NAME`) | Prefix `artifacts/` (attempt artifacts), prefix `checkpoints/` (checkpoint payloads over 350 KB) |
+| S3 bucket | `acca-<env>-artifacts`; locally the existing `acca-local-artifacts` (`ACCA_S3_BUCKET_NAME`) | Prefix `artifacts/` (attempt artifacts), prefix `checkpoints/` (checkpoint payloads over 350 KB) |
 
 Both tables are on-demand (`PAY_PER_REQUEST`). In AWS: point-in-time recovery, deletion protection and
 encryption at rest on both tables; bucket versioning off (artifacts are write-once by
@@ -98,7 +101,7 @@ its attempts, approvals, active guards, parent and children (tens of items, one 
 
 ## 5. Invariants: constraints and triggers mapped to conditions and transactions
 
-| Postgres today | DynamoDB mechanism |
+| PostgreSQL mechanism (removed) | DynamoDB mechanism |
 |---|---|
 | `SELECT ... FOR UPDATE` (C2, C5, R3, R16, M9) | Optimistic lock: consistent read records `row_version`; the commit transaction conditions every item it depends on (`Update` with `row_version = :seen`, or `ConditionCheck`). On `TransactionCanceledException` with `ConditionalCheckFailed` or `TransactionConflict`, the service method is retried (bounded, jittered; section 5.1) |
 | Unique `delivery_id`, `jira_issue_id`, `dedupe_key`, call id, `provider_message_id`, `canonical_locator`, `(git_provider, provider_repository_id)`, aliases and keys | A guard item keyed by the unique value, written with `attribute_not_exists(PK)` in the same transaction as the entity |
@@ -146,7 +149,7 @@ No LSIs (they would cap item collections at 10 GB and must be created with the t
 **TTL.** Attribute `expires_at` on `acca-app`. Set only on terminal job items (`SUCCEEDED`/`DEAD`;
 default retention 90 days). Never set on domain records, the usage ledger, the audit log or dedupe
 guards: job dedupe is permanent today. The checkpoint table uses the library's `ttl` attribute
-(retention is an approval item). TTL deletion is lazy, "within a few days" on AWS and about 60 s on Floci
+(90 days, owner-approved). TTL deletion is lazy, "within a few days" on AWS and about 60 s on Floci
 (`dynamodb.md:151-155`). Correctness never depends on it.
 
 **Item size (400 KB).** Enforced by Floci (probe: a 410 KB item was rejected with
@@ -182,7 +185,8 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 | Step | DynamoDB (authoritative) | SQS (delivery) |
 |---|---|---|
 | Enqueue (J1, W6) | `TransactWriteItems`: `JOBKEY#` guard + `JOB#` item (QUEUED, `GSI3` set = outbox row) | Worker-side producers send `{"job_id"}` right after commit and then `REMOVE` the GSI3 keys. The API never sends (no SQS permission); the relay picks its jobs up |
-| Relay (J8) | `Query GSI3 DISPATCH` for due rows, consistent re-read | `SendMessage`, then clear GSI3 keys on QUEUED jobs. Runs in the worker every 2 s, the poll interval today |
+| Relay (J8) | `Query GSI3 DISPATCH` for due rows, consistent re-read | `SendMessage`, then clear GSI3 keys on QUEUED jobs. Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
+process) every 2 s, the poll interval today |
 | Claim (J2) | Conditional `UpdateItem` (same predicate as `_CLAIM`), `ALL_NEW` | `ReceiveMessage` (`WaitTimeSeconds` 20, `VisibilityTimeout` = lease, `MaxNumberOfMessages` 1 per free slot) |
 | Not claimable | Read the item | Terminal -> `DeleteMessage`; not due -> `ChangeMessageVisibility(available_at - now)`; leased elsewhere -> visibility = remaining lease; exhausted and expired -> mark DEAD, `DeleteMessage` |
 | Heartbeat (J4) | Conditional lease extension (owner, RUNNING, not expired) | `ChangeMessageVisibility(lease)`; failure is non-fatal (DynamoDB decides) |
@@ -233,8 +237,18 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 
 - Table schema: `PK`/`SK` strings; items `CHECKPOINT_<thread_id>` / `<ns>#<checkpoint_id>`, payloads under
   `CHUNK_...`, writes under `WRITES_...` (`checkpoint/dynamodb/README.md`, "Unified Table Design").
-- Payloads of 350 KB or more go to S3 when `s3_offload_config` is set; otherwise they stay in DynamoDB
-  and fail at 400 KB. **S3 offload is mandatory here**: the largest blob already stored is 1.2 MB.
+- Payloads larger than `S3_OFFLOAD_THRESHOLD = 350 * 1024` (358,400 bytes, a module constant in
+  `checkpoint/dynamodb/storage_strategy.py:24`, not configurable) go to S3 when `s3_offload_config` is set;
+  otherwise they stay in DynamoDB and fail at the 400 KB item limit. **S3 offload is mandatory here**:
+  the largest blob already stored is 1.2 MB.
+- Threshold safety, accounting for item metadata: each payload is written as its own chunk item
+  (`PK` = `CHUNK_...` string, `SK` = `CHUNK`, `payload` binary, optional `ttl` number;
+  `storage_strategy.py:247-256`); the checkpoint's base item holds only keys and references. The
+  DynamoDB item limit is 409,600 bytes including attribute names, so a chunk item at the threshold is
+  358,400 bytes of payload plus under 1 KB of names, keys and TTL (thread ids here are under 120
+  characters), leaving about 50 KB of headroom. The application keeps thread ids under 200 characters
+  and tests a payload at exactly 358,400 bytes (stays in DynamoDB), one byte over (goes to S3), and
+  states of 600 KB and 1.3 MB (offloaded, round-tripped, deleted with the thread).
 - `consistent_read` (keyword, default `False`): "Enable this when a different worker or process may
   resume a thread immediately after a checkpoint is written". This applies to the resume job after
   an approval, so `True`.
@@ -255,11 +269,11 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 | 600 KB state, no S3 offload | Failed: `ValidationException ... Item size has exceeded the maximum allowed size` |
 | 600 KB state, S3 offload to a Floci bucket | Passed (interrupt, resume, 600,000-byte value intact); `adelete_thread` also removed the S3 objects (0 left) |
 
-### 9.4 Recommended configuration
+### 9.4 Configuration (approved)
 
 `DynamoDBSaver(table_name=<checkpoint table>, session=<app session>, boto_config=<app config>,
 consistent_read=True, s3_offload_config={"bucket_name": <bucket>, "endpoint_url": <local only>},
-ttl_seconds=<approval: 90 days>)`, pinned `langgraph-checkpoint-aws==1.3.0` (exact: 15 releases since
+ttl_seconds=7_776_000)` (90 days), pinned `langgraph-checkpoint-aws==1.3.0` (exact: 15 releases since
 1.0.4). Add the conformance suite to the `floci` tests so an upgrade is gated.
 
 ## 10. Floci 2.5.0 verification
@@ -333,19 +347,21 @@ The stub cannot drive a Deep Agent, which needs tool calls.
    rejects both. Visibility failures are non-fatal in the design; Settings cap the lease.
 4. TTL is swept every 60 s on Floci but lazily on AWS; tests must not wait for TTL deletion as proof of
    behaviour.
-5. IAM is not enforced by default; least-privilege policies are reviewed, not tested locally, unless
+5. The current floci.io environment page lists `FLOCI_SERVICES_DYNAMODB_TRANSACTION_CONFLICTS_ENABLED`, but the
+   2.5.0 reference does not, so it is not used with the pinned image; `Stubber` tests cover conflicts.
+6. IAM is not enforced by default; least-privilege policies are reviewed, not tested locally, unless
    a test enables `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED`.
-6. GSI queries read the base table on Floci (`dynamodb.md:379`), so local latency is not representative.
-7. Bedrock: no prompt caching or cache-token accounting through the proxy; `InvokeModel` unsupported on
+7. GSI queries read the base table on Floci (`dynamodb.md:379`), so local latency is not representative.
+8. Bedrock: no prompt caching or cache-token accounting through the proxy; `InvokeModel` unsupported on
    the proxy (contradicting the docs); stub has no tool use.
-8. Persistence default (`single-file`) rewrites all tables on each write (`dynamodb.md:293`).
+9. Persistence default (`single-file`) rewrites all tables on each write (`dynamodb.md:293`).
 
 ## 11. LLM modes
 
 | Mode | Settings | Path | Where allowed |
 |---|---|---|---|
 | `anthropic` | `LLM_PROVIDER=anthropic` | `ChatAnthropic` (unchanged) | development, test (Settings already refuse it in staging/production, `core/config.py:311-313`) |
-| bedrock via Floci | `LLM_PROVIDER=bedrock`, `BEDROCK_ENDPOINT_URL=http://127.0.0.1:4566` (new; development/test only; loopback only) | `ChatBedrockConverse(endpoint_url=...)` -> Floci `proxy` -> OpenAI-compatible upstream | local |
+| bedrock via Floci | `LLM_PROVIDER=bedrock`, `ACCA_BEDROCK_ENDPOINT_URL=http://127.0.0.1:4566` from the host or `http://acca-floci:4566` from a container on the `acca-floci` network (new; development/test only; loopback or a single-label Docker hostname only) | `ChatBedrockConverse(endpoint_url=...)` -> Floci `proxy` -> OpenAI-compatible upstream | local |
 | real Bedrock | `LLM_PROVIDER=bedrock`, no endpoint override | `ChatBedrockConverse` -> AWS Bedrock Runtime | staging, production |
 
 Upstream for the Floci proxy, without LiteLLM: Anthropic's OpenAI SDK compatibility endpoint
