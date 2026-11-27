@@ -14,7 +14,7 @@ HTTP request (timeouts, 5xx) keep the token, which makes them idempotent."""
 
 import asyncio
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer  # type: ignore[import-untyped]
@@ -24,6 +24,7 @@ from ai_code_change_agent.persistence.dynamodb.errors import (
     Classified,
     Failure,
     Item,
+    PersistenceError,
     RetryPolicy,
     classify,
     resolve_failure,
@@ -35,6 +36,7 @@ from ai_code_change_agent.persistence.dynamodb.keys import Key
 if TYPE_CHECKING:
     from ai_code_change_agent.persistence.dynamodb.transactions import TxBuilder
 
+BATCH_GET_LIMIT = 100  # keys per BatchGetItem request (DynamoDB limit)
 _SERIALIZER = TypeSerializer()
 _DESERIALIZER = TypeDeserializer()
 
@@ -195,6 +197,36 @@ class Table:
             if not last:
                 return items
             request["ExclusiveStartKey"] = last
+
+    async def batch_get(
+        self, item_keys: Iterable[Key], *, consistent: bool = True
+    ) -> dict[Key, Item]:
+        """The items that exist among `item_keys` (BatchGetItem, 100 keys per request, strongly
+        consistent by default). `UnprocessedKeys` are re-sent with the retry policy's backoff; a
+        batch still unprocessed when the attempts run out is `PersistenceError`."""
+        unique = list(dict.fromkeys(item_keys))
+        found: dict[Key, Item] = {}
+        for start in range(0, len(unique), BATCH_GET_LIMIT):
+            chunk = unique[start : start + BATCH_GET_LIMIT]
+            pending: dict[str, Any] = {
+                "Keys": [serialize_item(key.as_dict()) for key in chunk],
+                "ConsistentRead": consistent,
+            }
+            for retry in range(self.retry.attempts):
+                response = await self._call(
+                    "batch_get_item", {"RequestItems": {self.name: pending}}
+                )
+                for raw in response.get("Responses", {}).get(self.name, []):
+                    item = deserialize_item(raw) or {}
+                    found[Key.of(item)] = item
+                unprocessed = response.get("UnprocessedKeys", {}).get(self.name)
+                if not unprocessed or not unprocessed.get("Keys"):
+                    break
+                if retry + 1 >= self.retry.attempts:
+                    raise PersistenceError("batch_get_unprocessed_keys")
+                await self.retry.sleep(self.retry.delay(retry))
+                pending = dict(unprocessed)
+        return found
 
     async def transact_write(self, tx: "TxBuilder") -> None:
         request = tx.request()

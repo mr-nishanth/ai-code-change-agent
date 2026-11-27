@@ -1,0 +1,236 @@
+## rows: attempt A12 (5)
+2026-11-20T10:01:40.123456+00:00 | 00000000-0000-0000-0000-00000000d005 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a12_1 | True | 1500/400/0/0/1000 | 2E-10 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d006 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_2 | True | 9000/1100/0/0/0 | 0.0441000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d007 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_3 | True | 250000/4000/300/0/0 | 1.2345678901 | True | None | anthropic-2026-11 | None
+2026-11-20T10:02:00.123456+00:00 | 00000000-0000-0000-0000-00000000d008 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | correction | anthropic | claude-sonnet-5-5 | msg_a12_4 | True | 7000/650/0/0/6000 | 0.0301500000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:10.123456+00:00 | 00000000-0000-0000-0000-00000000d009 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | research | anthropic | claude-haiku-5-5 | None | True | 3000/200/0/0/0 | 0.0130000000 | False | None | anthropic-2026-11 | None
+
+## rows: attempts A11+A22 (5)
+2026-11-20T10:00:00.123456+00:00 | 00000000-0000-0000-0000-00000000d001 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a11_1 | True | 1200/300/100/0/50 | 0.0123456789 | False | None | anthropic-2026-11 | None
+2026-11-20T10:00:10.123456+00:00 | 00000000-0000-0000-0000-00000000d002 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a11_2 | True | 5400/900/0/2000/800 | 0.2500000000 | False | us | anthropic-2026-11 | None
+2026-11-20T10:00:20.123456+00:00 | 00000000-0000-0000-0000-00000000d003 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | None | False | - | None | False | None | anthropic-2026-11 | APITimeoutError
+2026-11-20T10:02:40.123456+00:00 | 00000000-0000-0000-0000-00000000d00c | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | planning | anthropic | claude-haiku-5-5 | msg_a22_1 | True | 1100/90/0/0/0 | 0.0016000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:50.123456+00:00 | 00000000-0000-0000-0000-00000000d00d | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | implementation | anthropic | claude-sonnet-5-5 | msg_a22_2 | True | 6000/700/0/0/0 | 0.0285000000 | False | None | anthropic-2026-11 | None
+
+## rows: issue SHOP-1 (8)
+2026-11-20T10:00:00.123456+00:00 | 00000000-0000-0000-0000-00000000d001 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a11_1 | True | 1200/300/100/0/50 | 0.0123456789 | False | None | anthropic-2026-11 | None
+2026-11-20T10:00:10.123456+00:00 | 00000000-0000-0000-0000-00000000d002 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a11_2 | True | 5400/900/0/2000/800 | 0.2500000000 | False | us | anthropic-2026-11 | None
+2026-11-20T10:00:20.123456+00:00 | 00000000-0000-0000-0000-00000000d003 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | None | False | - | None | False | None | anthropic-2026-11 | APITimeoutError
+2026-11-20T10:01:40.123456+00:00 | 00000000-0000-0000-0000-00000000d005 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a12_1 | True | 1500/400/0/0/1000 | 2E-10 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d006 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_2 | True | 9000/1100/0/0/0 | 0.0441000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d007 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_3 | True | 250000/4000/300/0/0 | 1.2345678901 | True | None | anthropic-2026-11 | None
+2026-11-20T10:02:00.123456+00:00 | 00000000-0000-0000-0000-00000000d008 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | correction | anthropic | claude-sonnet-5-5 | msg_a12_4 | True | 7000/650/0/0/6000 | 0.0301500000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:10.123456+00:00 | 00000000-0000-0000-0000-00000000d009 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | research | anthropic | claude-haiku-5-5 | None | True | 3000/200/0/0/0 | 0.0130000000 | False | None | anthropic-2026-11 | None
+
+## rows: issues SHOP-2+OPS-7 (5)
+2026-11-20T10:00:30.123456+00:00 | 00000000-0000-0000-0000-00000000d004 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c31 | OPS-7 | 1 | REJECTED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a31_1 | True | 800/120/0/0/0 | 0.0010000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:20.123456+00:00 | 00000000-0000-0000-0000-00000000d00a | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c21 | SHOP-2 | 1 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a21_1 | True | 1000/100/0/0/0 | 0.0015000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:30.123456+00:00 | 00000000-0000-0000-0000-00000000d00b | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c21 | SHOP-2 | 1 | COMPLETED | shop-api | implementation | anthropic | mystery-model-1 | msg_a21_2 | True | 2000/500/0/0/0 | None | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:40.123456+00:00 | 00000000-0000-0000-0000-00000000d00c | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | planning | anthropic | claude-haiku-5-5 | msg_a22_1 | True | 1100/90/0/0/0 | 0.0016000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:50.123456+00:00 | 00000000-0000-0000-0000-00000000d00d | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | implementation | anthropic | claude-sonnet-5-5 | msg_a22_2 | True | 6000/700/0/0/0 | 0.0285000000 | False | None | anthropic-2026-11 | None
+
+## rows: issue NOPE-1 (0)
+
+## rows: session now (10)
+2026-11-20T10:01:40.123456+00:00 | 00000000-0000-0000-0000-00000000d005 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a12_1 | True | 1500/400/0/0/1000 | 2E-10 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d006 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_2 | True | 9000/1100/0/0/0 | 0.0441000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d007 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_3 | True | 250000/4000/300/0/0 | 1.2345678901 | True | None | anthropic-2026-11 | None
+2026-11-20T10:02:00.123456+00:00 | 00000000-0000-0000-0000-00000000d008 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | correction | anthropic | claude-sonnet-5-5 | msg_a12_4 | True | 7000/650/0/0/6000 | 0.0301500000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:10.123456+00:00 | 00000000-0000-0000-0000-00000000d009 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | research | anthropic | claude-haiku-5-5 | None | True | 3000/200/0/0/0 | 0.0130000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:20.123456+00:00 | 00000000-0000-0000-0000-00000000d00a | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c21 | SHOP-2 | 1 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a21_1 | True | 1000/100/0/0/0 | 0.0015000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:30.123456+00:00 | 00000000-0000-0000-0000-00000000d00b | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c21 | SHOP-2 | 1 | COMPLETED | shop-api | implementation | anthropic | mystery-model-1 | msg_a21_2 | True | 2000/500/0/0/0 | None | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:40.123456+00:00 | 00000000-0000-0000-0000-00000000d00c | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | planning | anthropic | claude-haiku-5-5 | msg_a22_1 | True | 1100/90/0/0/0 | 0.0016000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:50.123456+00:00 | 00000000-0000-0000-0000-00000000d00d | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c22 | SHOP-2 | 2 | FAILED | shop-web | implementation | anthropic | claude-sonnet-5-5 | msg_a22_2 | True | 6000/700/0/0/0 | 0.0285000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:03:00.123456+00:00 | 00000000-0000-0000-0000-00000000d00e | 00000000-0000-0000-0000-000005e50002 | None | None | None | None | None | research | anthropic | claude-haiku-5-5 | None | True | 500/50/0/0/0 | 0.0105000000 | False | None | anthropic-2026-11 | None
+
+## rows: session old (4)
+2026-11-20T10:00:00.123456+00:00 | 00000000-0000-0000-0000-00000000d001 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a11_1 | True | 1200/300/100/0/50 | 0.0123456789 | False | None | anthropic-2026-11 | None
+2026-11-20T10:00:10.123456+00:00 | 00000000-0000-0000-0000-00000000d002 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a11_2 | True | 5400/900/0/2000/800 | 0.2500000000 | False | us | anthropic-2026-11 | None
+2026-11-20T10:00:20.123456+00:00 | 00000000-0000-0000-0000-00000000d003 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | None | False | - | None | False | None | anthropic-2026-11 | APITimeoutError
+2026-11-20T10:00:30.123456+00:00 | 00000000-0000-0000-0000-00000000d004 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c31 | OPS-7 | 1 | REJECTED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a31_1 | True | 800/120/0/0/0 | 0.0010000000 | False | None | anthropic-2026-11 | None
+
+## rows: issue SHOP-1 in session now (5)
+2026-11-20T10:01:40.123456+00:00 | 00000000-0000-0000-0000-00000000d005 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a12_1 | True | 1500/400/0/0/1000 | 2E-10 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d006 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_2 | True | 9000/1100/0/0/0 | 0.0441000000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:01:50.123456+00:00 | 00000000-0000-0000-0000-00000000d007 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a12_3 | True | 250000/4000/300/0/0 | 1.2345678901 | True | None | anthropic-2026-11 | None
+2026-11-20T10:02:00.123456+00:00 | 00000000-0000-0000-0000-00000000d008 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | correction | anthropic | claude-sonnet-5-5 | msg_a12_4 | True | 7000/650/0/0/6000 | 0.0301500000 | False | None | anthropic-2026-11 | None
+2026-11-20T10:02:10.123456+00:00 | 00000000-0000-0000-0000-00000000d009 | 00000000-0000-0000-0000-000005e50002 | 00000000-0000-0000-0000-000000000c12 | SHOP-1 | 2 | COMPLETED | shop-api | research | anthropic | claude-haiku-5-5 | None | True | 3000/200/0/0/0 | 0.0130000000 | False | None | anthropic-2026-11 | None
+
+## rows: attempts A11+A12 in session old (3)
+2026-11-20T10:00:00.123456+00:00 | 00000000-0000-0000-0000-00000000d001 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | planning | anthropic | claude-haiku-5-5 | msg_a11_1 | True | 1200/300/100/0/50 | 0.0123456789 | False | None | anthropic-2026-11 | None
+2026-11-20T10:00:10.123456+00:00 | 00000000-0000-0000-0000-00000000d002 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | msg_a11_2 | True | 5400/900/0/2000/800 | 0.2500000000 | False | us | anthropic-2026-11 | None
+2026-11-20T10:00:20.123456+00:00 | 00000000-0000-0000-0000-00000000d003 | 00000000-0000-0000-0000-000005e50001 | 00000000-0000-0000-0000-000000000c11 | SHOP-1 | 1 | FAILED | shop-api | implementation | anthropic | claude-sonnet-5-5 | None | False | - | None | False | None | anthropic-2026-11 | APITimeoutError
+
+## rows: attempt A21 and issue SHOP-1 (0)
+
+## rows: no attempts (0)
+
+## rows: no issues (0)
+
+## task_report 00000000-0000-0000-0000-000000000c12
+========================================================
+AI CODE CHANGE AGENT - TASK COST REPORT (LLM API cost only)
+========================================================
+Jira Issue       : SHOP-1
+Attempt          : 2 (00000000-0000-0000-0000-000000000c12)
+Repository       : shop-api
+Provider         : anthropic
+Primary Model    : claude-sonnet-5-5
+Models Used      : claude-haiku-5-5, claude-sonnet-5-5
+Workflow Result  : COMPLETED
+
+Token Usage
+--------------------------------------------------------
+Model Calls      : 5
+Input Tokens     : 270,500
+Output Tokens    : 6,350
+Cache Write      : 300
+Cache Read       : 7,000
+
+Cost Breakdown by Stage
+--------------------------------------------------------
+Planning (investigation + plan): $0.0000  [1 calls, in 1,500 / out 400, claude-haiku-5-5]
+Implementation (incl. tests, final report): $1.2787  [2 calls, in 259,000 / out 5,100, claude-sonnet-5-5]
+Correction: $0.0302  [1 calls, in 7,000 / out 650, claude-sonnet-5-5]
+research: $0.0130  [1 calls, in 3,000 / out 200, claude-haiku-5-5]
+
+Attempt LLM Cost : $1.3218 USD
+Task LLM Cost    : at least $1.5842 (INCOMPLETE: 1 call(s) without usage) USD over 2 attempt(s) with usage
+Pricing          : anthropic-2026-11
+========================================================
+
+## task_report 00000000-0000-0000-0000-000000000c11
+========================================================
+AI CODE CHANGE AGENT - TASK COST REPORT (LLM API cost only)
+========================================================
+Jira Issue       : SHOP-1
+Attempt          : 1 (00000000-0000-0000-0000-000000000c11)
+Repository       : shop-api
+Provider         : anthropic
+Primary Model    : claude-sonnet-5-5
+Models Used      : claude-haiku-5-5, claude-sonnet-5-5
+Workflow Result  : FAILED
+
+Token Usage
+--------------------------------------------------------
+Model Calls      : 3
+Input Tokens     : 6,600
+Output Tokens    : 1,200
+Cache Write      : 2,100
+Cache Read       : 850
+
+Cost Breakdown by Stage
+--------------------------------------------------------
+Planning (investigation + plan): $0.0123  [1 calls, in 1,200 / out 300, claude-haiku-5-5]
+Implementation (incl. tests, final report): at least $0.2500 (INCOMPLETE: 1 call(s) without usage)  [2 calls, in 5,400 / out 900, claude-sonnet-5-5]
+
+Attempt LLM Cost : at least $0.2623 (INCOMPLETE: 1 call(s) without usage) USD
+Task LLM Cost    : at least $1.5842 (INCOMPLETE: 1 call(s) without usage) USD over 2 attempt(s) with usage
+Pricing          : anthropic-2026-11
+========================================================
+
+## task_report 00000000-0000-0000-0000-000000000c22
+========================================================
+AI CODE CHANGE AGENT - TASK COST REPORT (LLM API cost only)
+========================================================
+Jira Issue       : SHOP-2
+Attempt          : 2 (00000000-0000-0000-0000-000000000c22)
+Repository       : shop-web
+Provider         : anthropic
+Primary Model    : claude-sonnet-5-5
+Models Used      : claude-haiku-5-5, claude-sonnet-5-5
+Workflow Result  : FAILED
+
+Token Usage
+--------------------------------------------------------
+Model Calls      : 2
+Input Tokens     : 7,100
+Output Tokens    : 790
+Cache Write      : 0
+Cache Read       : 0
+
+Cost Breakdown by Stage
+--------------------------------------------------------
+Planning (investigation + plan): $0.0016  [1 calls, in 1,100 / out 90, claude-haiku-5-5]
+Implementation (incl. tests, final report): $0.0285  [1 calls, in 6,000 / out 700, claude-sonnet-5-5]
+
+Attempt LLM Cost : $0.0301 USD
+Task LLM Cost    : at least $0.0316 (INCOMPLETE: 1 call(s) without usage) USD over 2 attempt(s) with usage
+  shop-api       : at least $0.0015 (INCOMPLETE: 1 call(s) without usage) USD
+  shop-web       : $0.0301 USD
+Pricing          : anthropic-2026-11
+========================================================
+
+## task_report 00000000-0000-0000-0000-000000000cff
+========================================================
+AI CODE CHANGE AGENT - TASK COST REPORT (LLM API cost only)
+========================================================
+Jira Issue       : -
+Attempt          : 00000000-0000-0000-0000-000000000cff
+Repository       : -
+Provider         : anthropic
+Primary Model    : claude-sonnet-5-5
+Models Used      : -
+Workflow Result  : -
+
+Token Usage
+--------------------------------------------------------
+Model Calls      : 0
+Input Tokens     : 0
+Output Tokens    : 0
+Cache Write      : 0
+Cache Read       : 0
+
+Cost Breakdown by Stage
+--------------------------------------------------------
+(no model calls recorded for this attempt)
+
+Attempt LLM Cost : $0.0000 USD
+Pricing          : anthropic-2026-11
+========================================================
+
+## session_summary 00000000-0000-0000-0000-000005e50002
+========================================================
+EXECUTION SESSION COST SUMMARY (LLM API cost only)
+========================================================
+Session          : 00000000-0000-0000-0000-000005e50002
+Completed Tasks  : 1
+Failed Tasks     : 1
+Other Tasks      : 1
+Total Attempts   : 3
+
+Task      Status      Model(s)                   Session    Task total
+--------------------------------------------------------
+(no task) -           claude-haiku-5-5           $0.0105       $0.0000
+SHOP-1    COMPLETED   claude-haiku-5-5, c        $1.3218       $1.5842 *
+  attempt 2                     5 calls                    $1.3218
+SHOP-2    FAILED      claude-haiku-5-5, c        $0.0316       $0.0316 *
+  attempt 1                     2 calls                    $0.0015
+  attempt 2                     2 calls                    $0.0301
+--------------------------------------------------------
+Session LLM Cost : at least $1.3639 (INCOMPLETE: 1 call(s) without usage) USD
+* usage was missing for some calls; their cost is unknown, not zero
+Pricing          : anthropic-2026-11
+========================================================
+
+## session_summary 00000000-0000-0000-0000-000005e50001
+========================================================
+EXECUTION SESSION COST SUMMARY (LLM API cost only)
+========================================================
+Session          : 00000000-0000-0000-0000-000005e50001
+Completed Tasks  : 0
+Failed Tasks     : 2
+Other Tasks      : 0
+Total Attempts   : 2
+
+Task      Status      Model(s)                   Session    Task total
+--------------------------------------------------------
+OPS-7     REJECTED    claude-haiku-5-5           $0.0010       $0.0010
+  attempt 1                     1 calls                    $0.0010
+SHOP-1    FAILED      claude-haiku-5-5, c        $0.2623       $1.5842 *
+  attempt 1                     3 calls                    $0.2623
+--------------------------------------------------------
+Session LLM Cost : at least $0.2633 (INCOMPLETE: 1 call(s) without usage) USD
+* usage was missing for some calls; their cost is unknown, not zero
+Pricing          : anthropic-2026-11
+========================================================
