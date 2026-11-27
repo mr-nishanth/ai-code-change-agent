@@ -331,13 +331,7 @@ class UsageTracker:
 
     def handlers(self, thread_id: str) -> Sequence[BaseCallbackHandler]:
         attempt, stage = stage_of(thread_id)
-        guards: list[BaseCallbackHandler] = []
-        if self.phase_budget_usd:
-            guard = BudgetGuard(self.prices, self.phase_budget_usd)
-            self._guards[thread_id] = guard
-            guards.append(guard)
-        return [
-            *guards,
+        handlers: list[BaseCallbackHandler] = [
             UsageCallbackHandler(
                 self.store,
                 self.prices,
@@ -346,8 +340,15 @@ class UsageTracker:
                 stage=stage,
                 provider=self.provider,
                 model=self.model,
-            ),
+            )
         ]
+        if self.phase_budget_usd:
+            guard = BudgetGuard(self.prices, self.phase_budget_usd)
+            self._guards[thread_id] = guard
+            # Last: langchain creates every handler's coroutine before awaiting them in order, so
+            # any handler after a raising guard would never be awaited (RuntimeWarning).
+            handlers.append(guard)
+        return handlers
 
 
 CallbackFactory = Callable[[str], Sequence[BaseCallbackHandler]]

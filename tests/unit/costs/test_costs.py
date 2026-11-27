@@ -420,8 +420,8 @@ async def test_searches_are_charged_to_the_phase_cost_guard_and_stop_further_cal
     tracker = UsageTracker(
         store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=Decimal("0.05")
     )
-    (guard, *_) = tracker.handlers(thread)
-    assert isinstance(guard, BudgetGuard) and tracker.search_allowed(thread)
+    guard = next(h for h in tracker.handlers(thread) if isinstance(h, BudgetGuard))
+    assert tracker.search_allowed(thread)
     search = SimpleNamespace(
         model="unpriced-model", input_tokens=10_000, output_tokens=100, searches=5, error=None
     )
@@ -531,9 +531,10 @@ async def test_a_replayed_accounting_event_is_handed_to_the_ledger_which_owns_th
         store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=D("1")
     )
     thread = f"attempt:{a}:planning:run1"
-    first = tracker.handlers(thread)[-1]
-    again = tracker.handlers(thread)[-1]  # the resumed run
-    assert isinstance(first, UsageCallbackHandler) and isinstance(again, UsageCallbackHandler)
+    first = next(h for h in tracker.handlers(thread) if isinstance(h, UsageCallbackHandler))
+    again = next(  # the resumed run
+        h for h in tracker.handlers(thread) if isinstance(h, UsageCallbackHandler)
+    )
     assert again is not first
     await first.on_llm_end(
         result(anthropic_message(100_000, 0, msg_id="msg_dup")), run_id=uuid.uuid4()

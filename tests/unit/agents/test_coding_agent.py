@@ -1,6 +1,8 @@
 """The coding agent: phase/sandbox pairing, structured output and error mapping (scripted model)."""
 
+import gc
 import uuid
+import warnings
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -407,6 +409,26 @@ async def test_the_cost_guard_stops_the_run_even_while_output_retries_remain(
     (record,) = store.records  # the refused call is not a provider call: nothing recorded
     assert record.succeeded and record.cost_usd == Decimal("0.012")
     assert not tracker.search_allowed(thread)
+
+
+async def test_a_tripped_cost_guard_leaves_no_unawaited_callback(tmp_path: Path) -> None:
+    """The guard raises from on_chat_model_start; langchain builds one coroutine per handler
+    before awaiting them in order, so a handler after the guard would never be awaited."""
+    store, tracker, thread = ledger(budget="0.001")
+    assert isinstance(tracker.handlers(thread)[-1], BudgetGuard)
+    model = ScriptedChatModel(
+        script=[
+            priced(call("ImplementationPlan", {"summary": "s"}, i), f"msg_{i}") for i in range(3)
+        ]
+    )
+    agent = CodingAgent(model, callbacks=tracker.handlers)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(AgentRunError, match="agent_cost_budget_exceeded"):
+            await agent.plan(STORY, sandbox(tmp_path, False), thread_id=thread)
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]
+    assert len(store.records) == 1
 
 
 async def test_a_provider_error_after_a_priced_call_keeps_the_recorded_usage(
