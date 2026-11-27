@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.jobs.queue import Job, JobStatus
 from ai_code_change_agent.application.jobs.worker import Worker
-from ai_code_change_agent.composition import build_registry_service
 from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.persistence.repositories.change_store import SqlChangeUnitOfWork
@@ -20,6 +19,7 @@ from ai_code_change_agent.persistence.session import create_engine, create_sessi
 from tests.integration.conftest import libpq, query
 from tests.support.changes import python_profile
 from tests.support.registry_fixtures import new_repo
+from tests.support.sql_registry import sql_registry_service
 
 pytestmark = pytest.mark.integration
 S = AttemptStatus
@@ -169,7 +169,7 @@ async def test_the_worker_runs_against_postgres(
 async def _attempt(
     sessions: async_sessionmaker[AsyncSession],
 ) -> tuple[CodeChangeService, uuid.UUID]:
-    reg = build_registry_service(sessions)
+    reg = sql_registry_service(sessions)
     await reg.register_repository(new_repo("shop-service", pid="424242"), actor="cli:t")
     await reg.create_version("shop-service", python_profile(), actor="cli:t")
     await reg.publish_version("shop-service", 1, actor="cli:t")

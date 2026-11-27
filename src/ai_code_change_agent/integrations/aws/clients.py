@@ -1,7 +1,8 @@
 """The one place the application builds boto3 clients for DynamoDB, SQS and S3.
 
-One `boto3.session.Session` holds the three clients, created eagerly here (boto3 clients are
-thread-safe once created; sessions are not).
+One `boto3.session.Session` holds the three clients. Each is created on first use, under a lock
+(boto3 clients are thread-safe once created; sessions are not), so a process only builds the
+clients it touches: the API, which never calls SQS or S3, has a DynamoDB client only.
 
 With an endpoint override (development/test, the local Floci emulator; Settings guarantees it is a
 loopback or single-label Docker host) the session is built from a botocore session whose profile,
@@ -13,6 +14,7 @@ settings in config files, so only the configured endpoint (or real AWS) is ever 
 
 import os
 import threading
+from functools import cached_property
 from typing import Any
 
 import boto3  # type: ignore[import-untyped]
@@ -45,6 +47,16 @@ def client_config() -> Config:
     )
 
 
+def probe_config(timeout_seconds: float) -> Config:
+    """A readiness probe: one attempt, bounded by the probe's own timeout (no botocore retries)."""
+    return Config(
+        connect_timeout=timeout_seconds,
+        read_timeout=timeout_seconds,
+        retries={"mode": "standard", "total_max_attempts": 1},
+        ignore_configured_endpoint_urls=True,
+    )
+
+
 class AwsClients:
     """DynamoDB, SQS and S3 clients for one Settings; `queue_url()` resolves the job queue once."""
 
@@ -61,17 +73,32 @@ class AwsClients:
             )
         else:
             self.session = boto3.session.Session(region_name=self.region)
-        config = client_config()
-        self.dynamodb: Any = self._client("dynamodb", config)
-        self.sqs: Any = self._client("sqs", config)
-        self.s3: Any = self._client("s3", config)
         self._queue_url: str | None = None
         self._lock = threading.Lock()
+        self._session_lock = threading.Lock()
+
+    @cached_property
+    def dynamodb(self) -> Any:
+        return self._client("dynamodb", client_config())
+
+    @cached_property
+    def sqs(self) -> Any:
+        return self._client("sqs", client_config())
+
+    @cached_property
+    def s3(self) -> Any:
+        return self._client("s3", client_config())
+
+    def dynamodb_probe(self, timeout_seconds: float) -> Any:
+        """A separate DynamoDB client for readiness probes (`probe_config`): a probe never waits
+        on the application client's retries and timeouts."""
+        return self._client("dynamodb", probe_config(timeout_seconds))
 
     def _client(self, service: str, config: Config) -> Any:
-        return self.session.client(
-            service, region_name=self.region, endpoint_url=self.endpoint_url, config=config
-        )
+        with self._session_lock:
+            return self.session.client(
+                service, region_name=self.region, endpoint_url=self.endpoint_url, config=config
+            )
 
     def queue_url(self) -> str:
         """The job queue URL from GetQueueUrl, looked up on first use and cached."""

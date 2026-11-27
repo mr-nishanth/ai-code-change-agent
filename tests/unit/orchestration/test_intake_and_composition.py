@@ -27,10 +27,10 @@ from ai_code_change_agent.composition import (
     build_sandbox_manager,
     build_webhook_service,
     build_workspace_runtime,
-    require_database,
 )
 from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.errors import ConfigurationError
+from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.integrations.github.publisher import GitHubAppPublisher
 from ai_code_change_agent.integrations.github.references import GitHubReferenceParser
 from ai_code_change_agent.integrations.jira.issues import JiraCloudIssueReader
@@ -261,9 +261,7 @@ def settings(**kw: object) -> Settings:
 def test_composition_without_configuration_fails_fast_or_stays_disabled(tmp_path: Path) -> None:
     s = settings()
     with pytest.raises(ConfigurationError):
-        require_database(s)
-    with pytest.raises(ConfigurationError):
-        build_webhook_service(s, None)  # type: ignore[arg-type]
+        build_webhook_service(s, AwsClients(s))
     with pytest.raises(ConfigurationError):
         build_workspace_runtime(s)
     with pytest.raises(ConfigurationError):

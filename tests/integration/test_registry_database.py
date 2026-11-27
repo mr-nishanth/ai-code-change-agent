@@ -9,7 +9,6 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_code_change_agent.cli.main import main
-from ai_code_change_agent.composition import build_registry_service, build_repository_resolver
 from ai_code_change_agent.domain.repositories.errors import (
     ConflictError,
     InvalidStateError,
@@ -20,6 +19,7 @@ from ai_code_change_agent.domain.repositories.resolution import ResolutionReques
 from ai_code_change_agent.persistence.session import create_engine, create_session_factory
 from tests.integration.conftest import libpq, query, run_alembic
 from tests.support.registry_fixtures import FIXTURES, django_service, new_repo
+from tests.support.sql_registry import sql_registry_service, sql_repository_resolver
 
 pytestmark = pytest.mark.integration
 ACTOR = "cli:itest"
@@ -40,7 +40,7 @@ def sql(url: str, statement: str, params: tuple[object, ...] = ()) -> None:
 async def onboard(
     f: async_sessionmaker[AsyncSession], key: str = "django-service", project: str = "SHOP"
 ) -> None:
-    svc = build_registry_service(f)
+    svc = sql_registry_service(f)
     await svc.register_repository(new_repo(key), actor=ACTOR)
     await svc.create_version(key, {**django_service(), "repository_key": key}, actor=ACTOR)
     await svc.publish_version(key, 1, actor=ACTOR)
@@ -53,7 +53,7 @@ async def test_a_story_url_resolves_through_the_unique_locator(
 ) -> None:
     """Gate D.2: owner/name and GitHub URLs are looked up by the stored canonical locator."""
     await onboard(factory)
-    resolver = build_repository_resolver(factory)
+    resolver = sql_repository_resolver(factory)
     for ref in ("acme/django-service", "https://github.com/ACME/django-service.git"):
         res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", (ref,)))
         assert res.outcome is O.RESOLVED and res.repository_key == "django-service", ref
@@ -65,11 +65,11 @@ async def test_register_publish_map_resolve_disable_flow(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
     await onboard(factory)
-    resolver = build_repository_resolver(factory)
+    resolver = sql_repository_resolver(factory)
     res = await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("django-service",)))
     assert res.outcome is O.RESOLVED and res.profile_version == 1
     assert (await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP"))).resolved
-    await build_registry_service(factory).disable("django-service", actor=ACTOR)
+    await sql_registry_service(factory).disable("django-service", actor=ACTOR)
     assert (
         await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP"))
     ).outcome is O.DISABLED_REPOSITORY
@@ -110,7 +110,7 @@ async def test_stored_row_has_no_credential_and_hash_matches(
 
 
 async def test_unique_constraints_and_conflicts(factory: async_sessionmaker[AsyncSession]) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.register_repository(new_repo("shop-api"), actor=ACTOR)
     for dup in (
         new_repo("shop-api", pid="x", name="x"),
@@ -133,7 +133,7 @@ async def test_unique_constraints_and_conflicts(factory: async_sessionmaker[Asyn
 async def test_failed_operations_roll_back_completely(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.register_repository(new_repo("shop-api"), actor=ACTOR)
     before = query(database_url, "SELECT count(*) FROM registry_audit_events")
     with pytest.raises(ConflictError):
@@ -154,7 +154,7 @@ async def test_failed_operations_roll_back_completely(
 async def test_concurrent_registration_creates_exactly_one(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     results = await asyncio.gather(
         *[svc.register_repository(new_repo("shop-api"), actor=ACTOR) for _ in range(6)],
         return_exceptions=True,
@@ -168,7 +168,7 @@ async def test_concurrent_registration_creates_exactly_one(
 async def test_concurrent_version_creation_numbers_are_unique_and_gapless(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.register_repository(new_repo("django-service"), actor=ACTOR)
     doc = django_service()
     await asyncio.gather(
@@ -185,7 +185,7 @@ async def test_concurrent_version_creation_numbers_are_unique_and_gapless(
 async def test_concurrent_alias_claims_have_one_winner(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     for k in ("repo-a", "repo-b", "repo-c"):
         await svc.register_repository(new_repo(k), actor=ACTOR)
     results = await asyncio.gather(
@@ -207,7 +207,7 @@ def _expect_blocked(url: str, statement: str, params: tuple[object, ...] = ()) -
 async def test_published_versions_are_immutable_and_drafts_only_publishable(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.register_repository(new_repo("django-service"), actor=ACTOR)
     await svc.create_version("django-service", django_service(), actor=ACTOR)
     await svc.create_version("django-service", django_service(), actor=ACTOR)
@@ -237,7 +237,7 @@ async def test_published_versions_are_immutable_and_drafts_only_publishable(
 async def test_audit_events_are_append_only(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    await build_registry_service(factory).register_repository(new_repo("shop-api"), actor=ACTOR)
+    await sql_registry_service(factory).register_repository(new_repo("shop-api"), actor=ACTOR)
     assert "append-only" in _expect_blocked(
         database_url, "UPDATE registry_audit_events SET actor = 'cli:evil'"
     )
@@ -276,7 +276,7 @@ async def test_database_check_constraints(
 async def test_active_version_must_belong_to_the_same_repository(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     for key in ("repo-one", "repo-two"):
         await svc.register_repository(new_repo(key), actor=ACTOR)
         await svc.create_version(key, {**django_service(), "repository_key": key}, actor=ACTOR)
@@ -310,7 +310,7 @@ async def test_profile_tampered_in_database_fails_resolution_closed(
             database_url,
             "ALTER TABLE repository_profile_versions ENABLE TRIGGER repository_profile_versions_guard",
         )
-    res = await build_repository_resolver(factory).resolve(ResolutionRequest("SHOP-1", "SHOP"))
+    res = await sql_repository_resolver(factory).resolve(ResolutionRequest("SHOP-1", "SHOP"))
     assert res.outcome is O.PROFILE_INVALID and res.detail.startswith("revalidation_failed")
 
 
@@ -328,7 +328,7 @@ async def test_four_stack_fixtures_onboard_through_the_cli_against_postgres(
         return main(
             list(argv),
             service_factory=lambda: (
-                build_registry_service(factory),
+                sql_registry_service(factory),
                 RepositoryResolver(lambda: SqlAlchemyRegistryUnitOfWork(factory)),
             ),
             out=io.StringIO(),
@@ -368,7 +368,7 @@ async def test_four_stack_fixtures_onboard_through_the_cli_against_postgres(
         ]
         for step in steps:
             assert await asyncio.to_thread(cli, *step) == 0, (name, step)
-    resolver = build_repository_resolver(factory)
+    resolver = sql_repository_resolver(factory)
     for name in FIXTURES:
         res = await resolver.resolve(ResolutionRequest("MULTI-1", "MULTI", (name,)))
         assert res.resolved and res.repository_key == name
@@ -380,7 +380,7 @@ async def test_four_stack_fixtures_onboard_through_the_cli_against_postgres(
 async def test_invalid_profile_is_rejected_before_any_write(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.register_repository(new_repo("django-service"), actor=ACTOR)
     bad = django_service()
     bad["commands"][1]["argv"] = ["curl", "http://evil.invalid"]
@@ -419,7 +419,7 @@ async def test_read_paths_and_lifecycle_operations_on_postgres(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
     await onboard(factory)
-    svc = build_registry_service(factory)
+    svc = sql_registry_service(factory)
     await svc.add_alias("django-service", "api", actor=ACTOR)
     await svc.create_version("django-service", {**django_service()}, actor=ACTOR)
     await svc.publish_version("django-service", 2, actor=ACTOR, activate=False)
@@ -444,7 +444,7 @@ async def test_read_paths_and_lifecycle_operations_on_postgres(
         events[0].occurred_at is not None and events[0].action.value == "project_mapping.activated"
     )
     assert len(await svc.audit_history(None, limit=2)) == 2
-    resolver = build_repository_resolver(factory)
+    resolver = sql_repository_resolver(factory)
     assert (
         await resolver.resolve(ResolutionRequest("SHOP-1", "SHOP", ("api",)))
     ).profile_version == 1

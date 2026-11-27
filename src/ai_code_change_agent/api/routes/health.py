@@ -1,11 +1,13 @@
-"""Public, minimal probes. Only up/down per dependency (no secrets, no driver errors)."""
+"""Public, minimal probes. Only up/down per dependency (no secrets, no driver errors).
+
+Readiness is `DescribeTable` on the application table (the composition root's probe), bounded by
+READINESS_TIMEOUT_SECONDS; a missing or inactive table, a timeout or any error is 503."""
 
 import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel
-from sqlalchemy import text
 
 from ai_code_change_agent import __version__
 from ai_code_change_agent.core.logging import get_logger
@@ -30,18 +32,17 @@ async def live() -> LiveResponse:
 
 @router.get("/ready")
 async def ready(request: Request, response: Response) -> ReadyResponse:
-    engine = request.app.state.engine
+    probe = request.app.state.readiness
     timeout: float = request.app.state.settings.readiness_timeout_seconds
-    database_ok = False
-    if engine is not None:
+    table_ok = False
+    if probe is not None:
         try:
-            async with asyncio.timeout(timeout), engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-            database_ok = True
+            async with asyncio.timeout(timeout):
+                table_ok = bool(await probe())
         except Exception as exc:
-            get_logger("health").warning("readiness_db_failed", error_type=type(exc).__name__)
-    if not database_ok:
+            get_logger("health").warning("readiness_dynamodb_failed", error_type=type(exc).__name__)
+    if not table_ok:
         response.status_code = 503
     return ReadyResponse(
-        status="ready" if database_ok else "not_ready", dependencies={"database": database_ok}
+        status="ready" if table_ok else "not_ready", dependencies={"dynamodb": table_ok}
     )

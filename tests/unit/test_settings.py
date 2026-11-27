@@ -81,11 +81,10 @@ def test_production_requires_its_core_settings(monkeypatch: pytest.MonkeyPatch) 
     ok = s(
         app_env="production",
         llm_provider="bedrock",
-        database_url="postgresql+psycopg://u:p@h/db",
         jira_webhook_secret="x",
         jira_project_keys="SHOP",
     )
-    assert ok.jira_webhook_configured
+    assert ok.jira_webhook_configured and ok.database_url is None  # DynamoDB only
 
 
 def test_reference_limits_default_to_the_documented_values() -> None:

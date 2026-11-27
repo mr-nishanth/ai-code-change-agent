@@ -24,7 +24,6 @@ from ai_code_change_agent.application.jira.errors import (
     JiraTimeoutError,
 )
 from ai_code_change_agent.application.jobs.worker import Worker
-from ai_code_change_agent.composition import build_registry_service, build_repository_resolver
 from ai_code_change_agent.domain.webhooks.models import (
     IssueRef,
     Outcome,
@@ -41,6 +40,7 @@ from ai_code_change_agent.persistence.session import create_engine, create_sessi
 from tests.integration.conftest import query
 from tests.support.changes import python_profile
 from tests.support.registry_fixtures import new_repo
+from tests.support.sql_registry import sql_registry_service, sql_repository_resolver
 from tests.support.workflow import FakeJira
 
 pytestmark = pytest.mark.integration
@@ -69,7 +69,7 @@ class FlakyJira(FakeJira):
 
 
 async def accepted_story(sessions: async_sessionmaker[AsyncSession]) -> None:
-    reg = build_registry_service(sessions)
+    reg = sql_registry_service(sessions)
     await reg.register_repository(new_repo("shop-service", pid="424242"), actor="cli:t")
     await reg.create_version("shop-service", python_profile(), actor="cli:t")
     await reg.publish_version("shop-service", 1, actor="cli:t")
@@ -99,7 +99,7 @@ def intake_worker(
     handler = IntakeHandler(
         changes=CodeChangeService(lambda: SqlChangeUnitOfWork(sessions), max_repairs=1),
         jira=jira,
-        resolver=build_repository_resolver(sessions),
+        resolver=sql_repository_resolver(sessions),
         start=start,
         repository_field_configured=False,
     )

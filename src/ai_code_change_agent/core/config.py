@@ -394,7 +394,6 @@ class Settings(BaseSettings):
             missing = [
                 name
                 for name, ok in (
-                    ("DATABASE_URL", self.database_url is not None),
                     ("JIRA_WEBHOOK_SECRET", self.jira_webhook_secret is not None),
                     ("JIRA_PROJECT_KEYS", bool(self.jira_project_keys)),
                 )

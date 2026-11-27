@@ -237,6 +237,11 @@ class Table:
         found = await self.batch_get(order, consistent=consistent)
         return [found[key] for key in order if key in found]
 
+    async def status(self) -> str:
+        """The table's `TableStatus` (`DescribeTable`); a missing table is `PersistenceError`."""
+        response = await self._call("describe_table", {"TableName": self.name})
+        return str(response["Table"]["TableStatus"])
+
     async def transact_write(self, tx: "TxBuilder") -> None:
         request = tx.request()
 
