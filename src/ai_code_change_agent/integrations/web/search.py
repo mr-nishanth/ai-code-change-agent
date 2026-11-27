@@ -13,6 +13,7 @@ Verified 2026-11-26 against claude-haiku-5-5 with tool type web_search_20250305 
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import anthropic
 
@@ -105,7 +106,9 @@ class AnthropicDocumentSearch:
                 url = str(getattr(item, "url", ""))
                 host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
                 fresh = url not in {h.url for h in hits}
-                if url.startswith("https://") and host_allowed(host, self._hosts) and fresh:
+                # fetch_reference refuses an agent URL with a query string: never offer one
+                usable = url.startswith("https://") and not urlsplit(url).query
+                if usable and host_allowed(host, self._hosts) and fresh:
                     hits.append(
                         SearchHit(
                             str(getattr(item, "title", ""))[:200],

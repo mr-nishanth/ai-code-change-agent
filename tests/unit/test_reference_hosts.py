@@ -251,3 +251,30 @@ async def test_fragments_are_dropped_and_server_redirects_may_carry_a_query() ->
     })  # fmt: skip
     doc = await f.fetch("https://pydantic.dev/docs/#validators")
     assert doc.url == "https://pydantic.dev/docs/?v=latest" and doc.text == "ok"
+
+
+async def test_relative_llms_txt_links_are_fetched_as_absolute_urls_on_the_same_host() -> None:
+    index_url = "https://pydantic.dev/docs/validation/latest/llms.txt"
+    page = "https://pydantic.dev/docs/validation/latest/concepts/validators/index.md"
+    llms = (
+        "# Pydantic\n"
+        "- [Validators](/docs/validation/latest/concepts/validators/index.md)\n"
+        "- [Mirror](//evil.example/validators.md)\n"
+    )
+    f = site({index_url: text(llms), page: text(VALIDATORS_MD, "text/markdown")})
+    index = await f.fetch(index_url)
+    links = re.findall(r"\]\(([^)\s]+)\)", index.text)
+    assert links == ["/docs/validation/latest/concepts/validators/index.md",
+                     "//evil.example/validators.md"]  # fmt: skip
+    # a relative path is not a URL the fetcher accepts on its own ...
+    with pytest.raises(ReferenceRefusedError, match="reference_url_not_allowed"):
+        await f.fetch(links[0])
+    # ... resolved against the index it is an absolute URL on the same, listed host
+    absolute = [str(httpx.URL(index.url).join(link)) for link in links]
+    assert absolute[0] == page
+    doc = await f.fetch(absolute[0])
+    assert doc.url == page and "field_validator" in doc.text
+    # a protocol-relative link resolves to another host and stays refused
+    assert absolute[1] == "https://evil.example/validators.md"
+    with pytest.raises(ReferenceRefusedError, match="reference_domain_not_allowed"):
+        await f.fetch(absolute[1])

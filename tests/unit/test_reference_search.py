@@ -155,3 +155,25 @@ async def test_official_documentation_ranks_before_registries_and_raw_sources() 
     )  # fmt: skip
     r = await s.search("x")
     assert r.hits[0].url == "https://docs.python.org/3/x.html"
+
+
+async def test_search_hits_with_a_query_string_or_an_unlisted_host_are_not_returned() -> None:
+    messages = FakeMessages(
+        [result_block(
+            "https://docs.python.org/3/search.html?q=asyncio",
+            "https://docs.python.org/3/library/asyncio.html?highlight=taskgroup",
+            "https://evil.example/docs.python.org/3/",
+            "https://fastapi.tiangolo.com/tutorial/#first-steps",
+            "https://docs.python.org/3/library/asyncio-task.html",
+        )]
+    )  # fmt: skip
+    s = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org", "fastapi.tiangolo.com"],
+        client=SimpleNamespace(messages=messages),
+    )  # fmt: skip
+    r = await s.search("asyncio taskgroup")
+    # fetch_reference refuses any agent URL with a query string, so such hits are never offered
+    assert [h.url for h in r.hits] == [
+        "https://fastapi.tiangolo.com/tutorial/#first-steps",
+        "https://docs.python.org/3/library/asyncio-task.html",
+    ]
