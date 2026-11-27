@@ -1,7 +1,7 @@
 """Real Docker: the sandbox is probed from inside a container started by the runtime.
 
 Run with: uv run pytest -m docker -rs   (needs Docker and the local execution image, see
-docs/SETUP-LOCAL.md). Missing Docker or image is a SKIP with a reason, never a pass.
+docs/GETTING-STARTED.md). Missing Docker or image is a SKIP with a reason, never a pass.
 The probes call the runtime's internal `_execute` (the policy gate only allows test/lint commands,
 not introspection); real validation commands go through `run_command`.
 """
@@ -56,7 +56,7 @@ def docker_ready() -> None:
     if _docker("version", "--format", "{{.Server.Version}}").returncode != 0:
         pytest.skip("docker daemon not reachable")
     if _docker("image", "inspect", IMAGE).returncode != 0:
-        pytest.skip(f"execution image '{IMAGE}' is not built (see docs/SETUP-LOCAL.md)")
+        pytest.skip(f"execution image '{IMAGE}' is not built (see docs/GETTING-STARTED.md)")
     if os.getuid() == 0:
         pytest.skip("must not run as root")
 

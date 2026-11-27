@@ -1,7 +1,8 @@
 """Platform-owned command policy. Profiles *request* argv commands; this module decides.
 
 Nothing here executes anything. Unknown toolchains, executables, flags or shapes fail closed.
-Adding a toolchain family is a reviewed edit to the catalog below, never repository data.
+Repository execution is Python only: "python" is the single toolchain family, a reviewed
+platform setting, never repository data.
 """
 
 import re
@@ -18,11 +19,9 @@ POLICY_VERSION = "1"
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./=:,@+-]{1,200}")
 _CWD = re.compile(r"\.|[A-Za-z0-9_][A-Za-z0-9_./-]{0,150}")
 _ENV_VALUE = re.compile(r"[A-Za-z0-9_.:/-]{0,100}")
-ALLOWED_ENV_NAMES = frozenset({"CI", "NODE_ENV", "PYTHONHASHSEED", "TZ", "LANG"})
+ALLOWED_ENV_NAMES = frozenset({"CI", "PYTHONHASHSEED", "TZ", "LANG"})
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,150}")
-_GO_PKG = re.compile(r"\./\.\.\.|\./[A-Za-z0-9_][A-Za-z0-9_./-]{0,100}(/\.\.\.)?")
 _DIGITS = re.compile(r"[0-9]{1,3}")
-_PLAIN = re.compile(r"plain")
 
 
 class CommandKind(StrEnum):
@@ -71,7 +70,6 @@ def _rule(kind: CommandKind, *prefix: str, **kw: object) -> CommandRule:
 
 K = CommandKind
 _PY_FLAGS = frozenset({"-q", "-v", "-vv", "-x", "--strict-markers", "--no-header"})
-_NODE_NET = {"network": True}
 
 DEFAULT_TOOLCHAINS: tuple[ToolchainPolicy, ...] = (
     ToolchainPolicy(
@@ -111,100 +109,6 @@ DEFAULT_TOOLCHAINS: tuple[ToolchainPolicy, ...] = (
                 positional=_PATH,
                 max_positional=5,
             ),
-        ),
-    ),
-    ToolchainPolicy(
-        "node",
-        (
-            _rule(K.TEST, "npm", "test"),
-            _rule(K.TEST, "npm", "run", "test"),
-            _rule(K.LINT, "npm", "run", "lint"),
-            _rule(K.LINT, "npm", "run", "typecheck"),
-            _rule(K.BUILD, "npm", "run", "build"),
-            _rule(K.FORMAT_CHECK, "npm", "run", "format:check"),
-            _rule(K.INSTALL, "npm", "ci", "--ignore-scripts", **_NODE_NET),
-            _rule(K.TEST, "yarn", "test"),
-            _rule(K.LINT, "yarn", "lint"),
-            _rule(K.BUILD, "yarn", "build"),
-            _rule(K.TEST, "pnpm", "test"),
-            _rule(K.LINT, "pnpm", "lint"),
-            _rule(K.BUILD, "pnpm", "build"),
-        ),
-    ),
-    ToolchainPolicy(
-        "jvm",
-        (
-            _rule(
-                K.TEST,
-                "mvn",
-                "test",
-                flags=frozenset({"-q", "-B", "--batch-mode", "--no-transfer-progress"}),
-            ),
-            _rule(
-                K.LINT,
-                "mvn",
-                "verify",
-                flags=frozenset({"-q", "-B", "--batch-mode", "--no-transfer-progress"}),
-            ),
-            _rule(
-                K.BUILD,
-                "mvn",
-                "compile",
-                flags=frozenset({"-q", "-B", "--batch-mode", "--no-transfer-progress"}),
-            ),
-            _rule(
-                K.TEST,
-                "gradle",
-                "test",
-                flags=frozenset({"--no-daemon"}),
-                value_flags={"--console": _PLAIN},
-            ),
-            _rule(
-                K.LINT,
-                "gradle",
-                "check",
-                flags=frozenset({"--no-daemon"}),
-                value_flags={"--console": _PLAIN},
-            ),
-            _rule(
-                K.BUILD,
-                "gradle",
-                "build",
-                flags=frozenset({"--no-daemon"}),
-                value_flags={"--console": _PLAIN},
-            ),
-        ),
-    ),
-    ToolchainPolicy(
-        "dotnet",
-        (
-            _rule(K.TEST, "dotnet", "test", flags=frozenset({"--no-build", "--nologo"})),
-            _rule(K.BUILD, "dotnet", "build", flags=frozenset({"--nologo"})),
-            _rule(K.FORMAT_CHECK, "dotnet", "format", "--verify-no-changes"),
-        ),
-    ),
-    ToolchainPolicy(
-        "go",
-        (
-            _rule(
-                K.TEST,
-                "go",
-                "test",
-                flags=frozenset({"-v", "-race"}),
-                positional=_GO_PKG,
-                max_positional=3,
-            ),
-            _rule(K.BUILD, "go", "build", positional=_GO_PKG, max_positional=3),
-            _rule(K.LINT, "go", "vet", positional=_GO_PKG, max_positional=3),
-        ),
-    ),
-    ToolchainPolicy(
-        "rust",
-        (
-            _rule(K.TEST, "cargo", "test", flags=frozenset({"--quiet", "--locked", "--offline"})),
-            _rule(K.BUILD, "cargo", "build", flags=frozenset({"--quiet", "--locked", "--offline"})),
-            _rule(K.LINT, "cargo", "clippy", flags=frozenset({"--quiet", "--locked", "--offline"})),
-            _rule(K.FORMAT_CHECK, "cargo", "fmt", "--check"),
         ),
     ),
 )

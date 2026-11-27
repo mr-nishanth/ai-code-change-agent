@@ -1,0 +1,53 @@
+"""Python dependency policy, safe manifest discovery and category separation."""
+
+from ai_code_change_agent.domain.dependencies.manifests import (
+    CategorizedDependencies,
+    DependencyCategory,
+    ManifestDiscoveryResult,
+    discover_dependencies_from_files,
+    discover_repository_dependencies,
+    merge_dependency_requests,
+)
+from ai_code_change_agent.domain.dependencies.policy import (
+    MAX_MANIFEST_REQUEST_LENGTH,
+    MAX_REQUEST_LENGTH,
+    DependencyError,
+    DependencyFailureCode,
+    DependencyPolicyError,
+    DependencyRequest,
+    TargetEnvironment,
+    default_target_environment,
+    merge_two_requests,
+    normalise,
+    parse_manifest_requirement,
+    parse_request,
+    specifiers_compatible,
+    validate_python_requirement,
+    validate_requests,
+    wheel_identity,
+)
+
+__all__ = [
+    "MAX_MANIFEST_REQUEST_LENGTH",
+    "MAX_REQUEST_LENGTH",
+    "CategorizedDependencies",
+    "DependencyCategory",
+    "DependencyError",
+    "DependencyFailureCode",
+    "DependencyPolicyError",
+    "DependencyRequest",
+    "ManifestDiscoveryResult",
+    "TargetEnvironment",
+    "default_target_environment",
+    "discover_dependencies_from_files",
+    "discover_repository_dependencies",
+    "merge_dependency_requests",
+    "merge_two_requests",
+    "normalise",
+    "parse_manifest_requirement",
+    "parse_request",
+    "specifiers_compatible",
+    "validate_python_requirement",
+    "validate_requests",
+    "wheel_identity",
+]

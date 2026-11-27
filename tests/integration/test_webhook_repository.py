@@ -4,7 +4,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ai_code_change_agent.domain.webhooks.models import (
     IgnoreReason,
@@ -163,6 +163,50 @@ async def test_failure_midway_rolls_back_everything(
     assert counts(database_url) == (0, 0, 0)
     monkeypatch.undo()
     assert await repo.record(accepted()) is Outcome.ACCEPTED  # retry after failure succeeds
+
+
+@pytest.mark.parametrize(
+    "interrupted_statement",
+    [2, 4],
+    ids=["request_insert", "delivery_link_update"],
+)  # 1 = delivery insert, 3 = intake job insert (covered by the test above)
+async def test_an_interruption_after_the_delivery_insert_leaves_nothing_and_redelivery_is_once(
+    repo: SqlAlchemyWebhookRepository,
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted_statement: int,
+) -> None:
+    executed = 0
+    original = AsyncSession.execute
+
+    async def statement_n_raises(self: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+        # raised before statement N is sent: proves exception-driven rollback, not a
+        # server-side connection loss
+        nonlocal executed
+        executed += 1
+        if executed == interrupted_statement:
+            raise ConnectionResetError("statement interrupted")
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", statement_n_raises)
+    with pytest.raises(PersistenceError, match="ConnectionResetError"):
+        await repo.record(accepted("d-1"))
+    monkeypatch.undo()
+    assert executed == interrupted_statement
+    assert counts(database_url) == (0, 0, 0)  # the delivery insert was rolled back too
+
+    assert await repo.record(accepted("d-1")) is Outcome.ACCEPTED  # Jira's retry of it
+    assert await repo.record(accepted("d-2")) is Outcome.DUPLICATE  # a later new delivery
+    assert counts(database_url) == (2, 1, 1)
+    (request_id,) = query(database_url, "SELECT id::text FROM code_change_requests")[0]
+    assert query(
+        database_url,
+        "SELECT delivery_id, processing_result, code_change_request_id::text "
+        "FROM jira_deliveries ORDER BY delivery_id",
+    ) == [("d-1", "ACCEPTED", request_id), ("d-2", "DUPLICATE_ISSUE", request_id)]
+    assert query(database_url, "SELECT payload->>'code_change_request_id' FROM jobs") == [
+        (request_id,)
+    ]
 
 
 async def test_unreachable_database_is_persistence_error_without_dsn_leak() -> None:

@@ -19,7 +19,7 @@ from ai_code_change_agent.domain.repositories.models import (
     MappingStatus,
     RepositoryStatus,
 )
-from tests.support.registry_fixtures import nestjs_backend, new_repo, profile
+from tests.support.registry_fixtures import django_service, new_repo, profile
 from tests.support.registry_memory import InMemoryRegistry
 
 ACTOR = "cli:tester"
@@ -38,11 +38,11 @@ class FakeProvider:
 
 
 async def ready(
-    reg: InMemoryRegistry, key: str = "nest-backend", doc: dict[str, Any] | None = None
+    reg: InMemoryRegistry, key: str = "django-service", doc: dict[str, Any] | None = None
 ) -> None:
     svc = reg.service()
     await svc.register_repository(new_repo(key), actor=ACTOR)
-    await svc.create_version(key, doc or {**nestjs_backend(), "repository_key": key}, actor=ACTOR)
+    await svc.create_version(key, doc or {**django_service(), "repository_key": key}, actor=ACTOR)
     await svc.publish_version(key, 1, actor=ACTOR)
 
 
@@ -111,38 +111,38 @@ async def test_provider_is_separate_from_repository_identity() -> None:
 async def test_profile_version_lifecycle() -> None:
     reg = InMemoryRegistry()
     svc = reg.service()
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
-    v1 = await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
-    v2 = await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
+    v1 = await svc.create_version("django-service", django_service(), actor=ACTOR)
+    v2 = await svc.create_version("django-service", django_service(), actor=ACTOR)
     assert (v1.version, v2.version) == (1, 2) and not v1.published
-    pub = await svc.publish_version("nest-backend", 1, actor=ACTOR)
+    pub = await svc.publish_version("django-service", 1, actor=ACTOR)
     assert pub.published
-    repo, versions, _, _ = await svc.show_repository("nest-backend")
+    repo, versions, _, _ = await svc.show_repository("django-service")
     assert repo.active_profile_version_id == v1.id and [v.published for v in versions] == [
         True,
         False,
     ]
     with pytest.raises(InvalidStateError):
-        await svc.publish_version("nest-backend", 1, actor=ACTOR)
+        await svc.publish_version("django-service", 1, actor=ACTOR)
     with pytest.raises(InvalidStateError):
-        await svc.activate_version("nest-backend", 2, actor=ACTOR)
-    await svc.publish_version("nest-backend", 2, actor=ACTOR, activate=False)
-    assert (await svc.show_repository("nest-backend"))[0].active_profile_version_id == v1.id
-    await svc.activate_version("nest-backend", 2, actor=ACTOR)
-    assert (await svc.show_repository("nest-backend"))[0].active_profile_version_id == v2.id
+        await svc.activate_version("django-service", 2, actor=ACTOR)
+    await svc.publish_version("django-service", 2, actor=ACTOR, activate=False)
+    assert (await svc.show_repository("django-service"))[0].active_profile_version_id == v1.id
+    await svc.activate_version("django-service", 2, actor=ACTOR)
+    assert (await svc.show_repository("django-service"))[0].active_profile_version_id == v2.id
     await svc.activate_version(
-        "nest-backend", 1, actor=ACTOR
+        "django-service", 1, actor=ACTOR
     )  # rollback to an older published version
-    assert (await svc.show_repository("nest-backend"))[0].active_profile_version_id == v1.id
+    assert (await svc.show_repository("django-service"))[0].active_profile_version_id == v1.id
     with pytest.raises(NotFoundError):
-        await svc.publish_version("nest-backend", 9, actor=ACTOR)
+        await svc.publish_version("django-service", 9, actor=ACTOR)
 
 
 async def test_create_version_rejects_wrong_key_and_invalid_profiles() -> None:
     svc = InMemoryRegistry().service()
     await svc.register_repository(new_repo("shop-api"), actor=ACTOR)
     with pytest.raises(RegistryValidationError) as exc:
-        await svc.create_version("shop-api", nestjs_backend(), actor=ACTOR)
+        await svc.create_version("shop-api", django_service(), actor=ACTOR)
     assert exc.value.findings[0].code == "key_mismatch"
     with pytest.raises(RegistryValidationError):
         await svc.create_version(
@@ -155,31 +155,31 @@ async def test_create_version_rejects_wrong_key_and_invalid_profiles() -> None:
 async def test_publish_revalidates_against_current_policy_and_rolls_back() -> None:
     reg = InMemoryRegistry()
     svc = reg.service()
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
-    v = await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
+    v = await svc.create_version("django-service", django_service(), actor=ACTOR)
     reg.state.versions[v.id].content["command_policy"] = "tampered"
     before = len(reg.state.audit)
     with pytest.raises(RegistryValidationError):
-        await svc.publish_version("nest-backend", 1, actor=ACTOR)
+        await svc.publish_version("django-service", 1, actor=ACTOR)
     assert not reg.state.versions[v.id].published and len(reg.state.audit) == before
 
 
 async def test_enable_disable_rules() -> None:
     reg = InMemoryRegistry()
     svc = reg.service()
-    await svc.register_repository(new_repo("nest-backend"), actor=ACTOR)
+    await svc.register_repository(new_repo("django-service"), actor=ACTOR)
     with pytest.raises(InvalidStateError):
-        await svc.enable("nest-backend", actor=ACTOR)  # no active profile
+        await svc.enable("django-service", actor=ACTOR)  # no active profile
     with pytest.raises(InvalidStateError):
-        await svc.disable("nest-backend", actor=ACTOR)
-    await svc.create_version("nest-backend", nestjs_backend(), actor=ACTOR)
-    await svc.publish_version("nest-backend", 1, actor=ACTOR)
-    assert (await svc.enable("nest-backend", actor=ACTOR)).status is RepositoryStatus.ACTIVE
+        await svc.disable("django-service", actor=ACTOR)
+    await svc.create_version("django-service", django_service(), actor=ACTOR)
+    await svc.publish_version("django-service", 1, actor=ACTOR)
+    assert (await svc.enable("django-service", actor=ACTOR)).status is RepositoryStatus.ACTIVE
     with pytest.raises(InvalidStateError):
-        await svc.enable("nest-backend", actor=ACTOR)
-    assert (await svc.disable("nest-backend", actor=ACTOR)).status is RepositoryStatus.DISABLED
+        await svc.enable("django-service", actor=ACTOR)
+    assert (await svc.disable("django-service", actor=ACTOR)).status is RepositoryStatus.DISABLED
     assert (
-        await svc.enable("nest-backend", actor=ACTOR)
+        await svc.enable("django-service", actor=ACTOR)
     ).status is RepositoryStatus.ACTIVE  # re-enable
     with pytest.raises(NotFoundError):
         await svc.enable("nope", actor=ACTOR)
@@ -230,17 +230,17 @@ async def test_audit_trail_covers_every_mutation_and_holds_no_secrets() -> None:
     reg = InMemoryRegistry()
     svc = reg.service()
     await ready(reg)
-    await svc.add_alias("nest-backend", "nest", actor=ACTOR)
-    await svc.map_project("SHOP", "nest-backend", actor=ACTOR)
-    await svc.enable("nest-backend", actor=ACTOR)
-    await svc.disable("nest-backend", actor=ACTOR)
-    await svc.unmap_project("SHOP", "nest-backend", actor=ACTOR)
+    await svc.add_alias("django-service", "nest", actor=ACTOR)
+    await svc.map_project("SHOP", "django-service", actor=ACTOR)
+    await svc.enable("django-service", actor=ACTOR)
+    await svc.disable("django-service", actor=ACTOR)
+    await svc.unmap_project("SHOP", "django-service", actor=ACTOR)
     actions = {e.action for e in reg.state.audit}
     assert actions == set(AuditAction)
     blob = json.dumps([dict(e.metadata) for e in reg.state.audit])
     assert "app-installation" not in blob and "12345" not in blob
-    assert len(await svc.audit_history("nest-backend")) == len(reg.state.audit)
+    assert len(await svc.audit_history("django-service")) == len(reg.state.audit)
     assert len(await svc.audit_history(None, limit=2)) == 2
-    assert [r.repository_key for r in await svc.list_repositories()] == ["nest-backend"]
+    assert [r.repository_key for r in await svc.list_repositories()] == ["django-service"]
     with pytest.raises(NotFoundError):
         await svc.audit_history("missing")

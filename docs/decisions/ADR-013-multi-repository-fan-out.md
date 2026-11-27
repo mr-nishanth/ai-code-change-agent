@@ -8,6 +8,7 @@ Status: accepted (2026-11-26)
 - **Coordination code is deterministic:** resolution, DAG ordering, compare-and-set state and dedupe-keyed jobs. No new agent, service, queue or Redis is added.
 - **Contracts:** an upstream child publishes its contract as an immutable artifact, read-only for its dependents. A missing contract blocks the dependents.
 - **All or nothing at intake:** every repository must resolve before anything runs.
+- **Python repositories only:** each child runs in the Python execution image (`ai-code-change-agent/execution-python:0.2.0`) and is validated by the Python validation engine. Only Python repositories are supported; a child whose profile names another toolchain is BLOCKED (`no_execution_image_for_toolchain`).
 
 ## Rejected alternatives
 

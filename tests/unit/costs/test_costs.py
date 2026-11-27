@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
@@ -403,3 +404,149 @@ def test_bedrock_usage_and_ids_are_understood() -> None:
     table = PriceTable()
     assert table.price(reported.model, reported.usage) is None  # reports: unknown, not guessed
     assert table.estimate(reported.model, reported.usage) is not None  # guards: list price
+
+
+async def test_searches_are_charged_to_the_phase_cost_guard_and_stop_further_calls() -> None:
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from ai_code_change_agent.application.costs.usage import BudgetExceededError, BudgetGuard
+
+    a = uuid.uuid4()
+    thread = f"attempt:{a}:planning:x"
+    store = MemoryStore()
+    tracker = UsageTracker(
+        store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=Decimal("0.05")
+    )
+    guard = next(h for h in tracker.handlers(thread) if isinstance(h, BudgetGuard))
+    assert tracker.search_allowed(thread)
+    search = SimpleNamespace(
+        model="unpriced-model", input_tokens=10_000, output_tokens=100, searches=5, error=None
+    )
+    await tracker.record_search(thread, search)  # unpriced: conservative rate + $0.05 fees
+    assert guard.spent >= Decimal("0.05") and not tracker.search_allowed(thread)
+    with pytest.raises(BudgetExceededError):
+        await guard.on_chat_model_start({}, [])
+    (record,) = store.records
+    assert record.stage == "research" and record.cost_usd is None  # ledger: no invented price
+    failed = SimpleNamespace(
+        model=HAIKU, input_tokens=100, output_tokens=1, searches=1, error="search_x"
+    )
+    await tracker.record_search(thread, failed)
+    assert store.records[-1].succeeded is False and store.records[-1].cost_usd is not None
+
+
+# ---- provider failures, duplicates and unpriced models in the ledger -----------------------
+
+
+def _error_response(status: int) -> LLMResult:
+    """What LangChain passes to on_llm_error for a failed non-streaming call: the provider's
+    error metadata only (see langchain_core _generate_response_from_error)."""
+    meta = {"body": {"type": "error"}, "headers": {}, "status_code": status}
+    return LLMResult(generations=[[ChatGeneration(message=AIMessage("", response_metadata=meta))]])
+
+
+async def test_a_failed_call_without_streamed_usage_is_unknown_and_adds_nothing_known() -> None:
+    from ai_code_change_agent.application.costs.usage import BudgetGuard
+
+    store, session, attempt = MemoryStore(), uuid.uuid4(), uuid.uuid4()
+    guard = BudgetGuard(PriceTable(), D("1"))
+    await guard.on_llm_end(result(anthropic_message(1000, 1000, model=SONNET)))
+    spent = guard.spent
+    err = RuntimeError("overloaded")
+    await guard.on_llm_error(err, run_id=uuid.uuid4(), response=_error_response(529))
+    await handler(store, attempt, "implementation", session).on_llm_error(
+        err, run_id=uuid.uuid4(), response=_error_response(529)
+    )
+    (rec,) = store.records
+    assert not rec.succeeded and rec.usage is None and rec.cost_usd is None  # unknown, not zero
+    assert guard.spent == spent == D("0.012")  # the earlier spend is kept
+
+
+class AcceptingStore:
+    """Records every add and accepts it: no dedupe, so the test sees what the tracker sends."""
+
+    def __init__(self) -> None:
+        self.added: list[LlmCallRecord] = []
+
+    async def add(self, record: LlmCallRecord) -> bool:
+        self.added.append(record)
+        return True
+
+
+async def test_a_replayed_accounting_event_is_handed_to_the_ledger_which_owns_the_dedupe() -> None:
+    """The tracker does no cross-handler dedupe: a resumed phase run builds new handlers, so a
+    replayed provider message reaches the store again under a new call id with its provider
+    message id intact. The PostgreSQL ledger refuses it on uq_llm_usage_records_provider_message_id
+    (tests/integration/test_usage_ledger_db.py::test_the_ledger_is_idempotent_append_only_and_
+    survives_restarts); this pins the tracker side of that contract."""
+    store, a = AcceptingStore(), uuid.uuid4()
+    tracker = UsageTracker(
+        store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=D("1")
+    )
+    thread = f"attempt:{a}:planning:run1"
+    first = next(h for h in tracker.handlers(thread) if isinstance(h, UsageCallbackHandler))
+    again = next(  # the resumed run
+        h for h in tracker.handlers(thread) if isinstance(h, UsageCallbackHandler)
+    )
+    assert again is not first
+    await first.on_llm_end(
+        result(anthropic_message(100_000, 0, msg_id="msg_dup")), run_id=uuid.uuid4()
+    )
+    await again.on_llm_end(
+        result(anthropic_message(999_999, 999_999, msg_id="msg_dup")), run_id=uuid.uuid4()
+    )
+    original, replayed = store.added
+    assert original.provider_message_id == replayed.provider_message_id == "msg_dup"
+    assert original.call_id != replayed.call_id  # only the provider message id can dedupe it
+    assert original.attempt_id == replayed.attempt_id == a
+    assert original.usage == TokenUsage(100_000, 0) and original.cost_usd == D("0.01")
+
+
+async def test_an_error_after_usage_was_recorded_keeps_the_recorded_usage() -> None:
+    store, session, attempt = MemoryStore(), uuid.uuid4(), uuid.uuid4()
+    h = handler(store, attempt, "implementation", session)
+    run = uuid.uuid4()
+    await h.on_llm_end(result(anthropic_message(100_000, 0, msg_id="msg_ok")), run_id=run)
+    (recorded,) = store.records
+    # the same run reporting an error afterwards does not replace or add to the recorded call
+    await h.on_llm_error(RuntimeError("late failure"), run_id=run)
+    assert store.records == [recorded] and recorded.succeeded
+    # a later call that fails is added next to it; the known cost stays
+    await h.on_llm_error(RuntimeError("overloaded"), run_id=uuid.uuid4())
+    kept, failed = store.records
+    assert kept is recorded and kept.usage == TokenUsage(100_000, 0)
+    assert not failed.succeeded and failed.usage is None
+    t = totals(store.records)
+    assert (t.calls, t.known_calls, t.cost) == (2, 1, D("0.01"))
+    assert t.money().startswith("at least $0.0100") and "INCOMPLETE: 1" in t.money()
+
+
+async def test_an_unpriced_model_is_recorded_as_unknown_cost_and_flagged_in_reports(
+    tmp_path: Path,
+) -> None:
+    store, session, attempt = MemoryStore(), uuid.uuid4(), uuid.uuid4()
+    query = MemoryQuery(store, {attempt: ("SHOP-9", 1, "COMPLETED")})
+    h = handler(store, attempt, "planning", session)
+    await h.on_llm_end(result(anthropic_message(100_000, 0)), run_id=uuid.uuid4())  # $0.01
+    await h.on_llm_end(
+        result(anthropic_message(5_000, 500, model="claude-future-9")), run_id=uuid.uuid4()
+    )
+    priced_rec, unpriced = store.records
+    assert unpriced.model == "claude-future-9" and unpriced.succeeded
+    assert unpriced.usage == TokenUsage(5_000, 500)  # the tokens are kept...
+    assert unpriced.cost_usd is None  # ...but the cost is unknown, never 0
+    rows = await query.rows(session_id=session)
+    summary = session_summary(session, rows, rows, pricing_version="v")
+    shop9 = next(line for line in summary.splitlines() if line.startswith("SHOP-9"))
+    assert shop9.endswith(" *")
+    assert "Session LLM Cost : at least $0.0100" in summary and "unknown, not zero" in summary
+    report = task_report(
+        attempt, rows, provider="anthropic", primary_model=HAIKU, pricing_version="v"
+    )
+    assert "INCOMPLETE: 1 call(s)" in report
+    # a price file that does not list the model: still unknown, not zero
+    path = tmp_path / "prices.json"
+    path.write_text(json.dumps({"version": "x", "models": {}}))
+    assert PriceTable.from_file(path).price("claude-future-9", TokenUsage(1, 1)) is None
+    assert priced_rec.cost_usd == D("0.01")

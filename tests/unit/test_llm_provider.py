@@ -1,6 +1,7 @@
 """LLM provider selection: Anthropic for local development and tests, Bedrock for staging and
 production (the only two providers)."""
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -126,8 +127,95 @@ def test_every_model_carries_its_context_window_for_summarisation(kw: dict[str, 
     assert model.profile is not None and model.profile["max_input_tokens"] == 200_000
 
 
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"llm_model": "claude-test", "anthropic_api_key": "k"},
+        {"llm_provider": "bedrock", "llm_model": "m", "bedrock_region": "us-east-1"},
+    ],
+)
+def test_the_production_chat_models_never_stream(kw: dict[str, object]) -> None:
+    """The cost handlers ignore on_llm_error's response because a non-streaming call that fails
+    has no partial usage. Enabling streaming would break that (usage streamed before an error
+    would go unrecorded and uncharged), so this trips first: see docs/LLM-COST-TRACKING.md."""
+    model = build_chat_model(s(**kw))
+    assert "streaming" not in model.model_fields_set
+    assert model._should_stream(async_api=True, run_manager=None) is False
+    assert model._should_stream(async_api=False, run_manager=None) is False
+
+
 def test_model_calls_can_be_paced_client_side() -> None:
     paced = build_chat_model(s(llm_model="m", anthropic_api_key="k", llm_requests_per_minute=30))
     assert paced.rate_limiter is not None
     assert paced.rate_limiter.requests_per_second == 0.5  # type: ignore[attr-defined]
     assert build_chat_model(s(llm_model="m", anthropic_api_key="k")).rate_limiter is None
+
+
+# ---- provider failures over a fake transport (no network) -----------------------------------
+
+
+async def test_anthropic_retries_rate_limits_within_the_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One representative case; 401/403 (never retried) are asserted with their error codes and
+    ledger rows in tests/unit/test_coding_agent.py::
+    test_provider_http_failures_end_the_run_with_a_fixed_non_secret_code."""
+    import httpx2
+    from langchain_core.messages import HumanMessage
+
+    from tests.support.models import anthropic_over_fake_http
+
+    body = {"type": "error", "error": {"type": "rate_limit_error", "message": "refused"}}
+    received = anthropic_over_fake_http(monkeypatch, lambda _: httpx2.Response(429, json=body))
+    model = build_chat_model(
+        s(llm_model="claude-haiku-5-5", anthropic_api_key="k", llm_max_retries=2)
+    )
+    with pytest.raises(Exception) as err:
+        await model.ainvoke([HumanMessage(content="hi")])
+    assert getattr(err.value, "status_code", None) == 429
+    assert len(received) == 3  # the first request plus LLM_MAX_RETRIES retries, then it stops
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "expected_requests"),
+    [(429, "ThrottlingException", 3), (403, "AccessDeniedException", 1)],
+)
+def test_bedrock_retries_throttling_within_the_policy_and_never_retries_access_denied(
+    monkeypatch: pytest.MonkeyPatch, status: int, error_type: str, expected_requests: int
+) -> None:
+    import botocore.retries.standard  # type: ignore[import-untyped]
+    from botocore.awsrequest import AWSResponse  # type: ignore[import-untyped]
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+    from langchain_core.messages import HumanMessage
+
+    for key, value in {
+        "AWS_ACCESS_KEY_ID": "AKIATEST",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_EC2_METADATA_DISABLED": "true",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setattr(  # retries do not sleep in tests
+        botocore.retries.standard.ExponentialBackoff, "delay_amount", lambda *_: 0
+    )
+
+    class Raw:
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+
+        def stream(self, **_: object) -> Iterator[bytes]:
+            yield self.data
+
+    received: list[object] = []
+
+    def send(request: object, **_: object) -> AWSResponse:
+        received.append(request)
+        headers = {"x-amzn-ErrorType": error_type, "content-type": "application/json"}
+        return AWSResponse(request.url, status, headers, Raw(b'{"message":"refused"}'))  # type: ignore[attr-defined]
+
+    model = build_chat_model(bedrock(llm_max_retries=2))
+    model.client.meta.events.register("before-send.bedrock-runtime.Converse", send)  # type: ignore[attr-defined]
+    with pytest.raises(ClientError) as err:
+        model.invoke([HumanMessage(content="hi")])
+    assert err.value.response["Error"]["Code"] == error_type
+    assert len(received) == expected_requests

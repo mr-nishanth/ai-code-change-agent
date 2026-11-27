@@ -10,7 +10,7 @@ from ai_code_change_agent.application.repositories.validation import (
 )
 from ai_code_change_agent.domain.repositories.catalog import MAX_PROFILE_BYTES
 from ai_code_change_agent.domain.repositories.errors import RegistryValidationError
-from tests.support.registry_fixtures import FIXTURES, jvm_service, nestjs_backend, profile
+from tests.support.registry_fixtures import FIXTURES, django_service, profile, python_sdk
 
 V = ProfileValidator()
 
@@ -22,18 +22,18 @@ def codes(doc: object) -> set[str]:
 
 
 @pytest.mark.parametrize("name", sorted(FIXTURES))
-def test_all_four_stack_fixtures_are_valid(name: str) -> None:
+def test_all_stack_fixtures_are_valid(name: str) -> None:
     out = V.validate(FIXTURES[name]())
     assert out.profile.repository_key == name and len(out.content_sha256) == 64
     assert out.policy_version == "1" and out.schema_version == 1
 
 
-def test_jvm_fixture_valid_too() -> None:
-    assert V.validate(jvm_service()).profile.toolchains == ("jvm",)
+def test_python_sdk_fixture_valid_too() -> None:
+    assert V.validate(python_sdk()).profile.toolchains == ("python",)
 
 
 def test_hash_is_stable_and_order_independent() -> None:
-    a = nestjs_backend()
+    a = django_service()
     b = json.loads(json.dumps(a, sort_keys=True))
     assert V.validate(a).content_sha256 == V.validate(b).content_sha256
     changed = copy.deepcopy(a)
@@ -52,7 +52,7 @@ def test_document_must_be_an_object(doc: object) -> None:
 
 def test_unknown_fields_are_rejected_everywhere() -> None:
     assert "extra_forbidden" in codes({**profile("xx"), "surprise": 1})
-    doc = nestjs_backend()
+    doc = django_service()
     doc["commands"][0]["shell"] = "rm -rf /"
     assert "extra_forbidden" in codes(doc)
     doc = profile("xx", limits={"max_files_changed": 5, "root": True})
@@ -69,7 +69,7 @@ def test_required_fields() -> None:
 
 
 def test_privilege_escalation_attempts_are_rejected() -> None:
-    doc = nestjs_backend()
+    doc = django_service()
     assert "unknown_policy" in codes({**doc, "command_policy": "permissive"})
     assert "unknown_policy" in codes({**doc, "validation_policy": "none"})
     assert "unknown_capability" in codes(
@@ -90,23 +90,23 @@ def test_privilege_escalation_attempts_are_rejected() -> None:
 
 
 def test_capability_must_be_selected_for_each_command_kind() -> None:
-    doc = nestjs_backend()
+    doc = django_service()
     doc["capabilities"] = ["test_run"]
     assert "capability_not_granted" in codes(doc)
 
 
 def test_toolchain_must_be_declared() -> None:
-    doc = nestjs_backend()
+    doc = django_service()
     doc["toolchains"] = []
     assert "toolchain_not_declared" in codes(doc)
-    assert "unknown_toolchain" in codes({**nestjs_backend(), "toolchains": ["node", "fortran"]})
+    assert "unknown_toolchain" in codes({**django_service(), "toolchains": ["node", "fortran"]})
 
 
 def test_duplicate_ids_and_capabilities() -> None:
-    doc = nestjs_backend()
+    doc = django_service()
     doc["commands"][1]["id"] = doc["commands"][0]["id"]
     assert "duplicate" in codes(doc)
-    doc = nestjs_backend()
+    doc = django_service()
     doc["capabilities"] = ["test_run", "test_run", "build_run", "lint_run", "dependency_install"]
     assert "duplicate" in codes(doc)
 
@@ -142,22 +142,22 @@ def test_labels_and_tiers() -> None:
 
 def test_key_format_and_command_field_bounds() -> None:
     assert codes(profile("Bad Key"))
-    d = nestjs_backend()
+    d = django_service()
     d["commands"][0]["argv"] = []
     assert codes(d)
-    d = nestjs_backend()
+    d = django_service()
     d["commands"][0]["argv"] = ["npm"] * 17
     assert codes(d)
-    d = nestjs_backend()
+    d = django_service()
     d["commands"][0]["timeout_seconds"] = 99999
     assert codes(d)
-    d = nestjs_backend()
+    d = django_service()
     d["commands"][0]["kind"] = "deploy"
     assert codes(d)
 
 
 def test_every_finding_is_reported_not_just_the_first() -> None:
-    doc = nestjs_backend()
+    doc = django_service()
     doc["command_policy"] = "x"
     doc["validation_policy"] = "y"
     doc["capabilities"] = ["nope"]

@@ -42,7 +42,9 @@ from ai_code_change_agent.domain.repositories.command_policy import CommandPolic
 from ai_code_change_agent.domain.webhooks.policy import ScopePolicy
 from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.execution.docker.dependencies import DockerDependencyPreparer
+from ai_code_change_agent.execution.docker.metadata_verifier import MetadataVerifier
 from ai_code_change_agent.execution.docker.process import SubprocessRunner
+from ai_code_change_agent.execution.docker.resolver_network import ResolverEgress, egress_hosts
 from ai_code_change_agent.execution.docker.runtime import ContainerLimits, DockerWorkspaceRuntime
 from ai_code_change_agent.execution.docker.sandbox import SandboxLimits, SandboxManager
 from ai_code_change_agent.integrations.github.authentication import GitHubAppAuth
@@ -62,9 +64,11 @@ from ai_code_change_agent.integrations.web.search import AnthropicDocumentSearch
 from ai_code_change_agent.orchestration.intake import (
     CHILD,
     INTAKE,
+    PARENT_REPORT,
     RESUME,
     ChildHandler,
     IntakeHandler,
+    ParentReportHandler,
     ResumeHandler,
 )
 from ai_code_change_agent.orchestration.langgraph.checkpointer import postgres_checkpointer
@@ -267,11 +271,23 @@ def dependency_root(settings: Settings) -> Path:
 
 
 def build_dependency_preparer(settings: Settings) -> DockerDependencyPreparer:
+    runner = SubprocessRunner()
     return DockerDependencyPreparer(
         root=dependency_root(settings),
         image=_image(settings),
         index_url=settings.dependency_index_url,
-        runner=SubprocessRunner(),
+        runner=runner,
+        egress=ResolverEgress(
+            runner=runner,
+            image=_image(settings),
+            allow_hosts=egress_hosts(settings.dependency_index_url),
+            network=settings.dependency_resolver_network,
+            lifetime_seconds=settings.dependency_timeout_seconds + 120,
+        ),
+        verifier=MetadataVerifier(
+            settings.dependency_index_url,
+            allow_unverified_index=settings.dependency_allow_unverified_index,
+        ),
         max_packages=settings.dependency_max_packages,
         max_bytes=settings.dependency_max_bytes,
         timeout_seconds=settings.dependency_timeout_seconds,
@@ -284,13 +300,15 @@ def build_reference_tools(
     """The agent's harness-side research tools (search_docs when the Anthropic provider and
     REFERENCE_SEARCH_ENABLED allow it, and fetch_reference), or None when no domain is
     allow-listed. Built afresh per phase run (per-phase budgets); searches are costed."""
-    if not settings.reference_allowed_domains:
+    if not settings.reference_allowed_hosts:
         return None
-    domains = sorted(settings.reference_allowed_domains)
+    hosts = sorted(settings.reference_allowed_hosts)
     fetcher = HttpReferenceFetcher(
-        allowed_domains=domains,
+        allowed_hosts=hosts,
         max_bytes=settings.reference_max_bytes,
         timeout_seconds=settings.reference_timeout_seconds,
+        max_url_chars=settings.reference_max_url_chars,
+        max_redirects=settings.reference_max_redirects,
     )
     searcher = None
     if (
@@ -302,11 +320,21 @@ def build_reference_tools(
         searcher = AnthropicDocumentSearch(
             api_key=settings.anthropic_api_key.get_secret_value(),
             model=settings.llm_model,
-            allowed_domains=domains,
+            allowed_hosts=hosts,
+            secondary_hosts=sorted(settings.reference_secondary_hosts),
+            max_hits=settings.reference_search_max_hits,
+            max_url_chars=settings.reference_max_url_chars,
         )
 
     def tools(thread_id: str) -> list[BaseTool]:
-        out = [build_reference_tool(fetcher, max_calls=settings.reference_max_fetches)]
+        out = [
+            build_reference_tool(
+                fetcher,
+                max_calls=settings.reference_max_fetches,
+                thread_id=thread_id,
+                max_url_chars=settings.reference_max_url_chars,
+            )
+        ]
         if searcher is not None:
 
             async def record(result: SearchResult) -> None:
@@ -316,7 +344,11 @@ def build_reference_tools(
             out.insert(
                 0,
                 build_search_tool(
-                    searcher, max_calls=settings.reference_max_searches, on_result=record
+                    searcher,
+                    max_calls=settings.reference_max_searches,
+                    on_result=record,
+                    allowed=(lambda: usage.search_allowed(thread_id)) if usage else None,
+                    thread_id=thread_id,
                 ),
             )
         return out
@@ -325,9 +357,9 @@ def build_reference_tools(
 
 
 def execution_images(settings: Settings) -> dict[str, str]:
-    """Toolchain family -> execution image: python from WORKSPACE_IMAGE, others from
-    WORKSPACE_IMAGES. A profile whose toolchain has no image is BLOCKED before any work."""
-    return {"python": _image(settings), **settings.workspace_images}
+    """Toolchain family -> execution image. Repository execution is Python only, so the single
+    entry is WORKSPACE_IMAGE; a profile declaring another toolchain is BLOCKED before any work."""
+    return {"python": _image(settings)}
 
 
 def build_sandbox_manager(settings: Settings) -> SandboxManager:
@@ -468,6 +500,8 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             agent_checkpointer=saver,
             dependencies=build_dependency_preparer(settings),
             approval_mode=settings.workflow_approval_mode,
+            max_dependency_packages=settings.dependency_max_packages,
+            dependency_index_url=settings.dependency_index_url,
             multirepo=coordinator,
             toolchains=frozenset(execution_images(settings)),
         )
@@ -486,6 +520,7 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             CHILD: ChildHandler(
                 coordinator=coordinator, changes=changes, start=costs.around(runner.start)
             ),
+            PARENT_REPORT: ParentReportHandler(coordinator=coordinator),
         }
         worker = Worker(
             PostgresJobQueue(sessions),

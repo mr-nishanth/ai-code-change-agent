@@ -1,4 +1,4 @@
-"""Profile documents for four technology stacks. Pure data: no repository-specific code exists."""
+"""Profile documents for Python repository stacks (repository execution is Python only). Pure data: no repository-specific code exists."""
 
 from typing import Any
 
@@ -20,43 +20,32 @@ def profile(key: str, **over: Any) -> dict[str, Any]:
     return base
 
 
-def nestjs_backend() -> dict[str, Any]:
+def django_service() -> dict[str, Any]:
     return profile(
-        "nest-backend",
-        languages=["TypeScript"],
-        frameworks=["NestJS"],
-        toolchains=["node"],
-        capabilities=["test_run", "build_run", "lint_run", "dependency_install"],
+        "django-service",
+        languages=["Python"],
+        frameworks=["Django"],
+        toolchains=["python"],
+        capabilities=["test_run", "lint_run"],
         commands=[
-            _cmd(
-                "install",
-                "install",
-                "node",
-                "npm",
-                "ci",
-                "--ignore-scripts",
-                network="package_registry",
-            ),
-            _cmd("test", "test", "node", "npm", "run", "test"),
-            _cmd("lint", "lint", "node", "npm", "run", "lint"),
-            _cmd("build", "build", "node", "npm", "run", "build"),
+            _cmd("test", "test", "python", "python", "-m", "pytest", "-q"),
+            _cmd("lint", "lint", "python", "ruff", "check", "--no-fix", "src"),
         ],
         execution_tier="medium",
     )
 
 
-def react_frontend() -> dict[str, Any]:
+def flask_worker() -> dict[str, Any]:
     return profile(
-        "react-frontend",
-        languages=["TypeScript", "JavaScript"],
-        frameworks=["React", "Vite"],
-        toolchains=["node"],
-        capabilities=["test_run", "build_run", "lint_run", "format_check"],
+        "flask-worker",
+        languages=["Python"],
+        frameworks=["Flask"],
+        toolchains=["python"],
+        capabilities=["test_run", "lint_run", "format_check"],
         commands=[
-            _cmd("test", "test", "node", "npm", "run", "test"),
-            _cmd("typecheck", "lint", "node", "npm", "run", "typecheck"),
-            _cmd("fmt", "format_check", "node", "npm", "run", "format:check"),
-            _cmd("build", "build", "node", "npm", "run", "build"),
+            _cmd("test", "test", "python", "pytest", "-q", "tests"),
+            _cmd("types", "lint", "python", "mypy", "src"),
+            _cmd("fmt", "format_check", "python", "ruff", "format", "--check", "src"),
         ],
     )
 
@@ -79,7 +68,7 @@ def python_backend() -> dict[str, Any]:
 
 
 def unfamiliar_framework() -> dict[str, Any]:
-    """A stack the platform has no toolchain policy for: valid, but declares no commands."""
+    """A stack with no execution toolchain: valid, but declares no commands."""
     return profile(
         "odd-framework",
         languages=["Zig"],
@@ -88,23 +77,20 @@ def unfamiliar_framework() -> dict[str, Any]:
     )
 
 
-def jvm_service() -> dict[str, Any]:
+def python_sdk() -> dict[str, Any]:
     return profile(
-        "spring-service",
-        languages=["Java"],
-        frameworks=["SpringBoot"],
-        toolchains=["jvm"],
-        capabilities=["test_run", "build_run"],
-        commands=[
-            _cmd("test", "test", "jvm", "mvn", "test", "-B"),
-            _cmd("build", "build", "jvm", "mvn", "compile", "-B"),
-        ],
+        "python-sdk",
+        languages=["Python"],
+        frameworks=[],
+        toolchains=["python"],
+        capabilities=["test_run"],
+        commands=[_cmd("test", "test", "python", "python", "-m", "pytest", "-q", "tests")],
     )
 
 
 FIXTURES: dict[str, Any] = {
-    "nest-backend": nestjs_backend,
-    "react-frontend": react_frontend,
+    "django-service": django_service,
+    "flask-worker": flask_worker,
     "python-backend": python_backend,
     "odd-framework": unfamiliar_framework,
 }

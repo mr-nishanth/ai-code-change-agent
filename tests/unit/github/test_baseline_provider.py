@@ -16,7 +16,7 @@ from ai_code_change_agent.application.workspaces.models import BaselineFile
 from ai_code_change_agent.application.workspaces.registry_baseline import RegistryBaselineProvider
 from ai_code_change_agent.domain.repositories.models import RepositoryStatus
 from tests.support.github_repos import FILES, reader_rig
-from tests.support.registry_fixtures import nestjs_backend, new_repo
+from tests.support.registry_fixtures import django_service, new_repo
 from tests.support.registry_memory import InMemoryRegistry
 
 GITHUB = {"provider": "github", "pid": "424242", "owner": "acme", "name": "shop-service"}
@@ -51,7 +51,7 @@ async def setup(reader: Any, key: str = "github") -> tuple[_Chg, Any, Any, Any]:
         new_repo("shop-service", pid="424242", owner="acme", name="shop-service"), actor="cli:t"
     )
     await svc.create_version(
-        "shop-service", nestjs_backend() | {"repository_key": "shop-service"}, actor="cli:t"
+        "shop-service", django_service() | {"repository_key": "shop-service"}, actor="cli:t"
     )
     await svc.publish_version("shop-service", 1, actor="cli:t")
     await svc.map_project("SHOP", "shop-service", actor="cli:t")

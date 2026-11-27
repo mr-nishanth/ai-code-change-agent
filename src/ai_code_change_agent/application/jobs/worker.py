@@ -7,6 +7,7 @@ two workers never act on the same job.
 
 import asyncio
 import contextlib
+import math
 import socket
 import uuid
 from collections.abc import Callable, Coroutine, Mapping
@@ -28,6 +29,16 @@ MAX_BACKOFF_SECONDS = 900
 def backoff_seconds(attempts: int, base: int = 30) -> int:
     exponent: int = max(attempts - 1, 0)
     return int(min(base * (1 << exponent), MAX_BACKOFF_SECONDS))
+
+
+def retry_delay_seconds(exc: BaseException, attempts: int) -> int:
+    """The backoff for a retryable failure, raised to the exception's positive
+    `retry_after_seconds` hint (rounded up) and capped at MAX_BACKOFF_SECONDS."""
+    delay = backoff_seconds(attempts)
+    hint = getattr(exc, "retry_after_seconds", None)
+    if isinstance(hint, int | float) and math.isfinite(hint) and hint > 0:
+        delay = max(delay, math.ceil(hint))
+    return min(delay, MAX_BACKOFF_SECONDS)
 
 
 class _LeaseLost(Exception):  # noqa: N818
@@ -110,7 +121,7 @@ class Worker:
         except Exception as exc:  # retryable by default; the code never carries raw messages
             code = exc.code if isinstance(exc, JobRetryableError) else type(exc).__name__
             status = await self._queue.fail(
-                job.id, self.owner, code, retry_in_seconds=backoff_seconds(job.attempts)
+                job.id, self.owner, code, retry_in_seconds=retry_delay_seconds(exc, job.attempts)
             )
             _log.warning(
                 "job_failed",

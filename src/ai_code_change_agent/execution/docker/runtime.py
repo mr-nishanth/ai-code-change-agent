@@ -55,7 +55,8 @@ _SAFE_MOUNT_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
 _IMAGE = re.compile(
     r"[a-z0-9][a-z0-9._/-]{0,100}(:[A-Za-z0-9._-]{1,100})?(@sha256:[0-9a-f]{64})?|sha256:[0-9a-f]{64}"
 )
-_DOCKER_FAILURE_CODES = frozenset({125, 126, 127})  # docker itself, or "cannot execute"
+_DOCKER_FAILURE_CODES = frozenset({125, 126})  # docker itself, or "cannot execute"
+_COMMAND_NOT_FOUND = 127  # executable missing from the image: an environment gap, not a code defect
 # Fixed by the platform, never by a repository or a model. Tool caches go to the container's
 # tmpfs so they neither count against the workspace quota nor appear as changed files.
 _CONTAINER_TMP = "/tmp"  # noqa: S108 - a path inside the container
@@ -499,6 +500,8 @@ class DockerWorkspaceRuntime:
             return finish(CommandStatus.ERROR, "workspace_size_exceeded")
         if result.exit_code in _DOCKER_FAILURE_CODES:
             return finish(CommandStatus.ERROR, "container_start_failed")
+        if result.exit_code == _COMMAND_NOT_FOUND:
+            return finish(CommandStatus.ERROR, "command_not_found")
         status = CommandStatus.PASSED if result.exit_code == 0 else CommandStatus.FAILED
         _log.info(
             "workspace_command",

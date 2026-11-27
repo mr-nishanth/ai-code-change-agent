@@ -8,7 +8,7 @@ from ai_code_change_agent.domain.repositories.resolution import ResolutionReques
 from ai_code_change_agent.integrations.github.references import (
     GitHubReferenceParser,
 )
-from tests.support.registry_fixtures import nestjs_backend, new_repo
+from tests.support.registry_fixtures import django_service, new_repo
 from tests.support.registry_memory import InMemoryRegistry
 
 ACTOR = "cli:tester"
@@ -55,7 +55,7 @@ async def onboard(reg: InMemoryRegistry, *, enable: bool = True, project: str = 
     repo = new_repo("shop-service", owner="acme", name="shop_service",
                     pid="1468634307")  # fmt: skip
     await svc.register_repository(repo, actor=ACTOR)
-    await svc.create_version("shop-service", nestjs_backend() | {
+    await svc.create_version("shop-service", django_service() | {
         "repository_key": "shop-service"}, actor=ACTOR)  # fmt: skip
     await svc.publish_version("shop-service", 1, actor=ACTOR)
     await svc.map_project(project, "shop-service", actor=ACTOR)

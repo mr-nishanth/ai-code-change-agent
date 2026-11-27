@@ -6,7 +6,19 @@ Turns a Jira Story into **draft pull requests**, for one repository or several. 
 - KAN-7 and KAN-8: single repository;
 - KAN-9: backend and client repositories, with the backend's API contract handed to the client.
 
-Python and Node toolchains are supported. Android, Flutter and iOS are not yet.
+## Components
+
+| Component | Technology | Role |
+|---|---|---|
+| Agent API | Python / FastAPI | Jira webhook intake and health checks; never runs agents |
+| Workflow | Python / LangGraph | One workflow per attempt, gates, retries |
+| Coding agent | Python / Deep Agents | Plans and implements inside the sandbox |
+| Execution sandbox | Python Docker image (`execution-python:0.2.0`) | Offline, hardened; runs **Python repositories only** |
+| Validation | Python, independent of the agent | Fresh offline container; runs the profile's Python commands |
+| Studio UI | React / TypeScript / Node.js (Vite) | Development UI to watch the agent; Node.js is a local development requirement only, not an execution toolchain |
+| Database | PostgreSQL | Requests, jobs, attempts, artifacts index, cost ledger |
+
+**Scope:** multi-repository means several registered **Python** repositories per Story (for example a backend API and a Python client, SDK or worker). Node.js, React/Next.js, Android, Kotlin/Java, Flutter and iOS/Swift repositories are out of scope.
 
 ## Start here
 
@@ -19,7 +31,7 @@ Python and Node toolchains are supported. Android, Flutter and iOS are not yet.
 | [docs/SECURITY.md](docs/SECURITY.md) | Security model |
 | [docs/AUTOMATED-PIPELINE.md](docs/AUTOMATED-PIPELINE.md) | Automatic gates, retries, onboarding |
 | [docs/MULTI-REPOSITORY.md](docs/MULTI-REPOSITORY.md) | Stories across several repositories |
-| [docs/TOOLCHAINS-AND-RESEARCH.md](docs/TOOLCHAINS-AND-RESEARCH.md) | Execution images, documentation search |
+| [docs/PYTHON-EXECUTION-AND-RESEARCH.md](docs/PYTHON-EXECUTION-AND-RESEARCH.md) | Python execution image, sandbox, documentation search |
 | [docs/DYNAMIC-DEPENDENCY-PROVISIONING.md](docs/DYNAMIC-DEPENDENCY-PROVISIONING.md) | Offline dependency bundles |
 | [docs/LLM-COST-TRACKING.md](docs/LLM-COST-TRACKING.md) | Cost ledger, reports, runaway-cost guards |
 | [docs/DEEP-AGENT-STUDIO.md](docs/DEEP-AGENT-STUDIO.md) | React UI to watch the agent live |

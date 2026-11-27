@@ -5,7 +5,6 @@ CAPABILITIES = frozenset(
 )
 COMMAND_POLICY_IDS = frozenset({"default-v1"})
 VALIDATION_POLICIES = frozenset({"standard", "strict"})
-EXECUTION_TIERS = ("small", "medium", "large")
 ACCESS_REFERENCE_SCHEMES = ("app-installation", "secret", "parameter")
 
 # Platform ceilings a profile can only lower.

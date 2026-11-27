@@ -32,13 +32,13 @@ These are OS-level guarantees and stronger than tool-level rules. Real-Docker te
 
 | Decision | Amendment |
 |---|---|
-| C2 | Dependencies: trusted, hash-locked wheel bundles prepared outside the sandbox and mounted read-only ([ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md)). One harness-side tool, `fetch_reference`, for allow-listed documentation ([ADR-011](decisions/ADR-011-harness-side-reference-fetching.md)). Sandbox and validation containers remain without network. |
+| C2 | Dependencies: trusted, hash-locked wheel bundles prepared outside the sandbox and mounted read-only ([ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md)). Two harness-side tools, `search_docs` and `fetch_reference`, for documentation on the exact hosts listed in `config/reference_sources.yaml` ([ADR-011](decisions/ADR-011-harness-side-reference-fetching.md)). Sandbox and validation containers remain without network. |
 | C3 | The two gates remain and still bind exact hashes, but by default they are decided by deterministic policy (`WORKFLOW_APPROVAL_MODE=automatic`, actor `policy:automatic`, reasons stored). Operator approval is the `manual` mode. See [AUTOMATED-PIPELINE.md](AUTOMATED-PIPELINE.md). |
 | C4 | Reporting covers failures too: one comment per attempt outcome (success with branch and draft PR; failure with stage, reason and retryability), plus one when no attempt can start (unresolvable repository). |
 
-## Multi-repository, toolchains, research and cost guards (2026-11-26)
+## Multi-repository, research and cost guards (2026-11-26)
 
 - [ADR-013](decisions/ADR-013-multi-repository-fan-out.md): multi-repository Stories by parent/child fan-out. Deterministic coordination; no new agents or services.
-- **Execution images per toolchain:** set through `WORKSPACE_IMAGES`. Node is verified; Android, Flutter and iOS are not supported yet.
+- **Python-only execution:** one Python execution image (`WORKSPACE_IMAGE`) for every repository; the command policy has only the `python` family. Other languages are out of scope. See [PYTHON-EXECUTION-AND-RESEARCH.md](PYTHON-EXECUTION-AND-RESEARCH.md).
 - **Documentation search:** worker-side Anthropic web search behind a `ReferenceSearcher` port. The sandbox stays offline.
 - **Runaway-cost guards for any model:** a call cap, a phase USD budget and bounded structured-output retries.

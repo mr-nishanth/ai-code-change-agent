@@ -9,15 +9,21 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ai_code_change_agent.application.changes.service import CodeChangeService
-from ai_code_change_agent.application.jira.errors import JiraIssueNotFoundError
+from ai_code_change_agent.application.jira.errors import (
+    JiraIntegrationError,
+    JiraIssueNotFoundError,
+    JiraResponseError,
+)
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
-from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError, JobRetryableError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
+    REPORT_JOB,
     Coordinator,
     MultiRepoBlockedError,
+    ReportRetryableError,
 )
-from ai_code_change_agent.application.multirepo.models import ChildStatus
+from ai_code_change_agent.application.multirepo.models import ChildStatus, ReportState
 from ai_code_change_agent.application.repositories.resolver import (
     RepositoryResolver,
     build_resolution_request,
@@ -27,8 +33,19 @@ from ai_code_change_agent.domain.changes.multirepo import DeclarationError, pars
 INTAKE = "code_change.intake"
 RESUME = "code_change.resume"
 CHILD = CHILD_JOB
+PARENT_REPORT = REPORT_JOB
 REPOSITORY_FIELD = "repository"  # logical name of the configured Jira custom field
 Launch = Callable[[uuid.UUID], Awaitable[Any]]
+# Responses the client treats as unusable that are usually transient (a proxy or maintenance page,
+# a truncated body, 408 Request Timeout, 425 Too Early): retried within the job's attempts.
+_TRANSIENT_RESPONSES = frozenset({"unexpected_content_type", "malformed_json"})
+_TRANSIENT_STATUSES = frozenset({408, 425})
+
+
+def _transient(exc: JiraIntegrationError) -> bool:
+    return isinstance(exc, JiraResponseError) and (
+        str(exc) in _TRANSIENT_RESPONSES or exc.status_code in _TRANSIENT_STATUSES
+    )
 
 
 class IntakeHandler:
@@ -61,6 +78,15 @@ class IntakeHandler:
             issue = await self._jira.get_issue(request.jira_issue_key)
         except JiraIssueNotFoundError:
             raise JobFailedError("jira_issue_not_found") from None
+        except JiraIntegrationError as exc:
+            # Authentication, permission, a bad request or an unusable response will not fix
+            # itself on a retry: dead at once, with the fixed code. Transient errors (429, 5xx
+            # outages, timeouts) propagate unchanged, so the queue backs off and retries them.
+            if _transient(exc):
+                raise JobRetryableError(exc.code) from None
+            if not exc.retryable:
+                raise JobFailedError(exc.code) from None
+            raise
         if issue.project is None or issue.project.key != request.jira_project_key:
             raise JobFailedError("jira_project_changed")
         story_text = f"{issue.summary or ''}\n{issue.description.text if issue.description else ''}"
@@ -154,6 +180,24 @@ class ChildHandler:
         finished = await self._changes.get_attempt(attempt.id)
         if finished.terminal:
             await self._coordinator.child_finished(child.id, finished)
+
+
+class ParentReportHandler:
+    """Retries the aggregated Jira comment of a multi-repository parent (never re-runs a child).
+    A retryable outcome raises, so the job queue backs off and runs it again; a worker crash
+    leaves the job leased, and the next claim reconciles with Jira before any new POST."""
+
+    def __init__(self, *, coordinator: Coordinator) -> None:
+        self._coordinator = coordinator
+
+    async def __call__(self, job: Job) -> None:
+        try:
+            parent_id = uuid.UUID(str(job.payload["parent_id"]))
+        except (KeyError, ValueError):
+            raise JobFailedError("payload_invalid") from None
+        state = await self._coordinator.report(parent_id)
+        if state is ReportState.RETRYABLE_FAILURE:
+            raise ReportRetryableError("jira_report_retryable")
 
 
 class ResumeHandler:

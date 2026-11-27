@@ -28,12 +28,11 @@ All variables are described in [CONFIGURATION.md](CONFIGURATION.md).
 docker compose up -d --wait postgres                 # PostgreSQL on 127.0.0.1:5435
 uv run alembic upgrade head                          # migrations 0001-0003
 docker build -t ai-code-change-agent/execution-python:0.2.0 docker/execution
-docker build -t ai-code-change-agent/execution-node:0.1.0 docker/execution-node   # optional (node repos)
 mkdir -p -m 700 var/workspaces var/artifacts
 docker compose up -d --wait api                      # webhook intake on 127.0.0.1:8000
 ```
 
-If you built the Node image, also set `WORKSPACE_IMAGES=node=ai-code-change-agent/execution-node:0.1.0`.
+Only Python repositories are supported; the Python image is the only execution image.
 
 ## 4. Jira webhook
 
@@ -52,7 +51,7 @@ Details are in [SETUP-JIRA-WEBHOOK.md](SETUP-JIRA-WEBHOOK.md).
 
 ```bash
 uv run ai-code-change repositories register --from-provider <owner>/<repo> --project <JIRA_KEY> --enable
-#   --toolchain node   for a Node repository; --test-command "..." via init-profile to override
+#   --test-command "..." via init-profile to override
 uv run ai-code-change repositories list
 ```
 

@@ -10,8 +10,10 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_reference_sources
 
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -123,9 +125,7 @@ class Settings(BaseSettings):
     # ---- execution sandbox and artifacts ---------------------------------------------------
     workspace_root: str | None = None
     artifact_root: str | None = None
-    workspace_image: str | None = None  # the python toolchain's execution image
-    # Further toolchains: "node=ai-code-change-agent/execution-node:0.1.0,..." (family=image).
-    workspace_images: Annotated[dict[str, str], NoDecode] = Field(default_factory=dict)
+    workspace_image: str | None = None  # the Python execution image (the only toolchain)
     workspace_cpu_limit: float = Field(default=1.0, gt=0, le=16)
     workspace_memory_limit_mb: int = Field(default=2048, ge=128, le=65_536)
     workspace_pids_limit: int = Field(default=256, ge=16, le=4096)
@@ -140,12 +140,25 @@ class Settings(BaseSettings):
     dependency_max_packages: int = Field(default=60, ge=1, le=500)  # resolved wheels per bundle
     dependency_max_bytes: int = Field(default=300 * 1024 * 1024, ge=1024 * 1024, le=4 * 1024**3)
     dependency_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    # accept wheels whose sha256 the index does not publish (recorded "unverified"); off by default
+    dependency_allow_unverified_index: bool = False
+    # --internal Docker network of the resolver; its only egress is the allow-list proxy
+    dependency_resolver_network: str = Field(
+        default="aica-dep-resolver", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$"
+    )
 
     # ---- reference fetching (ADR-011): the agent's harness-side web fetch ---------------------
-    # Empty list = the tool is not offered. Domains match exactly or as a parent of subdomains.
-    reference_allowed_domains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # Trusted hosts live in a version-controlled file of exact host names (no subdomains, no
+    # wildcards); a missing file means the tools are not offered, an invalid one fails startup.
+    reference_sources_file: Path = DEFAULT_SOURCES_FILE
+    _reference_hosts: frozenset[str] = PrivateAttr(default=frozenset())
+    _reference_secondary_hosts: frozenset[str] = PrivateAttr(default=frozenset())
     reference_max_fetches: int = Field(default=20, ge=1, le=200)  # per agent phase
-    # Web search (Anthropic server-side tool, worker side) restricted to the same domains.
+    # Longest URL the agent may request (fetch_reference; search hits above it are dropped).
+    reference_max_url_chars: int = Field(default=300, ge=50, le=2000)
+    reference_max_redirects: int = Field(default=3, ge=0, le=10)  # each hop re-checked
+    reference_search_max_hits: int = Field(default=8, ge=1, le=20)  # per search_docs call
+    # Web search (Anthropic server-side tool, worker side) restricted to the same exact hosts.
     reference_search_enabled: bool = True
     reference_max_searches: int = Field(default=5, ge=1, le=50)  # per agent phase
     reference_max_bytes: int = Field(default=1_048_576, ge=1024, le=16 * 1024 * 1024)
@@ -182,9 +195,7 @@ class Settings(BaseSettings):
     def _empty_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
 
-    @field_validator(
-        "jira_project_keys", "jira_story_issue_types", "reference_allowed_domains", mode="before"
-    )
+    @field_validator("jira_project_keys", "jira_story_issue_types", mode="before")
     @classmethod
     def _comma_separated(cls, value: object) -> object:
         return _split_set(value)
@@ -235,27 +246,6 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
-    @field_validator("workspace_images", mode="before")
-    @classmethod
-    def _images(cls, value: object) -> object:
-        if isinstance(value, str):
-            pairs = [p.strip() for p in value.split(",") if p.strip()]
-            out: dict[str, str] = {}
-            for pair in pairs:
-                family, sep, image = pair.partition("=")
-                family, image = family.strip(), image.strip()
-                if not sep or not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", family):
-                    msg = "WORKSPACE_IMAGES must be family=image pairs, e.g. node=org/img:1.0"
-                    raise ValueError(msg)
-                out[family] = image
-            value = out
-        if isinstance(value, dict):
-            for image in value.values():
-                if not _IMAGE.fullmatch(str(image)):
-                    msg = "WORKSPACE_IMAGES must contain plain image references"
-                    raise ValueError(msg)
-        return value
-
     @field_validator("workspace_image")
     @classmethod
     def _image(cls, value: str | None) -> str | None:
@@ -263,16 +253,6 @@ class Settings(BaseSettings):
             msg = "WORKSPACE_IMAGE must be a plain image reference"
             raise ValueError(msg)
         return value
-
-    @field_validator("reference_allowed_domains")
-    @classmethod
-    def _domains(cls, value: frozenset[str]) -> frozenset[str]:
-        domain = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
-        cleaned = frozenset(v.lower().strip(".") for v in value)
-        if any(not domain.fullmatch(v) for v in cleaned):
-            msg = "REFERENCE_ALLOWED_DOMAINS entries must be plain domain names (docs.python.org)"
-            raise ValueError(msg)
-        return cleaned
 
     @field_validator("dependency_index_url")
     @classmethod
@@ -292,6 +272,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _coherent(self) -> "Settings":
+        sources = load_reference_sources(self.reference_sources_file)
+        self._reference_hosts = sources.allowed_hosts
+        self._reference_secondary_hosts = sources.secondary_hosts
         app = [
             self.github_app_id,
             self.github_app_installation_id,
@@ -347,6 +330,16 @@ class Settings(BaseSettings):
     @property
     def jira_webhook_configured(self) -> bool:
         return self.jira_webhook_secret is not None and bool(self.jira_project_keys)
+
+    @property
+    def reference_allowed_hosts(self) -> frozenset[str]:
+        """The exact trusted documentation hosts loaded from reference_sources_file."""
+        return self._reference_hosts
+
+    @property
+    def reference_secondary_hosts(self) -> frozenset[str]:
+        """Trusted hosts that search ranks after documentation (secondary_hosts in the file)."""
+        return self._reference_secondary_hosts
 
     @property
     def jira_rest_configured(self) -> bool:

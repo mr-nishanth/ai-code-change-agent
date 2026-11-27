@@ -288,7 +288,8 @@ async def test_exit_codes_map_to_statuses_and_output_truncation_is_reported(tmp_
         (ProcessResult(1, b"fail", b"", False, False), CommandStatus.FAILED, None),
         (ProcessResult(5, b"", b"", False, False), CommandStatus.FAILED, None),
         (ProcessResult(125, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
-        (ProcessResult(127, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
+        (ProcessResult(126, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
+        (ProcessResult(127, b"", b"", False, False), CommandStatus.ERROR, "command_not_found"),
         (
             ProcessResult(None, b"partial", b"", False, True),
             CommandStatus.TIMED_OUT,
@@ -301,6 +302,20 @@ async def test_exit_codes_map_to_statuses_and_output_truncation_is_reported(tmp_
         assert (result.status, result.reason) == (status, reason)
     fake.on_run = lambda argv: ProcessResult(0, b"x" * 10, b"", True, False)
     assert (await runtime.run_command(h, PYTEST)).output_truncated
+
+
+@pytest.mark.parametrize(
+    "exit_code", [137, 139, 143, None], ids=["sigkill_oom", "sigsegv", "sigterm", "no_status"]
+)
+async def test_a_container_that_dies_unexpectedly_is_a_failed_command_never_a_pass(
+    tmp_path: Path, exit_code: int | None
+) -> None:
+    runtime, fake, h = await created(tmp_path)
+    fake.on_run = lambda argv: ProcessResult(exit_code, b"partial", b"", False, False)
+    result = await runtime.run_command(h, PYTEST)
+    assert result.status is CommandStatus.FAILED and result.exit_code == exit_code
+    name = fake.runs()[0][fake.runs()[0].index("--name") + 1]
+    assert ["docker", "rm", "-f", name] in fake.removals()  # nothing is left running
 
 
 async def test_a_timeout_removes_the_container_by_name(tmp_path: Path) -> None:

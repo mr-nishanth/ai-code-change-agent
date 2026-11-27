@@ -12,22 +12,23 @@ a replayed webhook, a crashed worker or two concurrent advances never duplicate 
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ai_code_change_agent.application.artifacts.hashing import load_verified, store_model
 from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.delivery.manifest import DeliveryManifest
+from ai_code_change_agent.application.errors import ArtifactIntegrityError
 from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.multirepo.models import (
-    CHILD_TERMINAL,
     Child,
     ChildStatus,
     ContractDoc,
     MultiRepoStore,
     Parent,
     ParentStatus,
+    ReportState,
 )
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
@@ -41,8 +42,34 @@ from ai_code_change_agent.domain.repositories.resolution import ResolutionReques
 
 _log = get_logger(__name__)
 CHILD_JOB = "code_change.child"
+REPORT_JOB = "code_change.parent_report"
+MAX_REPORT_ATTEMPTS = 6  # per report round; then PERMANENT_FAILURE (operator re-runs it)
+REPORT_STALE_SECONDS = 300  # an IN_PROGRESS claim older than this belongs to a crashed worker
+
+
+class ReportRetryableError(Exception):
+    """Raised by the report job so the PostgreSQL job queue retries it with backoff."""
+
+
+def report_marker(parent_id: uuid.UUID, report_round: int) -> str:
+    """Stable identity of one aggregated report: written into the comment, searched for
+    before any re-post, so an uncertain POST is never blindly repeated."""
+    return f"aica-report-{parent_id}-r{report_round}"
+
+
 _DONE = frozenset({ChildStatus.COMPLETED})
 _FAILED = frozenset({ChildStatus.FAILED, ChildStatus.REJECTED, ChildStatus.BLOCKED})
+# A stored artifact failed its hash, schema or origin check: possible corruption or tampering
+# in the artifact store (artifact_too_large and artifact_storage_error stay retryable).
+_INTEGRITY_FAILURES = frozenset(
+    {
+        "artifact_hash_mismatch",
+        "artifact_schema_invalid",
+        "artifact_missing",
+        "artifact_provenance_mismatch",
+        "artifact_integrity_failed",
+    }
+)
 _RESULT_TEXT = {
     ParentStatus.COMPLETED: "all repository executions and required contracts completed.",
     ParentStatus.PARTIALLY_COMPLETED: "partially completed; successful PRs are kept.",
@@ -158,7 +185,7 @@ class Coordinator:
                     key = alias.get(dep.lower()) or alias.get(_short(dep))
                     if key is None:
                         problems.append(f"{d.reference}: depends on unknown repository '{dep}'")
-                    else:
+                    elif key not in needs:  # one edge per upstream, however often it is named
                         needs.append(key)
                 edges[r.repository_key] = needs
             if not problems:
@@ -218,23 +245,25 @@ class Coordinator:
             upstream = [by_key[k] for k in child.depends_on]
             failed = [u for u in upstream if u.status in _FAILED]
             if failed:
-                await self._store.update_child(
+                if await self._store.update_child(
                     child.id,
                     frozenset({ChildStatus.WAITING}),
                     status=ChildStatus.BLOCKED,
                     failure_code=f"upstream_failed:{failed[0].repository_key}"[:120],
-                )
+                ):  # children run in dependency order: a block cascades within this pass
+                    by_key[child.repository_key] = replace(child, status=ChildStatus.BLOCKED)
                 continue
             if any(u.status not in _DONE for u in upstream):
                 continue
             missing = [u for u in upstream if not u.contract_sha256]
             if missing:  # never let a client guess the API shape
-                await self._store.update_child(
+                if await self._store.update_child(
                     child.id,
                     frozenset({ChildStatus.WAITING}),
                     status=ChildStatus.BLOCKED,
                     failure_code=f"upstream_contract_missing:{missing[0].repository_key}"[:120],
-                )
+                ):
+                    by_key[child.repository_key] = replace(child, status=ChildStatus.BLOCKED)
                 continue
             if await self._store.update_child(
                 child.id, frozenset({ChildStatus.WAITING}), status=ChildStatus.QUEUED
@@ -267,22 +296,64 @@ class Coordinator:
             )
         await self.report(parent.id)
 
-    async def report(self, parent_id: uuid.UUID) -> None:
-        """One aggregated comment per report round (claimed in the database before posting)."""
+    async def report(self, parent_id: uuid.UUID) -> ReportState:
+        """Post the aggregated comment of the current report round to the parent Story, at most
+        once. Lifecycle: PENDING -> IN_PROGRESS -> SUCCEEDED | RETRYABLE_FAILURE |
+        PERMANENT_FAILURE. A claim left IN_PROGRESS (crash) or RETRYABLE_FAILURE (timeout,
+        429, 5xx) may hide a comment Jira already created, so Jira is searched for this round's
+        report id first; only a confirmed absence leads to a new POST."""
         parent, children = await self._store.load(parent_id)
-        if parent.status is ParentStatus.RUNNING or not await self._store.claim_report(parent.id):
-            return
+        if parent.status is ParentStatus.RUNNING:
+            return ReportState(parent.jira_report or ReportState.PENDING)
+        claim = await self._store.claim_report(parent.id, REPORT_STALE_SECONDS)
+        if claim is None:
+            return ReportState(parent.jira_report or ReportState.PENDING)
         request = await self._changes.get_request(parent.request_id)
-        posted = False
+        issue_key = request.jira_issue_key
+        marker = report_marker(parent.id, claim.round)
+        log = _log.bind(
+            parent_id=str(parent.id), issue_key=issue_key, report_id=marker,
+            report_attempt=claim.attempts, previous_state=claim.previous.value,
+        )  # fmt: skip
+        state, comment_id, error, http_status = ReportState.RETRYABLE_FAILURE, None, None, None
         try:
-            text = await self.summary(parent, children, request.jira_issue_key)
-            outcome = await self._reporter.report(request.jira_issue_key, text)
-            posted = str(outcome) != "FAILED"
-            _log.info("jira_report", parent_id=str(parent.id), outcome=str(outcome))
-        finally:
-            await self._store.finish_report(parent.id, posted)
+            found = None
+            if claim.previous in (ReportState.IN_PROGRESS, ReportState.RETRYABLE_FAILURE):
+                found = await self._reporter.find_comment(issue_key, marker)
+                if found is not None:
+                    log.info("jira_report_reconciled", lookup=str(found.status))
+            result = found
+            if result is None:  # confirmed absent (or a first attempt): post this round's report
+                text = await self.summary(parent, children, issue_key, marker=marker)
+                result = await self._reporter.post_comment(issue_key, text)
+            state = {
+                "POSTED": ReportState.SUCCEEDED,
+                "DISABLED": ReportState.DISABLED,
+                "PERMANENT": ReportState.PERMANENT_FAILURE,
+            }.get(str(result.status), ReportState.RETRYABLE_FAILURE)
+            comment_id, error, http_status = result.comment_id, result.error, result.http_status
+            if state is ReportState.RETRYABLE_FAILURE and claim.attempts >= MAX_REPORT_ATTEMPTS:
+                state, error = ReportState.PERMANENT_FAILURE, f"retries_exhausted:{error}"
+        finally:  # a crash before this line leaves IN_PROGRESS, which the next run reconciles
+            await self._store.finish_report(
+                parent.id, state, comment_id=comment_id, error=(error or None) and error[:120]
+            )
+        log.info(
+            "jira_report", report_state=state.value, comment_id=comment_id,
+            jira_status=http_status, error=error,
+        )  # fmt: skip
+        if state is ReportState.RETRYABLE_FAILURE:
+            await self._queue.enqueue(
+                REPORT_JOB,
+                {"parent_id": str(parent.id)},
+                dedupe_key=f"{REPORT_JOB}:{parent.id}:{claim.round}",
+                max_attempts=MAX_REPORT_ATTEMPTS,
+            )
+        return state
 
-    async def summary(self, parent: Parent, children: list[Child], issue_key: str) -> str:
+    async def summary(
+        self, parent: Parent, children: list[Child], issue_key: str, *, marker: str | None = None
+    ) -> str:
         lines = [
             f"AI Code Change Agent Execution: {parent.status.value}",
             f"Issue: {issue_key}",
@@ -295,14 +366,23 @@ class Coordinator:
             if c.status is ChildStatus.COMPLETED:
                 lines += [
                     f"   Branch: {c.branch or '-'}",
-                    f"   Draft PR: {c.pr_url or '-'}",
+                    f"   Draft PR: {c.pr_url or 'not recorded'}",
                     "   Validation: PASSED",
                 ]
             else:
                 retry = "yes (ai-code-change changes retry-child " + str(c.id) + ")"
+                if c.failure_code in _INTEGRITY_FAILURES:
+                    # Possible corruption or tampering in the artifact store: an operator
+                    # investigates before anyone retries the child.
+                    retry = (
+                        "no (artifact integrity failure: an operator must investigate the "
+                        f"artifact store before retry-child {c.id})"
+                    )
                 lines += [f"   Reason: {c.failure_code or '-'}", f"   Retryable: {retry}"]
             if c.contract_sha256:
                 lines.append(f"   Published contract: sha256 {c.contract_sha256[:12]}")
+            if c.runs > 1:
+                lines.append(f"   Runs: {c.runs}")
         lines.append("")
         lines.append(
             "Cross-Repository Result: "
@@ -311,6 +391,10 @@ class Coordinator:
         if self._cost is not None:
             lines += ["", f"Total LLM API Cost: {await self._cost(issue_key)} USD"]
         lines += ["", "No PR was merged automatically. Review and merge are human decisions."]
+        if parent.completed_at is not None:
+            lines.append(f"Completed at: {parent.completed_at.isoformat(timespec='seconds')}")
+        if marker is not None:
+            lines.append(f"Report ID: {marker}")
         return "\n".join(lines)
 
     # ---- child lifecycle --------------------------------------------------------------------
@@ -410,6 +494,14 @@ class Coordinator:
                 up.contract_sha256,
                 ContractDoc,
             )
+            # The hash proves the bytes are unchanged, not that they came from this upstream:
+            # the contract must name this parent, this repository and the recorded attempt.
+            if (doc.parent_id, doc.repository_key, doc.attempt_id) != (
+                str(child.parent_id),
+                key,
+                str(up.attempt_id),
+            ):
+                raise ArtifactIntegrityError("artifact_provenance_mismatch")
             contracts.append(UpstreamContract(key, up.role, up.contract_sha256, doc.contract))
         return ChildContext(
             repository_key=child.repository_key,
@@ -462,10 +554,3 @@ class Coordinator:
         refreshed = await self._store.child(child_id)
         assert refreshed is not None  # noqa: S101
         return refreshed
-
-
-def child_statuses(children: Sequence[Child]) -> dict[str, str]:
-    return {c.repository_key: c.status.value for c in children}
-
-
-TERMINAL_CHILD = CHILD_TERMINAL

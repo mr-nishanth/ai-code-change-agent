@@ -5,6 +5,20 @@
 - **API** (FastAPI): Jira webhook intake and health checks. It never runs agents.
 - **Worker**: a trusted host process that runs jobs, the workflow and the sandboxes.
 
+### Components
+
+| Component | Technology | Role |
+|---|---|---|
+| Agent API | Python / FastAPI | Jira webhook intake and health checks; never runs agents |
+| Workflow | Python / LangGraph | One workflow per attempt, gates, retries |
+| Coding agent | Python / Deep Agents | Plans and implements inside the sandbox |
+| Execution sandbox | Python Docker image (`execution-python:0.2.0`) | Offline, hardened; runs **Python repositories only** |
+| Validation | Python, independent of the agent | Fresh offline container; runs the profile's Python commands |
+| Studio UI | React / TypeScript / Node.js (Vite) | Development UI to watch the agent; Node.js is a local development requirement only, not an execution toolchain |
+| Database | PostgreSQL | Requests, jobs, attempts, artifacts index, cost ledger |
+
+**Scope:** multi-repository means several registered **Python** repositories per Story (for example a backend API and a Python client, SDK or worker). Node.js, React/Next.js, Android, Kotlin/Java, Flutter and iOS/Swift repositories are out of scope.
+
 ## Flow
 
 ```mermaid
@@ -92,7 +106,7 @@ The worker controls a container runtime, so it is privileged control plane. Opti
 
 Do not mount the Docker socket into a general-purpose container, and never into a sandbox.
 
-## Multi-repository Stories, toolchains and research
+## Multi-repository Stories and research
 
 ```
 Jira Story --webhook--> API --job--> worker: IntakeHandler
@@ -100,9 +114,9 @@ Jira Story --webhook--> API --job--> worker: IntakeHandler
    several markers         -> Coordinator (application/multirepo): resolve all, DAG, parent row
                                -> code_change.child jobs (one per repository, bounded parallel)
                                   -> same LangGraph workflow per child attempt (own workspace,
-                                     toolchain image, Deep Agent thread, validation, draft PR)
+                                     Python execution image, Deep Agent thread, validation, draft PR)
                                -> contracts (artifacts) to dependents -> one aggregated Jira comment
 Deep Agent tools (worker side, sandbox stays offline): search_docs, fetch_reference
 ```
 
-Still one workflow, one Deep Agent and one validation engine. See MULTI-REPOSITORY.md, TOOLCHAINS-AND-RESEARCH.md, ADR-013.
+Still one workflow, one Deep Agent and one validation engine. Every child is a Python repository. See [MULTI-REPOSITORY.md](MULTI-REPOSITORY.md), [PYTHON-EXECUTION-AND-RESEARCH.md](PYTHON-EXECUTION-AND-RESEARCH.md), [ADR-013](decisions/ADR-013-multi-repository-fan-out.md).

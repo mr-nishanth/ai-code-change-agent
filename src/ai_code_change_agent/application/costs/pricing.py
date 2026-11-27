@@ -153,6 +153,12 @@ class PriceTable:
             bedrock_base_model(model), usage, inference_geo=inference_geo
         )
 
+    def conservative(self, usage: TokenUsage) -> CallCost | None:
+        """For cost GUARDS only, when a model has no price: the highest cost any configured
+        model would charge for this usage. An unpriced model is never counted as free."""
+        costs = [c for m in self._models if (c := self.price(m, usage)) is not None]
+        return max(costs, key=lambda c: c.total) if costs else None
+
     def knows(self, model: str) -> bool:
         return self._lookup(model) is not None
 

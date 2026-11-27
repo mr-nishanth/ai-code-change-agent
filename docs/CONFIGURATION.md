@@ -63,8 +63,12 @@ Requested names that are **deliberately absent**, because nothing uses them:
 | WORKFLOW_APPROVAL_MODE | automatic | | worker (`automatic`: policy decides PLAN and FINAL; `manual`: operator CLI) |
 | DEPENDENCY_INDEX_URL | https://pypi.org/simple | | worker (the only index the resolver container may use; https, no credentials) |
 | DEPENDENCY_MAX_PACKAGES, DEPENDENCY_MAX_BYTES, DEPENDENCY_TIMEOUT_SECONDS | 60, 314572800, 600 | | worker (per bundle) |
-| REFERENCE_ALLOWED_DOMAINS | (empty: tool disabled) | | worker (comma-separated domains for `fetch_reference`) |
+| DEPENDENCY_ALLOW_UNVERIFIED_INDEX | false | | worker (accept wheels whose sha256 the index does not publish; recorded as `unverified`; a mismatch always fails) |
+| DEPENDENCY_RESOLVER_NETWORK | aica-dep-resolver | | worker (`--internal` Docker network of the resolver; created if missing, refused if routable; only exit is the allow-list proxy) |
+| REFERENCE_SOURCES_FILE | config/reference_sources.yaml | | worker and API (version-controlled list of exact trusted documentation hosts for `search_docs` and `fetch_reference`; any path on a listed host is allowed, subdomains are not; a missing file disables both tools, an invalid one fails startup). Its optional `secondary_hosts` list (exact hosts, each also in `allowed_hosts`) only ranks those hosts' search hits after documentation. |
 | REFERENCE_MAX_FETCHES, REFERENCE_MAX_BYTES, REFERENCE_TIMEOUT_SECONDS | 20, 1048576, 20 | | worker (per agent phase, per response, per request) |
+| REFERENCE_MAX_URL_CHARS | 300 | | worker (50-2000; longest URL the agent may request from `fetch_reference`, stated in the tool description; `search_docs` drops longer hits) |
+| REFERENCE_MAX_REDIRECTS | 3 | | worker (0-10; redirects `fetch_reference` follows, every hop re-checked) |
 | DEEP_AGENT_RUN_TIMEOUT_SECONDS | 5400 | | worker (wall-clock budget per agent phase) |
 
 The API container needs none of these. It still receives only the webhook settings, so API and worker can't disagree on pipeline behaviour.
@@ -108,14 +112,14 @@ Agent harness (from the Deep Agents docs review):
 - Every phase run gets a fresh agent thread, so a crash re-run never appends to stale history.
 
 
-## Multi-repository, toolchains, research and cost guards
+## Multi-repository, research and cost guards
 
 | Variable | Default | Notes |
 |---|---|---|
 | MULTI_REPO_MAX_REPOSITORIES | 5 | Repositories per Story (2-20). See [MULTI-REPOSITORY.md](MULTI-REPOSITORY.md) |
-| WORKSPACE_IMAGES | (empty) | Further toolchain images as `family=image` pairs, e.g. `node=ai-code-change-agent/execution-node:0.1.0`. The python image stays `WORKSPACE_IMAGE` |
 | REFERENCE_SEARCH_ENABLED | true | `search_docs` (Anthropic web search, worker side) when the provider is anthropic |
 | REFERENCE_MAX_SEARCHES | 5 | Searches per agent phase |
+| REFERENCE_SEARCH_MAX_HITS | 8 | Hits returned per search (1-20) |
 | DEEP_AGENT_MAX_MODEL_CALLS | 80 | Hard cap on model calls per agent phase run, for any model |
 | LLM_MAX_COST_PER_PHASE_USD | 2.0 | The phase run stops before its next model call once this is spent. Bedrock ids use the matching Claude list price for this guard |
 

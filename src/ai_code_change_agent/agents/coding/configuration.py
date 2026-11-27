@@ -46,3 +46,4 @@ class StoryContext:
     base_commit_sha: str
     validation_commands: tuple[str, ...] = ()
     multi_repo: MultiRepoBrief | None = None
+    repository_dependencies: tuple[str, ...] = ()

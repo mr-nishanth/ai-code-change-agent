@@ -6,12 +6,12 @@ import pytest
 
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.cli.main import build_parser, main
-from tests.support.registry_fixtures import nestjs_backend
+from tests.support.registry_fixtures import django_service
 from tests.support.registry_memory import InMemoryRegistry
 
 REG_ARGS = [
-    "repositories", "register", "--key", "nest-backend", "--display-name", "Nest Backend",
-    "--provider", "github", "--provider-id", "123", "--owner", "acme", "--name", "nest-backend",
+    "repositories", "register", "--key", "django-service", "--display-name", "Nest Backend",
+    "--provider", "github", "--provider-id", "123", "--owner", "acme", "--name", "django-service",
     "--branch", "main", "--access-ref", "app-installation:42", "--no-profile",
 ]  # fmt: skip
 
@@ -31,7 +31,7 @@ def write_profile(
     tmp: Path, doc: dict[str, object] | None = None, name: str = "profile.json"
 ) -> Path:
     path = tmp / name
-    path.write_text(json.dumps(doc or nestjs_backend()))
+    path.write_text(json.dumps(doc or django_service()))
     return path
 
 
@@ -55,20 +55,20 @@ def test_full_onboarding_flow_through_the_cli(tmp_path: Path) -> None:
     prof = write_profile(tmp_path)
     steps = [
         REG_ARGS,
-        ["repositories", "create-version", "nest-backend", str(prof)],
-        ["repositories", "publish", "nest-backend", "1"],
-        ["repositories", "alias-add", "nest-backend", "nest"],
-        ["repositories", "map-project", "SHOP", "nest-backend"],
-        ["repositories", "enable", "nest-backend"],
+        ["repositories", "create-version", "django-service", str(prof)],
+        ["repositories", "publish", "django-service", "1"],
+        ["repositories", "alias-add", "django-service", "nest"],
+        ["repositories", "map-project", "SHOP", "django-service"],
+        ["repositories", "enable", "django-service"],
     ]
     for step in steps:
         code, out, err = run(reg, *step)
         assert code == 0 and err == "", (step, out, err)
     code, out, _ = run(reg, "repositories", "resolve", "--project", "SHOP", "--reference", "nest")
-    assert code == 0 and out.startswith("RESOLVED") and "nest-backend v1" in out
+    assert code == 0 and out.startswith("RESOLVED") and "django-service v1" in out
     code, out, _ = run(reg, "repositories", "list")
-    assert "nest-backend" in out and "ACTIVE" in out
-    code, out, _ = run(reg, "repositories", "show", "nest-backend")
+    assert "django-service" in out and "ACTIVE" in out
+    code, out, _ = run(reg, "repositories", "show", "django-service")
     assert (
         "version 1: published (ACTIVE)" in out
         and "alias nest" in out
@@ -76,15 +76,15 @@ def test_full_onboarding_flow_through_the_cli(tmp_path: Path) -> None:
     )
     code, out, _ = run(reg, "repositories", "mappings", "--project", "SHOP")
     assert "SHOP" in out
-    code, out, _ = run(reg, "repositories", "audit", "--repository", "nest-backend")
+    code, out, _ = run(reg, "repositories", "audit", "--repository", "django-service")
     assert "repository.registered" in out and "cli:" in out
-    code, out, _ = run(reg, "repositories", "disable", "nest-backend")
+    code, out, _ = run(reg, "repositories", "disable", "django-service")
     assert code == 0
     code, out, _ = run(reg, "repositories", "resolve", "--project", "SHOP")
     assert out.startswith("DISABLED_REPOSITORY") and "OPERATIONS_REVIEW" in out
-    code, out, _ = run(reg, "repositories", "unmap-project", "SHOP", "nest-backend")
+    code, out, _ = run(reg, "repositories", "unmap-project", "SHOP", "django-service")
     assert code == 0
-    code, out, _ = run(reg, "repositories", "activate-version", "nest-backend", "1")
+    code, out, _ = run(reg, "repositories", "activate-version", "django-service", "1")
     assert code == 0
 
 
@@ -95,12 +95,12 @@ def test_json_output_is_valid_and_has_no_credentials(tmp_path: Path) -> None:
     data = json.loads(out)
     assert (
         code == 0
-        and data[0]["repository_key"] == "nest-backend"
+        and data[0]["repository_key"] == "django-service"
         and data[0]["status"] == "DISABLED"
     )
     code, out, _ = run(reg, "--json", "repositories", "audit")
     assert json.loads(out)[0]["action"] == "repository.registered"
-    code, out, _ = run(reg, "--json", "repositories", "show", "nest-backend")
+    code, out, _ = run(reg, "--json", "repositories", "show", "django-service")
     assert {"repository", "versions", "aliases", "mappings"} <= set(json.loads(out))
 
 
@@ -126,7 +126,7 @@ def test_validate_profile_offline_json_and_toml(tmp_path: Path) -> None:
     )
     code, out, _ = run(reg, "--json", "repositories", "validate-profile", str(toml))
     assert code == 0 and json.loads(out)["valid"] is True
-    bad = write_profile(tmp_path, {**nestjs_backend(), "extra": 1}, "bad.json")
+    bad = write_profile(tmp_path, {**django_service(), "extra": 1}, "bad.json")
     code, _, err = run(reg, "repositories", "validate-profile", str(bad))
     assert code == 1 and "extra_forbidden" in err
     code, _, err = run(reg, "repositories", "validate-profile", str(tmp_path / "missing.json"))
@@ -138,9 +138,9 @@ def test_validate_profile_offline_json_and_toml(tmp_path: Path) -> None:
 
 def test_toolchains_catalogue() -> None:
     code, out, _ = run(InMemoryRegistry(), "repositories", "toolchains")
-    assert code == 0 and "python" in out and "jvm" in out and "default-v1" in out
+    assert code == 0 and "python" in out and "jvm" not in out and "default-v1" in out
     code, out, _ = run(InMemoryRegistry(), "--json", "repositories", "toolchains")
-    assert {"python", "node", "jvm", "dotnet", "go", "rust"} <= set(json.loads(out)["toolchains"])
+    assert set(json.loads(out)["toolchains"]) == {"python"}  # Python-only execution
 
 
 def test_domain_errors_exit_nonzero_with_codes(tmp_path: Path) -> None:
@@ -150,14 +150,14 @@ def test_domain_errors_exit_nonzero_with_codes(tmp_path: Path) -> None:
     run(reg, *REG_ARGS)
     code, _, err = run(reg, *REG_ARGS)
     assert code == 1 and "conflict" in err
-    code, _, err = run(reg, "repositories", "enable", "nest-backend")
+    code, _, err = run(reg, "repositories", "enable", "django-service")
     assert code == 1 and "no_active_profile_version" in err
     code, _, err = run(
         reg,
         "repositories",
         "create-version",
-        "nest-backend",
-        str(write_profile(tmp_path, {**nestjs_backend(), "repository_key": "other-key"})),
+        "django-service",
+        str(write_profile(tmp_path, {**django_service(), "repository_key": "other-key"})),
     )
     assert code == 1 and "key_mismatch" in err
 

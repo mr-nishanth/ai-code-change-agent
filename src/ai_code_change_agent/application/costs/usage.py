@@ -229,7 +229,8 @@ class BudgetExceededError(RuntimeError):
 
 class BudgetGuard(AsyncCallbackHandler):
     """Stops a phase run before its next model call once its priced cost reaches the budget.
-    Works for any priced model; calls without a known price fall back to the model-call cap."""
+    Works for any model: a call whose model has no price is charged at the most expensive
+    configured rate (never as zero), and the model-call cap still applies on top."""
 
     raise_error = True
     run_inline = True
@@ -237,7 +238,9 @@ class BudgetGuard(AsyncCallbackHandler):
     def __init__(self, prices: PriceTable, budget_usd: Decimal) -> None:
         self._prices = prices
         self._budget = budget_usd
+        self.budget = budget_usd
         self.spent = Decimal(0)
+        self.unpriced_calls = 0
 
     async def on_chat_model_start(self, serialized: Any, messages: Any, **_: Any) -> None:
         if self.spent >= self._budget:
@@ -253,6 +256,9 @@ class BudgetGuard(AsyncCallbackHandler):
                         cost = self._prices.estimate(  # Bedrock ids: list-price estimate
                             reported.model, reported.usage, inference_geo=reported.inference_geo
                         )
+                        if cost is None:
+                            self.unpriced_calls += 1
+                            cost = self._prices.conservative(reported.usage)
                         if cost is not None:
                             self.spent += cost.total
                     return
@@ -277,6 +283,12 @@ class UsageTracker:
         self.provider = provider
         self.model = model
         self.session_id = session_id or uuid.uuid4()
+        self._guards: dict[str, BudgetGuard] = {}  # per phase run (thread id)
+
+    def search_allowed(self, thread_id: str) -> bool:
+        """False once the phase run's budget is spent: searches are refused like model calls."""
+        guard = self._guards.get(thread_id)
+        return guard is None or guard.spent < guard.budget
 
     async def record_search(self, thread_id: str, result: Any) -> None:
         """A documentation search made by the harness (Anthropic web search): its tokens plus the
@@ -287,11 +299,19 @@ class UsageTracker:
             if result.input_tokens is not None and result.output_tokens is not None
             else None
         )
-        cost = None
-        if usage is not None and result.model:
-            priced = self.prices.price(result.model, usage)
+        fee = WEB_SEARCH_USD_PER_REQUEST * result.searches
+        cost = None  # ledger: only a real price is recorded
+        guard_cost = fee  # guard: never free; unpriced models charged at the highest rate
+        if usage is not None:
+            priced = self.prices.price(result.model, usage) if result.model else None
             if priced is not None:
-                cost = priced.total + WEB_SEARCH_USD_PER_REQUEST * result.searches
+                cost = priced.total + fee
+                guard_cost = cost
+            elif (worst := self.prices.conservative(usage)) is not None:
+                guard_cost = worst.total + fee
+        guard = self._guards.get(thread_id)
+        if guard is not None:
+            guard.spent += guard_cost  # searches count against the phase budget
         record = LlmCallRecord(
             call_id=uuid.uuid4(),
             session_id=self.session_id,
@@ -299,7 +319,7 @@ class UsageTracker:
             stage="research",
             provider="anthropic",
             model=result.model or self.model,
-            succeeded=True,
+            succeeded=getattr(result, "error", None) is None,
             usage=usage,
             cost_usd=cost,
             pricing_version=self.prices.version,
@@ -311,11 +331,7 @@ class UsageTracker:
 
     def handlers(self, thread_id: str) -> Sequence[BaseCallbackHandler]:
         attempt, stage = stage_of(thread_id)
-        guards: list[BaseCallbackHandler] = (
-            [BudgetGuard(self.prices, self.phase_budget_usd)] if self.phase_budget_usd else []
-        )
-        return [
-            *guards,
+        handlers: list[BaseCallbackHandler] = [
             UsageCallbackHandler(
                 self.store,
                 self.prices,
@@ -324,8 +340,15 @@ class UsageTracker:
                 stage=stage,
                 provider=self.provider,
                 model=self.model,
-            ),
+            )
         ]
+        if self.phase_budget_usd:
+            guard = BudgetGuard(self.prices, self.phase_budget_usd)
+            self._guards[thread_id] = guard
+            # Last: langchain creates every handler's coroutine before awaiting them in order, so
+            # any handler after a raising guard would never be awaited (RuntimeWarning).
+            handlers.append(guard)
+        return handlers
 
 
 CallbackFactory = Callable[[str], Sequence[BaseCallbackHandler]]

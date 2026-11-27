@@ -86,9 +86,3 @@ class JiraCommentList(_Model):
     total: int | None = None
     truncated: bool = False
     warnings: tuple[str, ...] = ()
-
-
-class JiraStory(_Model):
-    issue: JiraIssue
-    comments: JiraCommentList | None = None
-    comments_unavailable_reason: str | None = None

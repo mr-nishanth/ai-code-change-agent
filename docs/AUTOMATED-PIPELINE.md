@@ -41,11 +41,15 @@ The rebuilt tree must equal baseline + changes. Also checked: path safety, prote
 | Situation | Behaviour |
 |---|---|
 | Duplicate webhook or duplicate Story | API dedupe on delivery id and issue id (200 `duplicate`); no second request or job |
+| Jira read at intake fails | A permanent error (400 and other 4xx, 401, 403, 501/505, a redirect, an oversized or wrongly shaped response) makes the intake job DEAD after one attempt with the error's code (for example `jira_authentication_failed`); 404 stays `jira_issue_not_found`. A transient error (429, 408, 425, 5xx, timeout, connection, a non-JSON page such as a proxy or maintenance page, a malformed JSON body) is retried by the job queue within the job's attempts, with exponential backoff raised to the server's `Retry-After` when given. The delay is capped at 900 s, so a longer `Retry-After` retries inside the server's window and may exhaust the job's attempts |
 | LLM timeouts, 429/5xx | SDK retries (`LLM_MAX_RETRIES`; Anthropic SDK backoff, botocore standard retries on Bedrock); per-phase wall-clock budget `DEEP_AGENT_RUN_TIMEOUT_SECONDS` → `agent_run_timeout` |
 | Dependency failure | `dependency_*` code (wheel unavailable, conflict, Python unsupported, limit, corrupted bundle) → attempt FAILED, Jira comment; nothing falls back to network |
-| Validation failure | Bounded repair with the validator's feedback, then FAILED; nothing is published |
+| Validation failure | A code failure (a check or command failed, or a command exceeded the profile's per-command timeout) gets one bounded repair with the validator's feedback, then FAILED (`validation_failed`). A timeout counts as a code failure because the change itself is the usual cause (a hang, or a call blocking under `--network none`). Nothing is published |
+| Validation infrastructure failure | Docker unavailable, a container that did not start (exit 125/126), or a sandbox or workspace runtime failure: FAILED `validation_infrastructure_unavailable` with no repair run; retryable once the cause is resolved |
+| Validation command not found | A profile command's executable is missing from the image (exit 127): FAILED `validation_command_not_found` with no repair run (the agent cannot install tools in the network-less sandbox); not retryable until the profile or image is fixed |
+| Known limitation: 126/127 caused by the change | Exit 126 and 127 are classified without looking at the change. A profile command that runs a repository script (`./scripts/test.sh`) which the change deleted (127) or made non-executable (126) is reported as `validation_command_not_found` or `validation_infrastructure_unavailable` and gets no repair run, although the change caused it; a retry of the 126 case fails the same way. Profile commands are usually tools from the image, so this is rare |
 | GitHub timeout or unknown outcome | The publisher re-reads remote state before every write and reconciles; create-only refs; no duplicate branch, commit or PR |
-| Jira comment | At most one per attempt outcome (`jira_report` artifact marker); a reporting failure never changes the outcome |
+| Jira comment | At most one per attempt outcome (`jira_report` artifact marker); multi-repository parents: one per report round, with a durable lifecycle and Report-ID reconciliation ([MULTI-REPOSITORY.md](MULTI-REPOSITORY.md#jira-reporting-parent-story)); a reporting failure never changes the outcome |
 | Security or policy failures | Never retried automatically |
 | Re-running a Story | A new attempt is created only by a new intake job; it adopts the newest published profile |
 
@@ -64,7 +68,6 @@ DEPENDENCY_INDEX_URL=https://pypi.org/simple
 DEPENDENCY_MAX_PACKAGES=60
 DEPENDENCY_MAX_BYTES=314572800
 DEPENDENCY_TIMEOUT_SECONDS=600
-REFERENCE_ALLOWED_DOMAINS=docs.langchain.com,docs.python.org,fastapi.tiangolo.com,docs.pydantic.dev,pypi.org
 REFERENCE_MAX_FETCHES=20
 DEEP_AGENT_RUN_TIMEOUT_SECONDS=5400
 MAX_REPAIR_ATTEMPTS=1

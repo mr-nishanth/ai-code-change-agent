@@ -6,8 +6,6 @@ altered: a secret there **refuses** the artifact. Reports and evidence are **red
 hash that is recorded is the hash of the redacted bytes that were actually stored.
 """
 
-import uuid
-
 from ai_code_change_agent.application.artifacts.errors import (
     ArtifactRedactionError,
     ArtifactSecretError,
@@ -30,6 +28,7 @@ K = ArtifactKind
 REFUSE_ON_SECRET: frozenset[ArtifactKind] = frozenset(
     {
         K.REPOSITORY_SNAPSHOT,
+        K.REPOSITORY_DEPENDENCIES,
         K.IMPLEMENTATION_PLAN,
         K.CHANGESET,
         K.DELIVERY_MANIFEST,
@@ -110,7 +109,3 @@ class ArtifactService:
 
     async def list(self, scope: ArtifactScope) -> MetaList:
         return await self._store.list(scope)
-
-
-def new_scope(request_id: uuid.UUID, attempt_id: uuid.UUID) -> ArtifactScope:
-    return ArtifactScope(request_id, attempt_id)

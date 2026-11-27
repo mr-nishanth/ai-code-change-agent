@@ -36,13 +36,5 @@ class ActiveAttemptError(ChangeError):
     code = "active_attempt_exists"
 
 
-class ReprocessNotAllowedError(ChangeError):
-    code = "reprocess_not_allowed"
-
-
 class ImmutableAssignmentError(ChangeError):
     code = "assignment_immutable"
-
-
-class NotAuthorisedError(ChangeError):
-    code = "not_authorised"

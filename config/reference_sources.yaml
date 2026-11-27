@@ -1,0 +1,21 @@
+# Trusted documentation hosts for search_docs and fetch_reference (exact host names).
+# Listing a host allows every path on it (pages, .md, .txt, llms.txt). Subdomains are NOT
+# included: list each host that is needed, including redirect targets. No wildcards, no paths.
+# Changes to this file widen what the agent may read: review them like code.
+# secondary_hosts (optional) only orders search_docs results: hits on these exact hosts (package
+# registries, raw source files) rank after official documentation. Each must also be listed in
+# allowed_hosts; it grants nothing by itself.
+version: 1
+
+allowed_hosts:
+  - docs.langchain.com
+  - python.langchain.com
+  - docs.python.org
+  - fastapi.tiangolo.com
+  - docs.pydantic.dev
+  - pypi.org
+  - raw.githubusercontent.com
+
+secondary_hosts:
+  - pypi.org
+  - raw.githubusercontent.com
