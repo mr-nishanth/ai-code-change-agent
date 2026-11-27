@@ -52,7 +52,7 @@ The coding sandbox stays offline. Two research tools run in the worker:
   - DNS is resolved and private, loopback and link-local addresses are refused;
   - redirects are followed manually, at most `REFERENCE_MAX_REDIRECTS` (default 3), and every hop is re-checked;
   - text-like content types only, with a byte cap, a character cap and a timeout (truncation is reported);
-  - HTML is reduced to text and the result is marked as untrusted.
+  - HTML is reduced to text, and the result (URL, sanitised content type, truncation flag and text) is returned inside an `UNTRUSTED DATA <id> BEGINS` / `UNTRUSTED DATA <id> ENDS` frame whose id is random for every result; search results use the same frame, one line per hit. The system prompt tells the agent that everything up to the ENDS line with the same id is data. See [SECURITY.md](SECURITY.md).
 
 The agent is told to cite the URLs and retrieval dates it relied on in its report's `references`.
 

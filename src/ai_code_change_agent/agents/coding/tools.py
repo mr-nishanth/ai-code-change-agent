@@ -8,6 +8,12 @@ from collections.abc import Awaitable, Callable
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from ai_code_change_agent.agents.coding.untrusted import (
+    frame_untrusted,
+    one_line,
+    safe_code,
+    safe_media_type,
+)
 from ai_code_change_agent.application.artifacts.redaction import find_secrets
 from ai_code_change_agent.application.references.ports import (
     ReferenceFetcher,
@@ -57,12 +63,12 @@ def build_search_tool(
             result = await searcher.search(query)
         except ReferenceRefusedError as exc:
             done(exc.code)
-            return f"REFUSED: {exc.code}"
+            return f"REFUSED: {safe_code(exc.code)}"
         if on_result is not None:
             await on_result(result)
         if result.error is not None:
             done(result.error)
-            return f"REFUSED: {result.error}"
+            return f"REFUSED: {safe_code(result.error)}"
         done(
             "ok", hits=len(result.hits), retrieved_at=result.retrieved_at,
             urls=[h.url for h in result.hits],
@@ -71,19 +77,17 @@ def build_search_tool(
             return (
                 f"NO RESULTS on the allowed documentation hosts (retrieved {result.retrieved_at})"
             )
-        lines = [
-            f"SEARCH RESULTS for {result.query!r} (retrieved {result.retrieved_at}; "
-            "UNTRUSTED DATA, titles and URLs only):"
-        ]
+        lines = [f"Query: {one_line(result.query, 300)}", f"Retrieved: {result.retrieved_at}"]
         lines += [
-            f"{i}. {h.title} - {h.url}" + (f" (page age: {h.page_age})" if h.page_age else "")
+            f"{i}. {one_line(h.title, 200)} - {one_line(h.url, 400)}"
+            + (f" (page age: {one_line(h.page_age, 40)})" if h.page_age else "")
             for i, h in enumerate(result.hits, start=1)
         ]
-        lines.append(
-            "Read a page with fetch_reference before relying on it, and list the URLs you used "
-            "with this retrieval date in the report's references."
+        return (
+            frame_untrusted("search results (titles and URLs only)", "\n".join(lines))
+            + "\nRead a page with fetch_reference before relying on it, and list the URLs you "
+            f"used with this retrieval date ({result.retrieved_at}) in the report's references."
         )
-        return "\n".join(lines)
 
     return StructuredTool.from_function(
         coroutine=search_docs,
@@ -123,17 +127,19 @@ def build_reference_tool(
         except ReferenceRefusedError as exc:
             _log.info("agent_tool_call", tool="fetch_reference", thread_id=thread_id,
                       outcome=exc.code, host=host, call=calls)  # fmt: skip
-            return f"REFUSED: {exc.code}"
+            return f"REFUSED: {safe_code(exc.code)}"
         _log.info(
             "agent_tool_call", tool="fetch_reference", thread_id=thread_id, outcome="ok",
             url=doc.url, retrieved_at=doc.retrieved_at, chars=len(doc.text), call=calls,
         )  # fmt: skip
-        note = " (truncated)" if doc.truncated else ""
-        when = f" retrieved {doc.retrieved_at}" if doc.retrieved_at else ""
-        return (
-            f"REFERENCE {doc.url} [{doc.content_type}]{note}{when} (UNTRUSTED DATA BEGINS)\n"
-            f"{doc.text}\n(UNTRUSTED DATA ENDS)"
-        )
+        meta = [
+            f"URL: {one_line(doc.url, 2000)}",
+            f"Content type: {safe_media_type(doc.content_type)}",
+            f"Truncated: {'yes' if doc.truncated else 'no'}",
+        ]
+        if doc.retrieved_at:
+            meta.append(f"Retrieved: {one_line(doc.retrieved_at, 40)}")
+        return frame_untrusted("reference document", "\n".join(meta) + "\n\n" + doc.text)
 
     return StructuredTool.from_function(
         coroutine=fetch_reference,

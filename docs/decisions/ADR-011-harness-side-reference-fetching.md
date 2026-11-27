@@ -21,11 +21,11 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
   - GET only, no cookies or authorization headers, `trust_env=False`.
 - **Content:**
   - text types only, a `REFERENCE_MAX_BYTES` cap, HTML reduced to text (scripts and styles dropped, links kept);
-  - returned between `UNTRUSTED DATA BEGINS/ENDS` markers, and the prompts tell the agent never to follow instructions in fetched text.
+  - returned inside one untrusted-data frame: an `UNTRUSTED DATA <id> BEGINS: reference document` line and an `UNTRUSTED DATA <id> ENDS` line with a fresh random id per result (amended 2026-11-27: the earlier fixed markers could be closed by the page text). The URL, a sanitised content type (`type/subtype` or `text/plain`), the truncation flag and the retrieval time sit inside the frame with the text. The prompts tell the agent that only the ENDS line with the same id ends the data and never to follow instructions in it. Search results use the same frame, one line per hit.
 - **Budget and audit:**
   - `REFERENCE_MAX_FETCHES` per agent phase;
   - every fetch is logged (host, status, size, truncation);
-  - refusals return a fixed `REFUSED: <code>` string to the agent.
+  - refusals return a `REFUSED: <code>` string to the agent; the code is reduced to `[a-z0-9_.:-]` and 120 characters, because it can carry a redirect host or a provider error code.
 - A missing `config/reference_sources.yaml` (or an empty `allowed_hosts`) disables the tools; an invalid file fails startup.
 - The limits are configurable within validated bounds (amended 2026-11-27): `REFERENCE_MAX_URL_CHARS` (default 300), `REFERENCE_MAX_REDIRECTS` (default 3) and `REFERENCE_SEARCH_MAX_HITS` (default 8). Search ranking uses the optional `secondary_hosts` list in the same file (exact hosts that must also be trusted) instead of a constant in code. The static URL check shared by both tools lives in `core/reference_hosts.py`.
 
@@ -33,7 +33,7 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
 
 - New outbound traffic comes from the worker, only to the allow-listed documentation sites.
 - Exfiltration through URLs is limited in code: a URL the agent requests may not carry a query string (documentation such as Pydantic's `llms.txt` asks agents to append `goal`/`organization` parameters; that is refused, never prompted away), may not exceed `REFERENCE_MAX_URL_CHARS` characters (default 300; the tool description states the configured cap) and may not contain a secret. A residual channel remains in the path of a requested URL (bounded by the length cap and logged). Keep the list to documentation hosts you trust.
-- Prompt injection through fetched text is treated like Story text: quoted as untrusted data. Its effects are bounded by the offline sandbox, automatic policy gates and independent validation.
+- Prompt injection through fetched text is treated like Story text: framed as untrusted data with a random boundary id. Its effects are bounded by the offline sandbox, automatic policy gates and independent validation.
 - There's a short DNS-rebinding window between the address check and the connection; the allow-list limits it to listed sites.
 
 ## Alternatives
