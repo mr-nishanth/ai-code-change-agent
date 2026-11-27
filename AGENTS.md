@@ -16,7 +16,9 @@ Rules for any coding agent working in this repository. Product: **AI Code Change
   - **API** (FastAPI, webhook intake only);
   - **worker** (host process via `uv run ai-code-change worker`), the trusted control plane.
 
-  Jobs live in PostgreSQL (`jobs`, SKIP LOCKED). No Redis.
+  The worker also runs the job dispatcher (outbox relay and lost-message sweep) as a loop, not a separate service.
+
+  Persistence is AWS-native (ADR-015): DynamoDB is the only database (application table + checkpoint table), job state lives in DynamoDB and SQS (standard queue + DLQ) only delivers job ids, artifacts are write-once S3 objects, LangGraph checkpoints use `DynamoDBSaver` with S3 offload. The API never calls SQS or S3. No Redis, no PostgreSQL. Locally all of it runs on Floci (ADR-014).
 
 ## Security invariants
 - The Jira payload never grants access. Repository access requires both:
@@ -42,13 +44,15 @@ Rules for any coding agent working in this repository. Product: **AI Code Change
 
 ## Engineering
 - Python 3.12 and `uv` only (`uv sync`, `uv add`, `uv run`). Commit `uv.lock`.
-- Pydantic v2, SQLAlchemy 2 async, Alembic (forward-only; never edit applied revisions), structlog.
-- Configuration uses unprefixed names (see `docs/CONFIGURATION.md`). `.env` is never committed. `.env.example` has placeholders only.
+- Pydantic v2, boto3 (DynamoDB, SQS and S3 clients only from `integrations/aws/clients.py`), `langgraph-checkpoint-aws==1.3.0` (exact pin), structlog. There are no migrations: table schemas live in `infra/floci/schema/` and every invariant is a condition expression or transaction.
+- Configuration uses unprefixed names, except the AWS settings, which use `ACCA_` so the shell's `AWS_*` variables never configure the application (see `docs/CONFIGURATION.md`). `.env` is never committed. `.env.example` has placeholders only.
+- **AWS endpoints:** development and test always use the local Floci endpoint (`http://127.0.0.1:4566` from the host, `http://acca-floci:4566` from containers) with the dummy credentials `test`/`test`; never weaken the endpoint guard in `core/config.py`. Real AWS calls need explicit owner authorisation, like real model calls.
+- **Local services:** `docker compose -f infra/docker-compose.yml up -d --wait`, then `sh infra/floci/init/bootstrap.sh`. Never pass `--remove-orphans` to `docker compose` on project `ai-code-change-agent` (it would remove a running `acca-postgres` left by an older checkout). Debugging: `docs/DOCKER-DEBUGGING.md`.
 - **Quality gate before reporting done:**
   - `uv run ruff check .`
   - `uv run ruff format --check .`
   - `uv run mypy` (strict)
-  - `uv run pytest` (coverage >= 90%)
+  - `uv run pytest` (coverage >= 90%; with Floci up and bootstrapped, so the DynamoDB, SQS and S3 tests run instead of skipping)
 
   Report exact results; never claim an unexecuted check.
-- Tests first for new behaviour. Real external calls (Jira writes, GitHub writes, model calls) need explicit owner authorisation.
+- Tests first for new behaviour. Real external calls (Jira writes, GitHub writes, model calls, real AWS) need explicit owner authorisation. AWS tests use explicit local endpoints and dummy credentials only (`tests/support/floci.py` or `AwsClients` with test Settings).

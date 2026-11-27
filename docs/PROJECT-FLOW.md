@@ -7,7 +7,7 @@ AI Code Change Agent turns a Jira Story into reviewed-ready **draft pull request
 | Component | Where | Does |
 |---|---|---|
 | API (FastAPI) | `api/`, container `acca-api` | Receives the Jira webhook, verifies its HMAC signature, de-duplicates it and queues an intake job. Holds only the webhook secret |
-| PostgreSQL | container `acca-postgres` | Requests, attempts, approvals, jobs (SKIP LOCKED queue), registry, parent/child executions, LLM usage ledger, LangGraph checkpoints |
+| DynamoDB, SQS, S3 | AWS; locally the Floci container `acca-floci` | DynamoDB: requests, attempts, approvals, job state and outbox, registry, parent/child executions, LLM usage ledger, LangGraph checkpoints. SQS (+ DLQ): job delivery. S3: artifacts and large checkpoint payloads ([ADR-015](decisions/ADR-015-dynamodb-sqs-s3-persistence.md)) |
 | Worker | `uv run ai-code-change worker` (host process) | The trusted control plane: runs jobs, the workflow, Docker sandboxes, validation, GitHub delivery and Jira reporting. Holds the credentials |
 | Repository registry | `application/repositories`, CLI `ai-code-change repositories` | Which repositories are allowed, for which Jira projects, with which execution profile (toolchain, test command, limits) |
 | Coding agent | `agents/coding` (Deep Agents) | Plans (read-only sandbox), then implements (writable sandbox). Has no network and no credentials |
@@ -22,7 +22,7 @@ Jira Story created ("Repository: owner/repo")
   -> webhook -> API: verify HMAC, dedupe, store, queue "intake" job
   -> worker intake: re-read the Story from Jira (payload is never trusted)
        -> resolve the repository in the registry (ACTIVE, mapped to the project, published profile)
-       -> create attempt -> start the LangGraph workflow (checkpointed in PostgreSQL)
+       -> create attempt -> start the LangGraph workflow (checkpointed in DynamoDB)
   1 prepare    pin the default branch to one commit (GitHub App token scoped to this repository)
   2 plan       Deep Agent in a read-only, offline sandbox -> structured ImplementationPlan
                (may use search_docs / fetch_reference, which run in the worker)

@@ -56,7 +56,6 @@ Use History → Jira pipeline, then click an attempt → **Watch live** (or **Op
 - **How it works:**
   - The worker checkpoints every agent step to DynamoDB (`DynamoDBSaver`, table `ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME`). When a planning or implementation run starts, it also indexes the run's thread id under the attempt (`ATTEMPT#<aid>/THREAD#<thread_id>`), because the checkpoint table cannot be searched by thread prefix. The index is best effort: a failure to write it is logged and never fails the phase.
   - `GET /studio/attempts/{id}/live` reads that index and rebuilds each phase's state from the checkpoints with the same agent graph, read-only (`aget_state` only).
-  - Until the composition switches to DynamoDB, a worker running on PostgreSQL writes neither, so its attempts do not appear here.
   - The UI polls it every 3 s while the attempt is not finished, and the attempt list refreshes every 5 s, so new Stories appear on their own.
 - **Freshness:** updates arrive per agent step, not token by token, because the worker runs in its own process and doesn't stream to the UI. The worker is unaffected.
 

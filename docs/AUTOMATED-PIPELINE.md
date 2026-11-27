@@ -5,7 +5,7 @@ An Ops user creates a Jira Story that names a repository. The platform plans, pr
 ## Flow
 
 ```
-Jira issue_created ─► API (HMAC, dedupe) ─► intake job (PostgreSQL)
+Jira issue_created ─► API (HMAC, dedupe) ─► intake job (DynamoDB + SQS)
    ─► Jira GET issue ─► resolve "Repository: <name|owner/name>" ─► registry: registered, ACTIVE,
       mapped to the project, published profile (newer profile adopted between attempts)
       └─ not resolvable ─► Jira comment "could not start" (no attempt)

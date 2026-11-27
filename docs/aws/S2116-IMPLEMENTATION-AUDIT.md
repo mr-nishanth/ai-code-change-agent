@@ -6,6 +6,8 @@ Read-only: no source, configuration or runtime was changed to write it. Design:
 Floci references: the official documentation at tag `2.5.0` (`github.com/floci-io/floci`, `docs/**`) and
 `https://floci.io/floci/` (services, environment variables, initialization hooks, Testcontainers). Where the
 two differ, the 2.5.0 tag wins because that is the pinned image.
+**Historical snapshot:** sections 1-6 describe the PostgreSQL runtime as it was before the change; the result
+is recorded in [ADR-015](../decisions/ADR-015-dynamodb-sqs-s3-persistence.md).
 
 Owner decisions this audit applies: DynamoDB is the only application database and starts empty (no data
 migration, no `pg_dump`, no dual-write, no backend flag, no PostgreSQL fallback); SQS with a DLQ delivers

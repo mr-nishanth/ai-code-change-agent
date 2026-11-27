@@ -2,6 +2,7 @@
 
 Status: draft (Phase 1, read-only audit). Branch `feature/s2115-floci-local-aws`, base `1f05bd9`.
 Date: 2026-11-27. Nothing in this document has been run against Floci yet.
+**Historical snapshot:** it describes the PostgreSQL runtime before [ADR-015](../decisions/ADR-015-dynamodb-sqs-s3-persistence.md).
 
 ## 1. Scope and method
 

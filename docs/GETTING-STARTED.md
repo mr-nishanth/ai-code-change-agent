@@ -2,7 +2,7 @@
 
 ## 1. Prerequisites
 
-- **Local tools:** Python 3.12, [uv](https://docs.astral.sh/uv/), Docker Desktop, ngrok (or another public tunnel) and Node 22 (only for the Studio UI).
+- **Local tools:** Python 3.12, [uv](https://docs.astral.sh/uv/), Docker Desktop, ngrok (or another public tunnel) and Node 22 (only for the Studio UI). Optional debugging tools: [DOCKER-DEBUGGING.md](DOCKER-DEBUGGING.md).
 - **Accounts:** a Jira Cloud site, a GitHub App installed on the repositories you want to change ([SETUP-GITHUB-APP.md](SETUP-GITHUB-APP.md)), and an Anthropic API key (local) or AWS Bedrock access (staging and production).
 
 ## 2. Install and configure
@@ -13,7 +13,7 @@ cp .env.example .env && chmod 600 .env      # fill in values; never commit .env
 ```
 
 Minimum `.env` values:
-- **Database:** `DATABASE_URL`.
+- **AWS (local Floci):** `ACCA_AWS_ENDPOINT_URL=http://127.0.0.1:4566` (required in development and test) and the `ACCA_*` table, queue and bucket names (the `.env.example` defaults match the bootstrap).
 - **Jira:** `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS`.
 - **GitHub App:** `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`.
 - **Model:** `LLM_PROVIDER=anthropic`, `LLM_MODEL=claude-haiku-5-5`, `ANTHROPIC_API_KEY`. For production use `LLM_PROVIDER=bedrock` with `BEDROCK_REGION` and AWS credentials.
@@ -22,15 +22,17 @@ Minimum `.env` values:
 
 All variables are described in [CONFIGURATION.md](CONFIGURATION.md).
 
-## 3. Database, images and API
+## 3. Local AWS (Floci), images and API
 
 ```bash
-docker compose up -d --wait postgres                 # PostgreSQL on 127.0.0.1:5435
-uv run alembic upgrade head                          # migrations 0001-0003
+docker compose -f infra/docker-compose.yml up -d --wait   # Floci: DynamoDB, SQS, S3 on 127.0.0.1:4566
+sh infra/floci/init/bootstrap.sh                     # tables, job queue + DLQ, bucket (idempotent)
 docker build -t ai-code-change-agent/execution-python:0.2.0 docker/execution
 mkdir -p -m 700 var/workspaces var/artifacts
-docker compose up -d --wait api                      # webhook intake on 127.0.0.1:8000
+docker compose up -d --wait api                      # webhook intake on 127.0.0.1:8000 (joins the acca-floci network)
 ```
+
+DynamoDB starts empty: there is nothing to migrate ([ADR-015](decisions/ADR-015-dynamodb-sqs-s3-persistence.md)). Floci data lives in its own volume until `docker compose -f infra/docker-compose.yml down -v`. Do not add `--remove-orphans` to `docker compose` for this project while an older `acca-postgres` container must keep running.
 
 Only Python repositories are supported; the Python image is the only execution image.
 
@@ -106,7 +108,8 @@ uv run ai-code-change changes retry-child <child-id>    # re-run one failed repo
 ## 10. Quality checks
 
 ```bash
-uv run pytest                      # unit + integration (coverage >= 90%)
+uv run pytest                      # unit + integration (coverage >= 90%; Floci up and bootstrapped)
+uv run pytest -m floci -rs         # DynamoDB, SQS, S3 and checkpoint tests only
 uv run pytest -m docker            # Docker sandbox tests (run when no worker sandbox is active)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```

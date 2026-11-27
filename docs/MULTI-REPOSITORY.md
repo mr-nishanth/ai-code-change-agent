@@ -69,7 +69,7 @@ The aggregated result is posted to the **parent Story** (the issue the webhook c
 - **Lifecycle** (`jira_report`): `NULL` (pending) -> `IN_PROGRESS` -> `SUCCEEDED` | `RETRYABLE_FAILURE` | `PERMANENT_FAILURE` (`DISABLED` when `JIRA_REPORTING_ENABLED=false`). The Jira comment id, the attempt count, the last error class and the time are stored with it.
 - **Classification:** 201 = success (comment id stored). 400/401/403/404 and an invalid issue key are permanent. 429, 5xx, timeouts and network errors are retryable.
 - **Idempotency:** the POST is never retried blindly. Before any second POST of a round (after a timeout, a 429/5xx, or a claim left `IN_PROGRESS` by a crashed worker for more than 5 minutes), the worker reads the issue's comments and looks for the round's Report ID. Found: the existing comment id is stored and nothing is posted. Lookup failed: nothing is posted, and the report stays retryable.
-- **Retries:** a retryable outcome enqueues one `code_change.parent_report` job per round in the PostgreSQL job queue, which retries it with backoff. After 6 attempts the report becomes `PERMANENT_FAILURE` (error `retries_exhausted:...`).
+- **Retries:** a retryable outcome enqueues one `code_change.parent_report` job per round in the job queue (DynamoDB state, SQS delivery), which retries it with backoff. After 6 attempts the report becomes `PERMANENT_FAILURE` (error `retries_exhausted:...`).
 - **Rounds:** `retry-child` opens a new round, so earlier comments of the Story stay as history and the new outcome gets one new comment.
 - **Limits:** the lookup reads the newest 100 comments of the issue. Comments posted before this lifecycle existed have no Report ID; KAN-9's final comment (10009) was reconciled by hand.
 

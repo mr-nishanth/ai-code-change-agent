@@ -4,6 +4,11 @@ Status: accepted (2026-11-27). The Docker-socket exception below is approved by 
 constraints; the owner should confirm its wording, because it amends the
 [ARCHITECTURE.md](../ARCHITECTURE.md#future-worker-deployment) guidance.
 
+**Extended by [ADR-015](ADR-015-dynamodb-sqs-s3-persistence.md) (2026-11-27):** the application now uses
+Floci's DynamoDB, SQS, S3 and (optionally) Bedrock Runtime as its local AWS endpoint in development and
+test. The "nothing in the application talks to it" rule below is replaced by ADR-015's local endpoint
+guard; the isolation, loopback, dummy-credential and Docker-socket terms stay.
+
 ## Context
 
 S2115 asks for local proof of the AWS services a future deployment could use (S3, SQS with a DLQ,
