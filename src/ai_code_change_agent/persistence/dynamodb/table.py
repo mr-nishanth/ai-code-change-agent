@@ -5,9 +5,15 @@ Items go in and come out as plain Python values (boto3's type (de)serializer: nu
 strongly consistent unless the caller asks otherwise; index reads are always eventual (DynamoDB
 rejects `ConsistentRead` on a GSI). `query` follows `LastEvaluatedKey` until the result is complete
 or `limit` items are collected (`Limit` counts items before a filter, so filtered queries loop).
-Every failure is mapped by `errors`: no botocore text leaves this package."""
+Every failure is mapped by `errors`: no botocore text leaves this package.
+
+A transaction retried after a cancellation (`TransactionConflict`, throttling) is sent with a
+fresh `ClientRequestToken`: the cancelled attempt wrote nothing, and AWS semantics for reusing the
+token of a cancelled request are not something the adapter relies on. botocore's own retries of one
+HTTP request (timeouts, 5xx) keep the token, which makes them idempotent."""
 
 import asyncio
+import uuid
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -195,13 +201,17 @@ class Table:
             failure = tx.failure_at(classified.index) if classified.index is not None else None
             return resolve_failure(failure, deserialize_item(classified.old_item))
 
-        await self._call("transact_write_items", request, on_condition)
+        def fresh_token(retry_request: dict[str, Any]) -> None:
+            retry_request["ClientRequestToken"] = str(uuid.uuid4())
+
+        await self._call("transact_write_items", request, on_condition, fresh_token)
 
     async def _call(
         self,
         operation: str,
         request: dict[str, Any],
         on_condition: Callable[[Classified], BaseException] | None = None,
+        before_retry: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         method = getattr(self._client, operation)
         for retry in range(self.retry.attempts):
@@ -223,6 +233,8 @@ class Table:
             if not classified.retryable or retry + 1 >= self.retry.attempts:
                 raise terminal_error(classified)
             await self.retry.sleep(self.retry.delay(retry))
+            if before_retry is not None:
+                before_retry(request)
         raise AssertionError("unreachable")  # pragma: no cover
 
 

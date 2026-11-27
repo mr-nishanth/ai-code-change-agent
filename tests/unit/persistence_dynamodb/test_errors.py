@@ -95,17 +95,26 @@ def test_concurrent_modification_is_both_conflict_errors() -> None:
     assert str(error) == "concurrent_modification"
 
 
-async def test_transaction_conflict_is_retried_with_the_same_token(
+async def test_transaction_conflict_is_retried_with_a_fresh_token(
     stubbed: tuple[Table, Stubber], sleeps: Sleeps
 ) -> None:
     table, stub = stubbed
+    tokens: list[str] = []
+    table._client.meta.events.register(
+        "provide-client-params.dynamodb.TransactWriteItems",
+        lambda params, **_: tokens.append(params["ClientRequestToken"]),
+    )
     tx = two_puts(table)
     cancelled(stub, "None", "TransactionConflict")
-    stub.add_response("transact_write_items", {}, tx.request())
+    cancelled(stub, "ThrottlingError", "None")
+    stub.add_response("transact_write_items", {})
 
     await tx.commit()
 
-    assert sleeps.delays == [0.1]
+    assert sleeps.delays == [0.1, 0.2]
+    # a cancelled transaction wrote nothing: each retry is a new request with its own token
+    assert tokens[0] == "token-1" and len(set(tokens)) == 3
+    assert all(len(token) == 36 for token in tokens[1:])
     assert tx.request()["ClientRequestToken"] == "token-1"
 
 

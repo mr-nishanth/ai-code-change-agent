@@ -2,8 +2,10 @@
 
 `TxBuilder` collects at most 100 `TransactWriteItems` entries (one per item; DynamoDB rejects two
 operations on one item, so the builder refuses them first) and sends them with a
-`ClientRequestToken`: a retry of the same commit (by this adapter or botocore) is idempotent, and
-the same token with another body is `IdempotentParameterMismatchException`. A cancelled transaction
+`ClientRequestToken`: botocore's resend of the same HTTP request is idempotent, and the same token
+with another body is `IdempotentParameterMismatchException`. After a cancellation
+(`TransactionConflict`, throttling) `Table` retries with a fresh token, since the cancelled
+attempt wrote nothing. A cancelled transaction
 writes nothing; the first `ConditionalCheckFailed` reason is mapped by its item index to that item's
 `on_failed` error (default `ConcurrentModificationError`).
 
@@ -20,6 +22,8 @@ leaving the block without `commit()` discards everything, like the SQL adapters'
    with `on_exists` naming the domain error, e.g. `ConflictError("alias_taken")`);
    `replace(item)` for a mutable item already read (`row_version` becomes seen + 1, condition
    `row_version = :seen`, plus any extra condition such as "attempt not terminal");
+   `update(key, ...)` for a targeted `UpdateExpression` on an item without `row_version` whose one
+   allowed change is guarded by its own condition (e.g. `SET published_at` on a profile version);
    `delete(key)` for an item already read; `check(...)` for an explicit `ConditionCheck` on an item
    not written (e.g. "profile version is published"). Reads after a write see the buffered state
    (**read-your-writes**), so `add_repository` then an audit event, or `_bump` returning the new
@@ -166,12 +170,13 @@ class TxBuilder:
 
 @dataclass
 class _Write:
-    kind: str  # "create" | "replace" | "delete"
-    item: Item | None  # None for delete
+    kind: str  # "create" | "replace" | "update" | "delete"
+    item: Item | None  # None for delete; for update, the image later reads see
     condition: str
     names: dict[str, str]
     values: dict[str, Any]
     failure: Failure | None
+    expression: str | None = None  # the UpdateExpression of an "update"
 
 
 def _and(*conditions: str | None) -> str:
@@ -278,6 +283,8 @@ class DynamoUnitOfWork:
         if pending is not None:
             if pending.item is None:
                 raise ValueError("item deleted in this unit of work")
+            if pending.kind == "update":
+                raise ValueError("item updated in this unit of work")
             # One write per item and commit: keep the first write's condition and version.
             if VERSION in pending.item:
                 body[VERSION] = pending.item[VERSION]
@@ -296,6 +303,44 @@ class DynamoUnitOfWork:
             on_failed,
         )
         return copy.deepcopy(body)
+
+    def update(
+        self,
+        key: Key,
+        *,
+        image: Mapping[str, Any],
+        expression: str,
+        condition: str,
+        names: Mapping[str, str] | None = None,
+        values: Mapping[str, Any] | None = None,
+        on_failed: Failure | None = None,
+    ) -> Item:
+        """A targeted `UpdateExpression` on an item read in this unit of work and not yet written.
+
+        For items without `row_version` whose only allowed change is guarded by `condition`
+        (e.g. `SET published_at` with `attribute_not_exists(published_at)`); `image` is the item as
+        later reads in this unit of work see it."""
+        if key in self._writes:
+            raise ValueError("item already written in this unit of work")
+        if self._read.get(key) is None:
+            raise ValueError("update needs an item read in this unit of work")
+        if Key.of(dict(image)) != key:
+            raise ValueError("image does not match the key")
+        body = copy.deepcopy(dict(image))
+        self._writes[key] = _Write(
+            "update",
+            body,
+            condition,
+            dict(names or {}),
+            dict(values or {}),
+            on_failed,
+            expression,
+        )
+        return copy.deepcopy(body)
+
+    def is_written(self, key: Key) -> bool:
+        """Whether this unit of work already holds a write for `key` (one operation per item)."""
+        return key in self._writes
 
     def delete(
         self,
@@ -347,7 +392,17 @@ class DynamoUnitOfWork:
     def build(self, token: str | None = None) -> TxBuilder:
         tx = self.table.transaction(token)
         for key, write in self._writes.items():
-            if write.item is None:
+            if write.kind == "update":
+                assert write.expression is not None  # noqa: S101 - set by update()
+                tx.update(
+                    key,
+                    update=write.expression,
+                    condition=write.condition,
+                    names=write.names,
+                    values=write.values,
+                    on_failed=write.failure,
+                )
+            elif write.item is None:
                 tx.delete(
                     key,
                     condition=write.condition,

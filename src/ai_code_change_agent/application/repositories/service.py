@@ -1,8 +1,16 @@
-"""Registry use cases. Every mutation runs in one transaction together with its audit event."""
+"""Registry use cases. Every mutation runs in one transaction together with its audit event.
 
+A mutation that loses an optimistic race (`ConcurrentModificationError`: an item its unit of work
+read changed before it committed) is retried as a whole method, up to `RETRY_ATTEMPTS` times with
+full jitter; this reproduces waiting for the row lock (DYNAMODB-DATA-MODEL.md 5.1). Genuine
+conflicts (`alias_taken`, `repository_already_registered`, ...) are never retried."""
+
+import asyncio
+import functools
+import random
 import uuid
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any, Concatenate
 
 from ai_code_change_agent.application.git_providers.ports import (
     GitProviderRegistry,
@@ -10,6 +18,7 @@ from ai_code_change_agent.application.git_providers.ports import (
 )
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
 from ai_code_change_agent.application.repositories.validation import ProfileValidator
+from ai_code_change_agent.domain.changes.errors import ConcurrentModificationError
 from ai_code_change_agent.domain.repositories.errors import (
     ConflictError,
     Finding,
@@ -35,6 +44,38 @@ from ai_code_change_agent.domain.repositories.models import (
 )
 
 UowFactory = Callable[[], RegistryUnitOfWork]
+Sleep = Callable[[float], Awaitable[None]]
+
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 0.025
+RETRY_MAX_DELAY = 0.5
+
+
+def _retry_delay(retry: int) -> float:
+    """Full jitter: U(0, min(max, base * 2**retry))."""
+    cap = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * float(2**retry))
+    return random.random() * cap  # noqa: S311 - retry jitter, not a secret
+
+
+def _retry_concurrent[**P, T](
+    method: Callable[Concatenate["RepositoryRegistryService", P], Coroutine[Any, Any, T]],
+) -> Callable[Concatenate["RepositoryRegistryService", P], Coroutine[Any, Any, T]]:
+    """Run the whole method again (new unit of work, fresh reads) after a lost optimistic race."""
+
+    @functools.wraps(method)
+    async def wrapper(
+        service: "RepositoryRegistryService", /, *args: P.args, **kwargs: P.kwargs
+    ) -> T:
+        for retry in range(RETRY_ATTEMPTS):
+            try:
+                return await method(service, *args, **kwargs)
+            except ConcurrentModificationError:
+                if retry + 1 >= RETRY_ATTEMPTS:
+                    raise
+            await service._sleep(_retry_delay(retry))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    return wrapper
 
 
 class RepositoryRegistryService:
@@ -43,8 +84,11 @@ class RepositoryRegistryService:
         uow_factory: UowFactory,
         validator: ProfileValidator | None = None,
         providers: GitProviderRegistry | None = None,
+        *,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._uow = uow_factory
+        self._sleep = sleep
         self._validator = validator or ProfileValidator()
         self._providers = providers or GitProviderRegistry()
 
@@ -90,6 +134,7 @@ class RepositoryRegistryService:
             owner=owner, name=name, access_reference=access_reference
         )
 
+    @_retry_concurrent
     async def register_repository(
         self, new: NewRepository, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -142,6 +187,7 @@ class RepositoryRegistryService:
                 await uow.store.list_mappings(repository_id=repo.id),
             )
 
+    @_retry_concurrent
     async def enable(
         self, key: str, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -165,6 +211,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return repo
 
+    @_retry_concurrent
     async def disable(
         self, key: str, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -186,6 +233,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return repo
 
+    @_retry_concurrent
     async def add_alias(
         self, key: str, alias: str, *, actor: str, correlation_id: str | None = None
     ) -> str:
@@ -208,6 +256,7 @@ class RepositoryRegistryService:
         return normalised
 
     # ---- profile versions ----------------------------------------------------------------
+    @_retry_concurrent
     async def create_version(
         self, key: str, document: object, *, actor: str, correlation_id: str | None = None
     ) -> ProfileVersion:
@@ -257,6 +306,7 @@ class RepositoryRegistryService:
         self._validator.validate(version.content)
         return version
 
+    @_retry_concurrent
     async def publish_version(
         self,
         key: str,
@@ -298,6 +348,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return version
 
+    @_retry_concurrent
     async def activate_version(
         self, key: str, version_no: int, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -322,6 +373,7 @@ class RepositoryRegistryService:
         return repo
 
     # ---- project mappings ----------------------------------------------------------------
+    @_retry_concurrent
     async def map_project(
         self, project_key: str, key: str, *, actor: str, correlation_id: str | None = None
     ) -> ProjectMapping:
@@ -350,6 +402,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return mapping
 
+    @_retry_concurrent
     async def unmap_project(
         self, project_key: str, key: str, *, actor: str, correlation_id: str | None = None
     ) -> ProjectMapping:
