@@ -111,6 +111,33 @@ async def test_an_expired_job_without_attempts_left_is_reaped(
     ]
 
 
+async def test_an_expired_lease_is_reclaimed_by_one_worker_and_a_second_expiry_is_dead(
+    sessions: async_sessionmaker[AsyncSession], database_url: str
+) -> None:
+    q = PostgresJobQueue(sessions)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=2)
+    first = await q.claim("crashed-1", 60)
+    assert first is not None and first.attempts == 1
+    sql(database_url, "UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
+
+    claims = await asyncio.gather(*[q.claim(f"w{i}", 60) for i in range(8)])
+    (winner,) = [c for c in claims if c is not None]  # exactly one reclaims it
+    assert winner.id == first.id and winner.attempts == 2
+    owner = f"w{claims.index(winner)}"
+    assert query(database_url, "SELECT status, attempts, lease_owner FROM jobs") == [
+        ("RUNNING", 2, owner)
+    ]  # the retry count moved once, not once per competing worker
+
+    # the second worker crashes too: its last attempt is used, so the job is DEAD, not retried
+    sql(database_url, "UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
+    assert await q.claim("w-late", 60) is None
+    assert query(database_url, "SELECT status, attempts, last_error, lease_owner FROM jobs") == [
+        ("DEAD", 2, "lease_expired_attempts_exhausted", None)
+    ]
+    assert not await q.complete(winner.id, owner)  # a late finish cannot revive it
+    assert await q.claim("w-later", 60) is None
+
+
 async def test_a_permanent_failure_is_dead_and_fail_requires_the_owner(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:

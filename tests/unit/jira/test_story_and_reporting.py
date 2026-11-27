@@ -90,6 +90,7 @@ async def test_failures_are_reported_not_raised() -> None:
 @pytest.mark.parametrize(
     ("code", "status"),
     [
+        (400, CommentStatus.PERMANENT),
         (401, CommentStatus.PERMANENT),
         (403, CommentStatus.PERMANENT),
         (404, CommentStatus.PERMANENT),
@@ -99,8 +100,15 @@ async def test_failures_are_reported_not_raised() -> None:
     ],
 )
 async def test_comment_post_failures_are_classified(code: int, status: CommentStatus) -> None:
-    result = await reporter(lambda _: httpx.Response(code)).post_comment("SHOP-1", "x")
+    calls: list[httpx.Request] = []
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(code)
+
+    result = await reporter(handle).post_comment("SHOP-1", "x")
     assert result.status is status and result.http_status == code and result.comment_id is None
+    assert result.error == f"http_{code}" and len(calls) == 1  # never retried inside
 
 
 async def test_comment_post_returns_the_created_comment_id() -> None:

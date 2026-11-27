@@ -407,7 +407,7 @@ async def test_success_posts_once_to_the_parent_story_and_persists_the_comment_i
     assert reporter.lookups == 0  # a first attempt never needs reconciliation
 
 
-@pytest.mark.parametrize("code", [401, 403, 404])
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
 async def test_auth_and_permission_errors_are_permanent_and_not_retried(code: int) -> None:
     result = CommentResult(R.PERMANENT, http_status=code, error=f"http_{code}")
     coordinator, _, queue, reporter, parent = await finished_parent([result])

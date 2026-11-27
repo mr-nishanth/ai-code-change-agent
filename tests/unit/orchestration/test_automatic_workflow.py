@@ -4,7 +4,9 @@ policy decisions replace the two human gates; failures never publish and are rep
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
 from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
 from ai_code_change_agent.application.artifacts.models import ArtifactKind
@@ -13,6 +15,8 @@ from ai_code_change_agent.domain.changes.models import ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, DependencyRequest
 from ai_code_change_agent.execution.docker.process import ProcessResult
+from ai_code_change_agent.integrations.jira.authentication import BasicAuthenticator
+from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
 from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps
 from tests.support import workflow
 from tests.support.changes import python_profile
@@ -62,6 +66,35 @@ async def test_failed_validation_never_publishes_and_is_reported_once(tmp_path: 
     assert "validation_failed" in text and "Retryable: no" in text
     await CodeChangeSteps(rig.deps).cleanup(rig.attempt_id)  # a second cleanup: no second comment
     assert len(rig.reporter.reports) == 1
+
+
+@pytest.mark.parametrize("code", [400, 401, 403])
+@pytest.mark.parametrize("validation_passes", [True, False], ids=["completed", "failed"])
+async def test_a_permanent_jira_comment_failure_is_not_retried_or_marked_reported(
+    tmp_path: Path, code: int, validation_passes: bool
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    if not validation_passes:
+        rig.agent.edits = [{"app/greeting.py": b"x = 1\n", ".github/workflows/ci.yml": b"x"}]
+    posts: list[httpx.Request] = []
+
+    def jira(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        return httpx.Response(code)
+
+    rig.deps.reporter = JiraOutcomeReporter(  # the real reporter over a fake Jira
+        enabled=True,
+        base_url="https://x.atlassian.net",
+        authenticator=BasicAuthenticator("a@b.c", SecretStr("tok")),
+        transport=httpx.MockTransport(jira),
+    )
+    expected = S.COMPLETED if validation_passes else S.FAILED
+    assert await run(rig) is expected  # reporting never changes the attempt outcome
+    assert [(p.method, p.url.path) for p in posts] == [
+        ("POST", "/rest/api/3/issue/SHOP-1/comment")
+    ]  # one POST, not retried
+    assert ArtifactKind.JIRA_REPORT not in await kinds(rig)  # not recorded as reported
+    assert len(rig.publisher.requests) == int(validation_passes)
 
 
 async def test_a_profile_without_a_test_command_uses_the_toolchain_default(
