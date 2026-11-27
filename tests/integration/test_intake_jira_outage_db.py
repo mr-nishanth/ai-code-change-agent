@@ -1,4 +1,4 @@
-"""PostgreSQL: Jira being unavailable while the worker reads the Story during intake.
+"""PostgreSQL: Jira being unavailable, or refusing, while the worker reads the Story at intake.
 
 The intake job runs through the real worker, job queue, change store and registry; only Jira is a
 fake. A transient Jira failure must leave the request untouched (no repository assignment, no
@@ -15,8 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.jira.errors import (
+    JiraAuthenticationError,
     JiraIntegrationError,
+    JiraPermissionError,
     JiraRateLimitError,
+    JiraResponseError,
     JiraServiceUnavailableError,
     JiraTimeoutError,
 )
@@ -160,3 +163,28 @@ async def test_jira_unavailable_for_every_attempt_ends_dead_with_the_request_unt
     assert state(database_url) == ([("DEAD", 3, "JiraTimeoutError")], [("RECEIVED", True)], 0)
     make_due(database_url)
     assert await worker.run_once() is None and jira.reads == 3 and started == []
+
+
+PERMANENT = [
+    (JiraAuthenticationError(operation="get_issue", status_code=401), "jira_authentication_failed"),
+    (JiraPermissionError(operation="get_issue", status_code=403), "jira_permission_denied"),
+    (JiraResponseError("malformed_json", operation="get_issue"), "jira_response_invalid"),
+]
+
+
+@pytest.mark.parametrize(("error", "code"), PERMANENT, ids=["http_401", "http_403", "malformed"])
+async def test_a_permanent_jira_error_during_intake_is_dead_after_one_attempt(
+    sessions: async_sessionmaker[AsyncSession],
+    database_url: str,
+    error: JiraIntegrationError,
+    code: str,
+) -> None:
+    await accepted_story(sessions)
+    jira, started = FlakyJira(error, failures=99), list[uuid.UUID]()
+    worker = intake_worker(sessions, jira, started)
+
+    assert await worker.run_once() is not None
+    assert state(database_url) == ([("DEAD", 1, code)], [("RECEIVED", True)], 0)
+    make_due(database_url)
+    assert await worker.run_once() is None  # never claimed again: no further Jira reads
+    assert jira.reads == 1 and started == []

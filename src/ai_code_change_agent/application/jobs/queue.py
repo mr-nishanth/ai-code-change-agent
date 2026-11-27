@@ -23,10 +23,16 @@ class Job:
 
 
 class JobRetryableError(Exception):
-    """A temporary failure: the job is retried with backoff while attempts remain."""
+    """A temporary failure: the job is retried with backoff while attempts remain.
 
-    def __init__(self, code: str) -> None:
+    `retry_after_seconds`, when positive, is the earliest useful retry (a provider's
+    Retry-After); the worker waits at least that long, up to its maximum backoff. Any other
+    exception is retried too; one that carries a `retry_after_seconds` attribute (for example
+    `JiraRateLimitError`) is honoured the same way."""
+
+    def __init__(self, code: str, *, retry_after_seconds: float | None = None) -> None:
         self.code = code
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(code)
 
 

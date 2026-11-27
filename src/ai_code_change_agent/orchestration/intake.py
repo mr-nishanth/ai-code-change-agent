@@ -9,7 +9,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ai_code_change_agent.application.changes.service import CodeChangeService
-from ai_code_change_agent.application.jira.errors import JiraIssueNotFoundError
+from ai_code_change_agent.application.jira.errors import (
+    JiraIntegrationError,
+    JiraIssueNotFoundError,
+)
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.coordinator import (
@@ -64,6 +67,13 @@ class IntakeHandler:
             issue = await self._jira.get_issue(request.jira_issue_key)
         except JiraIssueNotFoundError:
             raise JobFailedError("jira_issue_not_found") from None
+        except JiraIntegrationError as exc:
+            # Authentication, permission, a bad request or an unusable response will not fix
+            # itself on a retry: dead at once, with the fixed code. Transient errors (429, 5xx
+            # outages, timeouts) propagate unchanged, so the queue backs off and retries them.
+            if not exc.retryable:
+                raise JobFailedError(exc.code) from None
+            raise
         if issue.project is None or issue.project.key != request.jira_project_key:
             raise JobFailedError("jira_project_changed")
         story_text = f"{issue.summary or ''}\n{issue.description.text if issue.description else ''}"

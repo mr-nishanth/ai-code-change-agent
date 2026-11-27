@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from ai_code_change_agent.application.jira.errors import JiraRateLimitError
 from ai_code_change_agent.application.jobs.queue import (
     Job,
     JobFailedError,
@@ -136,6 +137,43 @@ async def test_run_loop_respects_concurrency_and_stops() -> None:
     stop.set()
     await task
     assert peak == 2 and len(q.completed) == 6
+
+
+class _RetryAfter(Exception):  # noqa: N818 - mirrors JiraRateLimitError's attribute only
+    def __init__(self, retry_after_seconds: float | None) -> None:
+        super().__init__("raw text never stored")
+        self.retry_after_seconds = retry_after_seconds
+
+
+@pytest.mark.parametrize(
+    ("exc", "retry"),
+    [(JobRetryableError("jira_rate_limited", retry_after_seconds=120), 120),
+     (JobRetryableError("jira_rate_limited", retry_after_seconds=5000), 900),
+     (JobRetryableError("jira_rate_limited", retry_after_seconds=10), 30),
+     (JobRetryableError("jira_rate_limited", retry_after_seconds=None), 30),
+     (_RetryAfter(120.2), 121),
+     (_RetryAfter(0), 30),
+     (_RetryAfter(-5), 30),
+     (_RetryAfter(None), 30)],
+)  # fmt: skip
+async def test_a_retry_after_hint_lengthens_the_backoff_up_to_the_cap(
+    exc: Exception, retry: int
+) -> None:
+    async def bad(j: Job) -> None:
+        raise exc
+
+    q = MemoryQueue([job()])
+    await worker(q, {"k.one": bad}).run_once()
+    assert q.failed[0][2] == retry
+
+
+async def test_a_jira_rate_limit_carries_its_retry_after_into_the_queue() -> None:
+    async def limited(j: Job) -> None:
+        raise JiraRateLimitError(operation="get_issue", status_code=429, retry_after_seconds=120)
+
+    q = MemoryQueue([job()])
+    await worker(q, {"k.one": limited}).run_once()
+    assert q.failed[0][1:] == ("JiraRateLimitError", 120)
 
 
 def test_backoff_is_exponential_and_capped() -> None:
