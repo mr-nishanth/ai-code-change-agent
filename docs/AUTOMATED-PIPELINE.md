@@ -41,6 +41,7 @@ The rebuilt tree must equal baseline + changes. Also checked: path safety, prote
 | Situation | Behaviour |
 |---|---|
 | Duplicate webhook or duplicate Story | API dedupe on delivery id and issue id (200 `duplicate`); no second request or job |
+| Jira read at intake fails | A permanent error (400 and other 4xx, 401, 403, 501/505, a malformed response) makes the intake job DEAD after one attempt with the error's code (for example `jira_authentication_failed`); 404 stays `jira_issue_not_found`. A transient error (429, 5xx, timeout, connection) is retried by the job queue with exponential backoff, raised to the server's `Retry-After` when given (capped at 900 s) |
 | LLM timeouts, 429/5xx | SDK retries (`LLM_MAX_RETRIES`; Anthropic SDK backoff, botocore standard retries on Bedrock); per-phase wall-clock budget `DEEP_AGENT_RUN_TIMEOUT_SECONDS` → `agent_run_timeout` |
 | Dependency failure | `dependency_*` code (wheel unavailable, conflict, Python unsupported, limit, corrupted bundle) → attempt FAILED, Jira comment; nothing falls back to network |
 | Validation failure | A code failure (a check or command failed, or a command exceeded the profile's per-command timeout) gets one bounded repair with the validator's feedback, then FAILED (`validation_failed`). A timeout counts as a code failure because the change itself is the usual cause (a hang, or a call blocking under `--network none`). Nothing is published |

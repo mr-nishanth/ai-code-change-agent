@@ -107,7 +107,7 @@ same offline install in its fresh container
 The design follows the existing architecture:
 
 - An application port `DependencyPreparer` (`application/dependencies/ports.py`) with one Docker adapter (`execution/docker/dependencies.py`).
-- A pure domain validator (`domain/dependencies/manifest.py`).
+- Pure domain validators: `domain/dependencies/policy.py` (dependency requests and manifest requirements) and `domain/dependencies/manifests.py` (manifest and lock discovery and validation).
 - A new workflow step between PLAN approval and implementation.
 - No new agent, service, queue or Redis.
 
@@ -183,7 +183,7 @@ python -m pip check
 
 ## 11. Implementation roadmap (after ADR-010 approval)
 
-1. **Domain:** `domain/dependencies/manifest.py` (request and lock models, validation), with unit tests.
+1. **Domain:** `domain/dependencies/policy.py` (request model and validation) and `domain/dependencies/manifests.py` (manifest and lock validation), with unit tests.
 2. **Plan schema:** `ImplementationPlan.dependencies` (optional, default empty) and prompt guidance; plan hash covers it.
 3. **Port and adapter:**
    - `application/dependencies/ports.py` (`DependencyPreparer`, `DependencyBundleStore`);
