@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from tests.support.dynamo import app_table  # noqa: F401 - fixture
 from tests.support.floci import FLOCI_ENDPOINT, floci_reachable
 
 

@@ -1,5 +1,7 @@
 """Typed domain errors. Messages are fixed codes; never include secrets or raw input."""
 
+from ai_code_change_agent.domain.repositories.errors import ConflictError
+
 
 class ChangeError(Exception):
     code = "change_error"
@@ -18,6 +20,15 @@ class ChangeNotFoundError(ChangeError):
 
 class ChangeConflictError(ChangeError):
     code = "conflict"
+
+
+class ConcurrentModificationError(ChangeConflictError, ConflictError):
+    """A lost optimistic race: an item this unit of work read changed before it committed.
+
+    A subclass of both conflict errors (changes and registry), so existing handlers treat it as a
+    conflict; services retry the whole method on this class only (DYNAMODB-DATA-MODEL.md 5.1)."""
+
+    code = "concurrent_modification"
 
 
 class InvalidTransitionError(ChangeError):
