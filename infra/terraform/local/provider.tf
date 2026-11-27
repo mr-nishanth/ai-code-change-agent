@@ -22,6 +22,7 @@ provider "aws" {
   s3_use_path_style           = true
 
   endpoints {
+    dynamodb       = var.floci_endpoint
     s3             = var.floci_endpoint
     sqs            = var.floci_endpoint
     secretsmanager = var.floci_endpoint

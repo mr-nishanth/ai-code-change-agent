@@ -1,11 +1,11 @@
 #!/bin/sh
-# S3: artifact and scratch buckets.
+# S3: artifact bucket (ACCA_S3_BUCKET_NAME, default acca-local-artifacts) and scratch bucket.
 set -eu
-FLOCI_INIT_DIR=${FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
+ACCA_FLOCI_INIT_DIR=${ACCA_FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
 # shellcheck source=infra/floci/init/_env.sh
-. "$FLOCI_INIT_DIR/_env.sh"
+. "$ACCA_FLOCI_INIT_DIR/_env.sh"
 
-for bucket in acca-local-artifacts acca-local-scratch; do
+for bucket in "${ACCA_S3_BUCKET_NAME:-acca-local-artifacts}" acca-local-scratch; do
   if awsl s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
     log "s3 bucket $bucket exists"
   else

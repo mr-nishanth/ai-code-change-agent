@@ -1,9 +1,9 @@
 #!/bin/sh
 # CloudWatch Logs: worker and API log groups with 1-day retention.
 set -eu
-FLOCI_INIT_DIR=${FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
+ACCA_FLOCI_INIT_DIR=${ACCA_FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
 # shellcheck source=infra/floci/init/_env.sh
-. "$FLOCI_INIT_DIR/_env.sh"
+. "$ACCA_FLOCI_INIT_DIR/_env.sh"
 
 for group in /acca/local/worker /acca/local/api; do
   found=$(awsl logs describe-log-groups --log-group-name-prefix "$group" \

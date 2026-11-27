@@ -2,9 +2,9 @@
 # Secrets Manager: one test-only dummy secret. Never seed real secrets here and
 # never read .env; this value is not a credential.
 set -eu
-FLOCI_INIT_DIR=${FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
+ACCA_FLOCI_INIT_DIR=${ACCA_FLOCI_INIT_DIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
 # shellcheck source=infra/floci/init/_env.sh
-. "$FLOCI_INIT_DIR/_env.sh"
+. "$ACCA_FLOCI_INIT_DIR/_env.sh"
 
 name=acca/local/test-only-dummy
 if awsl secretsmanager describe-secret --secret-id "$name" >/dev/null 2>&1; then

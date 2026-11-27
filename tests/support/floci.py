@@ -28,7 +28,9 @@ def require_loopback(url: str) -> str:
     return url.rstrip("/")
 
 
-FLOCI_ENDPOINT = require_loopback(os.environ.get("FLOCI_ENDPOINT_URL", "http://127.0.0.1:4566"))
+FLOCI_ENDPOINT = require_loopback(
+    os.environ.get("ACCA_FLOCI_ENDPOINT_URL", "http://127.0.0.1:4566")
+)
 
 
 def floci_client(service: str) -> Any:

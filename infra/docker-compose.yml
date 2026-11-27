@@ -22,6 +22,13 @@ services:
       FLOCI_STORAGE_MODE: persistent
       FLOCI_STORAGE_PERSISTENT_PATH: /app/data
       FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE: "true" # RDS/ECR volumes go with their resource
+      # DynamoDB: journaled writes, one item file per table (docs/configuration/storage.md:72-74,
+      # docs/services/dynamodb.md "Item layout on disk"); an existing single-file store is migrated on start.
+      FLOCI_STORAGE_SERVICES_DYNAMODB_MODE: wal
+      FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT: per-table
+      # Web console sidecar (opened on demand at /_floci/ui): loopback only, pinned image (docs/ui/index.md).
+      FLOCI_SERVICES_UI_BIND_ADDRESS: "127.0.0.1"
+      FLOCI_SERVICES_UI_IMAGE: floci/floci-ui:0.7.0@sha256:90dcaa588f9b3cd3cb5ccc98559286574391001e46735b7be4373364d51f7dfe
       FLOCI_SERVICES_DOCKER_NETWORK: acca-floci
       FLOCI_SERVICES_RDS_PROXY_BASE_PORT: "7001"
       FLOCI_SERVICES_RDS_PROXY_MAX_PORT: "7005"

@@ -116,9 +116,10 @@ Variables seen on floci.io but absent from the 2.5.0 reference (for example
 
 Keep `infra/floci/init/bootstrap.sh` (host-run, idempotent, loopback and dummy-credential guard). Official hooks
 would need the `2.5.0-compat` image (a new pinned digest), a 30 s per-script timeout, and a failure would shut
-down the shared Floci. The host script also serves the tests. Rename the script-internal `FLOCI_INIT_DIR` and
-`FLOCI_INIT_HEALTHY` to `ACCA_FLOCI_INIT_DIR` and `ACCA_FLOCI_HEALTHY`: the `FLOCI_` prefix belongs to Floci
-(`FLOCI_INIT_HOOKS_DIR` is official), and the test helper's `FLOCI_ENDPOINT_URL` becomes `ACCA_FLOCI_ENDPOINT_URL`.
+down the shared Floci. The host script also serves the tests. The script-internal init-directory and health-flag
+variables are named `ACCA_FLOCI_INIT_DIR` and `ACCA_FLOCI_HEALTHY` (they used to carry a bare `FLOCI_` prefix,
+which belongs to Floci: `FLOCI_INIT_HOOKS_DIR` is official), and the test helper's endpoint variable is
+`ACCA_FLOCI_ENDPOINT_URL`.
 Table definitions live in one JSON schema read by the script, Terraform and the test fixture.
 
 ### 9.2 Floci tests: running instance, not Testcontainers

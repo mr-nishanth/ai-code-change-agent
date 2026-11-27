@@ -5,16 +5,18 @@ locals {
   prefix = "tf-acca"
 }
 
-# SQS: job queue with a dead-letter queue (maxReceiveCount 3).
+# SQS: job queue with a dead-letter queue (lease 300 s, long polling 20 s, maxReceiveCount 20).
 resource "aws_sqs_queue" "jobs_dlq" {
   name = "${local.prefix}-local-jobs-dlq"
 }
 
 resource "aws_sqs_queue" "jobs" {
-  name = "${local.prefix}-local-jobs"
+  name                       = "${local.prefix}-local-jobs"
+  visibility_timeout_seconds = 300
+  receive_wait_time_seconds  = 20
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = 20
   })
 }
 
@@ -48,4 +50,50 @@ resource "aws_cloudwatch_log_group" "local" {
   for_each          = toset(["worker", "api"])
   name              = "/${local.prefix}/local/${each.key}"
   retention_in_days = 1
+}
+
+# DynamoDB: the application and checkpoint tables, from the same CreateTable input the bootstrap
+# script uses (infra/floci/schema), so the two cannot drift. TTL: expires_at resp. ttl.
+locals {
+  dynamodb_tables = {
+    app = {
+      schema        = jsondecode(file("${path.module}/../../floci/schema/acca-app.json"))
+      ttl_attribute = "expires_at"
+    }
+    checkpoints = {
+      schema        = jsondecode(file("${path.module}/../../floci/schema/acca-checkpoints.json"))
+      ttl_attribute = "ttl"
+    }
+  }
+}
+
+resource "aws_dynamodb_table" "local" {
+  for_each     = local.dynamodb_tables
+  name         = "${local.prefix}-local-${each.key}"
+  billing_mode = each.value.schema.BillingMode
+  hash_key     = one([for k in each.value.schema.KeySchema : k.AttributeName if k.KeyType == "HASH"])
+  range_key    = one([for k in each.value.schema.KeySchema : k.AttributeName if k.KeyType == "RANGE"])
+
+  dynamic "attribute" {
+    for_each = each.value.schema.AttributeDefinitions
+    content {
+      name = attribute.value.AttributeName
+      type = attribute.value.AttributeType
+    }
+  }
+
+  dynamic "global_secondary_index" {
+    for_each = try(each.value.schema.GlobalSecondaryIndexes, [])
+    content {
+      name            = global_secondary_index.value.IndexName
+      hash_key        = one([for k in global_secondary_index.value.KeySchema : k.AttributeName if k.KeyType == "HASH"])
+      range_key       = one([for k in global_secondary_index.value.KeySchema : k.AttributeName if k.KeyType == "RANGE"])
+      projection_type = global_secondary_index.value.Projection.ProjectionType
+    }
+  }
+
+  ttl {
+    enabled        = true
+    attribute_name = each.value.ttl_attribute
+  }
 }
