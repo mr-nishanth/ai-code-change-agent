@@ -2,8 +2,8 @@
 
 Status: **filled from the S2115 Task 8 clean run on 2026-11-27**. Every value below was observed in that run.
 
-Related: [AWS-DEPLOYMENT-READINESS.md](AWS-DEPLOYMENT-READINESS.md) ·
-[FLOCI-SERVICE-CAPABILITY-MATRIX.md](FLOCI-SERVICE-CAPABILITY-MATRIX.md) ·
+Related: [AWS-DEPLOYMENT-READINESS.md](../aws/AWS-DEPLOYMENT-READINESS.md) ·
+[FLOCI-SERVICE-CAPABILITY-MATRIX.md](../aws/FLOCI-SERVICE-CAPABILITY-MATRIX.md) ·
 [ADR-014](../decisions/ADR-014-floci-local-aws-emulator.md).
 
 ## 1. Environment
@@ -97,3 +97,7 @@ Bootstrap: first run created 2 queues (redrive `maxReceiveCount` 3), 2 buckets, 
 | Floci child containers after the run | only `floci-aws-ecr-registry` (ECR sidecar) | `docker ps -a --filter label=floci=true`: only `floci-aws-ecr-registry` |
 | Floci volumes (`label=floci=true`) | only `floci-aws-ecr-registry-data` | only `floci-aws-ecr-registry-data` (RDS volume pruned by the test) |
 | Application stack (`acca-api`, `acca-postgres`, `acca_pgdata`) | untouched | `acca-api` started 2026-11-27T08:08:43Z and `acca-postgres` 2026-11-27T04:39:23Z, both before and after the run; `ai-code-change-agent_acca_pgdata` present |
+
+## Controller follow-up (2026-11-27)
+- The Bedrock unit tests that failed only with dummy AWS variables exported now ignore the shell: `tests/conftest.py` clears ambient `AWS_*` variables before every test. Full suite with the Floci dummy variables exported: 1,564 passed, 0 skipped, coverage 91.87%.
+- Floci was restarted after Task 8 and is running and healthy (acceptance criterion 1).

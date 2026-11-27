@@ -3,7 +3,7 @@
 Status: **verified on 2026-11-27** (S2115 Task 8, clean `down -v` / `up` start, Floci 2.5.0 on Docker
 Engine 29.9.2 linux/arm64). A row is `VERIFIED LOCALLY` only for the behaviour its listed test asserts;
 everything else the row documents stays as the documentation says. Evidence:
-[S2115-INTEGRATION-REPORT.md](S2115-INTEGRATION-REPORT.md).
+[../testing/S2115-FLOCI-INTEGRATION-REPORT.md](../testing/S2115-FLOCI-INTEGRATION-REPORT.md).
 
 Floci version: **2.5.0** (release 2026-11-15). Image: `floci/floci:2.5.0` (standard variant,
 multi-arch `linux/amd64` + `linux/arm64`; also on `public.ecr.aws/floci/floci`). Pinned in `infra/docker-compose.yml` as

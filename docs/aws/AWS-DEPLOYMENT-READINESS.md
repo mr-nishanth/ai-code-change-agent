@@ -10,7 +10,7 @@ added, and the API, worker, sandboxes and providers run exactly as before.
 Related: [ADR-014](../decisions/ADR-014-floci-local-aws-emulator.md) ·
 [architecture audit](S2115-ARCHITECTURE-AUDIT.md) ·
 [service capability matrix](FLOCI-SERVICE-CAPABILITY-MATRIX.md) ·
-[integration report](S2115-INTEGRATION-REPORT.md).
+[integration report](../testing/S2115-FLOCI-INTEGRATION-REPORT.md).
 
 ## 1. What is proven locally
 
@@ -34,7 +34,7 @@ Everything below runs against Floci on `http://127.0.0.1:4566` with the dummy cr
 | Terraform | [`infra/terraform/local`](../../infra/terraform/local) | `init -backend=false`, `validate`, `fmt -check` only; never applied |
 
 Final per-test results, timings and cleanup evidence are recorded in
-[S2115-INTEGRATION-REPORT.md](S2115-INTEGRATION-REPORT.md).
+[../testing/S2115-FLOCI-INTEGRATION-REPORT.md](../testing/S2115-FLOCI-INTEGRATION-REPORT.md).
 
 **What local proof does not show:** real IAM enforcement, VPC/security-group behaviour, Fargate
 isolation, KMS, quotas, latency, cost, regional failure, or anything about the real AWS account,
