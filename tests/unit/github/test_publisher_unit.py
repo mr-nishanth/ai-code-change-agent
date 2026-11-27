@@ -124,9 +124,14 @@ async def test_a_verified_draft_pull_request_is_created_on_the_pinned_base(tmp_p
 async def test_a_repeated_delivery_reuses_the_branch_and_pull_request(tmp_path: Path) -> None:
     x = publish_rig(tmp_path)
     first = await x.publish()
+    mark = len(x.hub.calls)
     second = await x.publish()
     assert second.outcome.value == "PULL_REQUEST_CREATED" and not second.created
     assert second.pr_number == first.pr_number and len(x.hub.pulls) == 1
+    calls = x.hub.calls[mark:]
+    assert [p for m, p in calls if m != "GET" and "access_tokens" not in p] == []  # no write
+    steps = [(s.name, s.status) for s in second.progress]
+    assert ("ref", "REUSED") in steps and ("pull_request", "REUSED") in steps
 
 
 async def test_a_repository_removed_from_the_installation_is_refused(tmp_path: Path) -> None:
@@ -290,22 +295,11 @@ async def test_a_pull_request_created_behind_a_timeout_is_adopted_not_duplicated
     assert (
         retry.pr_number == number and ("GET", f"/repos/acme/shop-service/pulls/{number}") in second
     )
+    # the fake hub's own state: the PR this run created is a draft. Adoption itself matches on
+    # head branch and base only (a human may have marked it ready), so draft is not re-checked.
     assert pr["draft"] is True and pr["base"]["ref"] == "main"
     assert pr["head"]["ref"] == x.request.branch and pr["head"]["sha"] == retry.commit_sha
     assert retry.pr_head_sha == retry.commit_sha and retry.base_branch == "main"
-
-
-async def test_an_existing_draft_pull_request_is_reused_without_any_write(tmp_path: Path) -> None:
-    x = publish_rig(tmp_path)
-    first = await x.publish()
-    mark = len(x.hub.calls)
-    again = await x.publish()
-    second = x.hub.calls[mark:]
-    assert again.outcome.value == "PULL_REQUEST_CREATED" and not again.created
-    assert again.pr_number == first.pr_number
-    assert [p for m, p in second if m != "GET" and "access_tokens" not in p] == []  # no POST
-    steps = [(s.name, s.status) for s in again.progress]
-    assert ("ref", "REUSED") in steps and ("pull_request", "REUSED") in steps
 
 
 async def test_a_token_expired_mid_publish_is_refreshed_once_and_the_write_retried(

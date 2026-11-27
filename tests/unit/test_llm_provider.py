@@ -136,32 +136,27 @@ def test_model_calls_can_be_paced_client_side() -> None:
 
 # ---- provider failures over a fake transport (no network) -----------------------------------
 
-ANTHROPIC_ERRORS = {
-    429: "rate_limit_error",
-    401: "authentication_error",
-    403: "permission_error",
-}
 
-
-@pytest.mark.parametrize(("status", "expected_requests"), [(429, 3), (401, 1), (403, 1)])
-async def test_anthropic_retries_rate_limits_within_the_policy_and_never_retries_auth_failures(
-    monkeypatch: pytest.MonkeyPatch, status: int, expected_requests: int
+async def test_anthropic_retries_rate_limits_within_the_policy(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """One representative case; 401/403 (never retried) are asserted with their error codes and
+    ledger rows in tests/unit/test_coding_agent.py::
+    test_provider_http_failures_end_the_run_with_a_fixed_non_secret_code."""
     import httpx2
     from langchain_core.messages import HumanMessage
 
     from tests.support.models import anthropic_over_fake_http
 
-    body = {"type": "error", "error": {"type": ANTHROPIC_ERRORS[status], "message": "refused"}}
-    received = anthropic_over_fake_http(monkeypatch, lambda _: httpx2.Response(status, json=body))
+    body = {"type": "error", "error": {"type": "rate_limit_error", "message": "refused"}}
+    received = anthropic_over_fake_http(monkeypatch, lambda _: httpx2.Response(429, json=body))
     model = build_chat_model(
         s(llm_model="claude-haiku-5-5", anthropic_api_key="k", llm_max_retries=2)
     )
     with pytest.raises(Exception) as err:
         await model.ainvoke([HumanMessage(content="hi")])
-    assert getattr(err.value, "status_code", None) == status
-    # 429: the first request plus LLM_MAX_RETRIES retries, then it stops; 401/403: never retried
-    assert len(received) == expected_requests
+    assert getattr(err.value, "status_code", None) == 429
+    assert len(received) == 3  # the first request plus LLM_MAX_RETRIES retries, then it stops
 
 
 @pytest.mark.parametrize(

@@ -177,3 +177,31 @@ async def test_search_hits_with_a_query_string_or_an_unlisted_host_are_not_retur
         "https://fastapi.tiangolo.com/tutorial/#first-steps",
         "https://docs.python.org/3/library/asyncio-task.html",
     ]
+
+
+async def test_search_never_offers_a_url_that_fetch_reference_would_refuse() -> None:
+    """Search uses the fetcher's own static URL check, so a hit the fetcher would refuse (port,
+    userinfo, a long URL, a secret in the path, an unparsable port) never costs the agent a
+    fetch."""
+    long_url = "https://docs.python.org/3/" + "a" * 300
+    messages = FakeMessages(
+        [result_block(
+            "https://docs.python.org:8443/3/library/asyncio.html",
+            "https://docs.python.org:443/3/library/os.html",
+            "https://user:pw@docs.python.org/3/library/re.html",
+            "https://user@docs.python.org/3/library/json.html",
+            long_url,
+            "https://docs.python.org/3/ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+            "https://docs.python.org:abc/3/",
+            "https://DOCS.python.org/3/library/asyncio-task.html",
+        )]
+    )  # fmt: skip
+    s = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org"],
+        client=SimpleNamespace(messages=messages),
+    )  # fmt: skip
+    r = await s.search("asyncio")
+    assert [h.url for h in r.hits] == [
+        "https://docs.python.org:443/3/library/os.html",  # the default port is allowed
+        "https://DOCS.python.org/3/library/asyncio-task.html",
+    ]

@@ -179,14 +179,16 @@ async def test_an_interruption_after_the_delivery_insert_leaves_nothing_and_rede
     executed = 0
     original = AsyncSession.execute
 
-    async def connection_drops(self: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+    async def statement_n_raises(self: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+        # raised before statement N is sent: proves exception-driven rollback, not a
+        # server-side connection loss
         nonlocal executed
         executed += 1
         if executed == interrupted_statement:
-            raise ConnectionResetError("connection lost mid-transaction")
+            raise ConnectionResetError("statement interrupted")
         return await original(self, *args, **kwargs)
 
-    monkeypatch.setattr(AsyncSession, "execute", connection_drops)
+    monkeypatch.setattr(AsyncSession, "execute", statement_n_raises)
     with pytest.raises(PersistenceError, match="ConnectionResetError"):
         await repo.record(accepted("d-1"))
     monkeypatch.undo()

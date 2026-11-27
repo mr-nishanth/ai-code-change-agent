@@ -68,6 +68,8 @@ def test_the_reference_fetcher_is_the_only_web_client_outside_known_integrations
     assert where("ai_code_change_agent.integrations.web") <= {
         "composition.py",
         "integrations/web/fetcher.py",
+        # a sibling in the same package: reuses the fetcher's pure static URL check (no client)
+        "integrations/web/search.py",
     }
 
 

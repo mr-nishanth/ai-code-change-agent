@@ -839,6 +839,21 @@ async def test_a_missing_contract_at_the_top_of_a_chain_blocks_every_level_below
 
 
 @pytest.mark.parametrize("outcome", [ChildStatus.FAILED, ChildStatus.REJECTED])
+async def test_a_failure_at_the_top_of_a_chain_blocks_every_level_below_in_one_pass(
+    outcome: ChildStatus,
+) -> None:
+    coordinator, store, queue, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(CHAIN))
+    await finish(store, coordinator, "schema-lib", outcome)  # one advance
+    assert by_key(store, "backend-api").failure_code == "upstream_failed:schema-lib"
+    web = by_key(store, "web-app")
+    assert web.status is ChildStatus.BLOCKED and web.failure_code == "upstream_failed:backend-api"
+    assert queued_keys(store, queue) == ["schema-lib"]  # neither level below ever ran
+    assert store.parents[parent.id].status is ParentStatus.FAILED
+    assert len(reporter.texts) == 1
+
+
+@pytest.mark.parametrize("outcome", [ChildStatus.FAILED, ChildStatus.REJECTED])
 async def test_an_upstream_that_fails_blocks_dependents_and_the_independent_sibling_still_runs(
     outcome: ChildStatus,
 ) -> None:

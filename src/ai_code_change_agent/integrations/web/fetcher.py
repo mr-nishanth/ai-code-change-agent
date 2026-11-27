@@ -5,7 +5,9 @@ Permission rules, all enforced here and none by the model:
 - the host must exactly equal a trusted host (config/reference_sources.yaml, see
   core.reference_hosts); any path on it is allowed, subdomains are not implied;
 - every address the host resolves to must be public (no private, loopback, link-local,
-  multicast or reserved ranges: no SSRF into the host or internal network);
+  multicast or reserved ranges: no SSRF into the host or internal network); IPv6 forms that
+  embed or stand for an IPv4 address (IPv4-compatible ::/96, SIIT ::ffff:0:0:0/96) and
+  site-local fec0::/10 are refused outright, and NAT64 64:ff9b::/96 only reaches a public IPv4;
 - redirects are followed manually, at most three, and each hop is checked again (scheme, port,
   exact host, public addresses), so a redirect to another host needs that host listed too;
 - a URL the agent asks for has no query string, at most MAX_REQUESTED_URL characters and no
@@ -39,7 +41,56 @@ Resolver = Callable[[str], Awaitable[list[str]]]
 _TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
 _MAX_REDIRECTS = 3
 MAX_REQUESTED_URL = 300  # characters, for a URL the agent asks for
+# Python's is_global misses these (they report global on 3.12); listed explicitly so the result
+# does not depend on the stdlib patch level.
+_NAT64 = ipaddress.IPv6Network("64:ff9b::/96")
+_REFUSED_V6 = tuple(
+    ipaddress.IPv6Network(n)
+    for n in (
+        "::/96",  # IPv4-compatible (deprecated)
+        "::ffff:0:0:0/96",  # SIIT IPv4-translated
+        "fec0::/10",  # site-local (deprecated)
+    )
+)
 _log = get_logger("references")
+
+
+def address_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True when the fetcher may connect to `ip`. The stdlib check is the base rule; the IPv6
+    rules only refuse more. A NAT64 address is allowed only when its embedded IPv4 is public, so
+    hosts on IPv6-only DNS64 networks still work."""
+    if not ip.is_global or ip.is_multicast:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip in _NAT64:
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+            return embedded.is_global and not embedded.is_multicast
+        if any(ip in net for net in _REFUSED_V6):
+            return False
+    return True
+
+
+def url_refusal(url: str, hosts: Sequence[str], *, requested: bool = True) -> str | None:
+    """The static (no DNS) part of the URL check: the refusal code, or None when the URL passes.
+    `requested`: the URL comes from the agent (not a server redirect), so it also may not carry
+    a query string, be long, or contain a secret. `hosts` are normalised trusted hosts. Raises
+    ValueError for a URL urlsplit cannot parse (for example a non-numeric port)."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if requested:
+        if parts.query:
+            return "reference_query_not_allowed"
+        if len(url) > MAX_REQUESTED_URL:
+            return "reference_url_too_long"
+        if find_secrets(url):
+            return "reference_url_contains_secret"
+    if parts.scheme != "https" or not host or parts.username or parts.password:
+        return "reference_url_not_allowed"
+    if parts.port not in (None, 443):
+        return "reference_url_not_allowed"
+    if not host_allowed(host, hosts):
+        return "reference_domain_not_allowed"
+    return None
 
 
 async def _resolve(host: str) -> list[str]:
@@ -113,22 +164,13 @@ class HttpReferenceFetcher:
         organisation details or repository content cannot be sent to a site in a URL, whatever
         a fetched page (an llms.txt, for example) asks for. Path text remains a small channel;
         the length cap bounds it and every requested URL is logged."""
+        code = url_refusal(url, self._hosts, requested=requested)
+        if code is not None:
+            raise ReferenceRefusedError(code)
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
         if requested:
-            if parts.query:
-                raise ReferenceRefusedError("reference_query_not_allowed")
-            if len(url) > MAX_REQUESTED_URL:
-                raise ReferenceRefusedError("reference_url_too_long")
-            if find_secrets(url):
-                raise ReferenceRefusedError("reference_url_contains_secret")
             url = urlunsplit(parts._replace(fragment=""))
-        if parts.scheme != "https" or not host or parts.username or parts.password:
-            raise ReferenceRefusedError("reference_url_not_allowed")
-        if parts.port not in (None, 443):
-            raise ReferenceRefusedError("reference_url_not_allowed")
-        if not host_allowed(host, self._hosts):
-            raise ReferenceRefusedError("reference_domain_not_allowed")
         try:
             addresses = await self._resolve(host)
         except OSError:
@@ -136,8 +178,7 @@ class HttpReferenceFetcher:
         if not addresses:
             raise ReferenceRefusedError("reference_unresolvable")
         for address in addresses:
-            ip = ipaddress.ip_address(address.split("%")[0])
-            if not ip.is_global or ip.is_multicast:
+            if not address_is_public(ipaddress.ip_address(address.split("%")[0])):
                 raise ReferenceRefusedError("reference_address_not_public")
         return url
 

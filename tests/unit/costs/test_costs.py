@@ -509,28 +509,43 @@ async def test_usage_streamed_before_a_failure_is_recorded_and_charged() -> None
     assert guard.spent == D("0.012")
 
 
-async def test_a_replayed_accounting_event_neither_double_counts_nor_erases_the_first_row() -> None:
-    store, a = MemoryStore(), uuid.uuid4()
+class AcceptingStore:
+    """Records every add and accepts it: no dedupe, so the test sees what the tracker sends."""
+
+    def __init__(self) -> None:
+        self.added: list[LlmCallRecord] = []
+
+    async def add(self, record: LlmCallRecord) -> bool:
+        self.added.append(record)
+        return True
+
+
+async def test_a_replayed_accounting_event_is_handed_to_the_ledger_which_owns_the_dedupe() -> None:
+    """The tracker does no cross-handler dedupe: a resumed phase run builds new handlers, so a
+    replayed provider message reaches the store again under a new call id with its provider
+    message id intact. The PostgreSQL ledger refuses it on uq_llm_usage_records_provider_message_id
+    (tests/integration/test_usage_ledger_db.py::test_the_ledger_is_idempotent_append_only_and_
+    survives_restarts); this pins the tracker side of that contract."""
+    store, a = AcceptingStore(), uuid.uuid4()
     tracker = UsageTracker(
         store, PriceTable(), provider="anthropic", model=HAIKU, phase_budget_usd=D("1")
     )
     thread = f"attempt:{a}:planning:run1"
     first = tracker.handlers(thread)[-1]
-    assert isinstance(first, UsageCallbackHandler)
+    again = tracker.handlers(thread)[-1]  # the resumed run
+    assert isinstance(first, UsageCallbackHandler) and isinstance(again, UsageCallbackHandler)
+    assert again is not first
     await first.on_llm_end(
         result(anthropic_message(100_000, 0, msg_id="msg_dup")), run_id=uuid.uuid4()
     )
-    (original,) = store.records
-    # a resumed phase run builds new handlers; the same provider message arrives again under a
-    # new run id, this time with different counts
-    again = tracker.handlers(thread)[-1]
-    assert isinstance(again, UsageCallbackHandler)
     await again.on_llm_end(
         result(anthropic_message(999_999, 999_999, msg_id="msg_dup")), run_id=uuid.uuid4()
     )
-    assert store.records == [original]
+    original, replayed = store.added
+    assert original.provider_message_id == replayed.provider_message_id == "msg_dup"
+    assert original.call_id != replayed.call_id  # only the provider message id can dedupe it
+    assert original.attempt_id == replayed.attempt_id == a
     assert original.usage == TokenUsage(100_000, 0) and original.cost_usd == D("0.01")
-    assert totals(store.records).cost == D("0.01")
 
 
 async def test_an_error_after_usage_was_recorded_keeps_the_recorded_usage() -> None:
