@@ -8,22 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from ai_code_change_agent.application.artifacts.errors import (
-    ArtifactIntegrityError,
-    ArtifactNotFoundError,
-    ArtifactStorageError,
-    ArtifactTooLargeError,
+from ai_code_change_agent.application.artifacts.errors import ArtifactStorageError
+from ai_code_change_agent.application.artifacts.models import (
+    ArtifactKind,
+    ArtifactMeta,
+    ArtifactScope,
 )
-from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.execution.artifacts import (
     LocalFilesystemArtifactStore,
     ensure_private_root,
 )
+from tests.support.artifact_contract import LIMIT, ArtifactStoreContract
 
 K = ArtifactKind
 SCOPE = ArtifactScope(uuid.uuid4(), uuid.uuid4())
-OTHER_ATTEMPT = ArtifactScope(SCOPE.request_id, uuid.uuid4())
-OTHER_REQUEST = ArtifactScope(uuid.uuid4(), SCOPE.attempt_id)
 
 
 @pytest.fixture
@@ -33,33 +31,51 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def store(root: Path) -> LocalFilesystemArtifactStore:
-    return LocalFilesystemArtifactStore(root, max_artifact_bytes=1024)
+    return LocalFilesystemArtifactStore(root, max_artifact_bytes=LIMIT)
 
 
 def files_of(root: Path, scope: ArtifactScope = SCOPE) -> Path:
     return root / str(scope.request_id) / str(scope.attempt_id)
 
 
-async def test_store_and_retrieve_with_metadata(store: LocalFilesystemArtifactStore) -> None:
-    meta = await store.put(
-        SCOPE, K.IMPLEMENTATION_PLAN, b'{"a":1}', redactions=2, redaction_version="9"
-    )
-    assert meta.id.startswith("art_") and len(meta.id) == 36 and meta.size == 7
-    assert (meta.redactions, meta.redaction_version, meta.kind) == (2, "9", K.IMPLEMENTATION_PLAN)
-    assert await store.get(SCOPE, meta.id) == b'{"a":1}'
-    assert await store.meta(SCOPE, meta.id) == meta
-    assert await store.exists(SCOPE, meta.id)
-    assert (await store.verify(SCOPE, meta.id)) == meta
-    assert await store.list(SCOPE) == [meta]
+class FilesystemBackdoor:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def _replace(self, path: Path, data: bytes) -> None:
+        path.chmod(0o600)
+        path.write_bytes(data)
+
+    def replace_blob(self, meta: ArtifactMeta, data: bytes) -> None:
+        self._replace(files_of(self._root, meta.scope) / f"{meta.id}.blob", data)
+
+    def replace_meta(self, meta: ArtifactMeta, raw: bytes) -> None:
+        self._replace(files_of(self._root, meta.scope) / f"{meta.id}.meta.json", raw)
+
+    def remove_meta(self, meta: ArtifactMeta) -> None:
+        path = files_of(self._root, meta.scope) / f"{meta.id}.meta.json"
+        path.chmod(0o600)
+        path.unlink()
+
+    def copy_to_scope(self, meta: ArtifactMeta, other: ArtifactScope) -> None:
+        target = files_of(self._root, other)
+        target.parent.mkdir(exist_ok=True, mode=0o700)
+        target.mkdir(mode=0o700)
+        for suffix in (".blob", ".meta.json"):
+            source = files_of(self._root, meta.scope) / f"{meta.id}{suffix}"
+            (target / f"{meta.id}{suffix}").write_bytes(source.read_bytes())
+
+    def add_unrelated(self, scope: ArtifactScope) -> None:
+        (files_of(self._root, scope) / "notes.txt").write_text("ignored")
 
 
-async def test_every_put_gets_a_new_opaque_id_and_nothing_is_overwritten(
-    store: LocalFilesystemArtifactStore,
-) -> None:
-    a = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"same")
-    b = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"same")
-    assert a.id != b.id and a.sha256 == b.sha256
-    assert await store.get(SCOPE, a.id) == await store.get(SCOPE, b.id) == b"same"
+@pytest.fixture
+def backdoor(root: Path) -> FilesystemBackdoor:
+    return FilesystemBackdoor(root)
+
+
+class TestFilesystemStoreContract(ArtifactStoreContract):
+    """The shared adapter behaviour (tests/support/artifact_contract.py) on the local filesystem."""
 
 
 async def test_stored_files_are_private_and_read_only(
@@ -71,91 +87,6 @@ async def test_stored_files_are_private_and_read_only(
     for suffix in (".blob", ".meta.json"):
         mode = stat.S_IMODE(os.stat(files_of(root) / f"{meta.id}{suffix}").st_mode)
         assert mode == 0o400
-
-
-async def test_tampered_blob_is_detected_on_every_read(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    meta = await store.put(SCOPE, K.CHANGESET, b"original")
-    blob = files_of(root) / f"{meta.id}.blob"
-    blob.chmod(0o600)
-    blob.write_bytes(b"tampered")
-    for call in (store.get, store.verify):
-        with pytest.raises(ArtifactIntegrityError):
-            await call(SCOPE, meta.id)
-
-
-async def test_same_size_tamper_is_detected_by_the_hash(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    meta = await store.put(SCOPE, K.CHANGESET, b"original")
-    blob = files_of(root) / f"{meta.id}.blob"
-    blob.chmod(0o600)
-    blob.write_bytes(b"0riginal")  # same length
-    with pytest.raises(ArtifactIntegrityError):
-        await store.get(SCOPE, meta.id)
-
-
-async def test_corrupt_metadata_fails_closed(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    meta = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"x")
-    path = files_of(root) / f"{meta.id}.meta.json"
-    path.chmod(0o600)
-    path.write_text("{not json")
-    with pytest.raises(ArtifactIntegrityError, match="artifact_metadata_invalid"):
-        await store.meta(SCOPE, meta.id)
-
-
-async def test_artifacts_are_invisible_outside_their_request_and_attempt(
-    store: LocalFilesystemArtifactStore,
-) -> None:
-    meta = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"secret-plan")
-    for other in (OTHER_ATTEMPT, OTHER_REQUEST):
-        with pytest.raises(ArtifactNotFoundError):
-            await store.get(other, meta.id)
-        with pytest.raises(ArtifactNotFoundError):
-            await store.meta(other, meta.id)
-        assert not await store.exists(other, meta.id)
-        assert await store.list(other) == []
-
-
-async def test_a_copied_artifact_does_not_authenticate_in_another_scope(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    meta = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"x")
-    other = files_of(root, OTHER_ATTEMPT)
-    other.parent.mkdir(exist_ok=True, mode=0o700)
-    other.mkdir(mode=0o700)
-    for suffix in (".blob", ".meta.json"):
-        (other / f"{meta.id}{suffix}").write_bytes(
-            (files_of(root) / f"{meta.id}{suffix}").read_bytes()
-        )
-    with pytest.raises(ArtifactNotFoundError):  # metadata names the original scope
-        await store.get(OTHER_ATTEMPT, meta.id)
-
-
-@pytest.mark.parametrize(
-    "bad_id",
-    [
-        "../x",
-        "art_../../etc/passwd",
-        "art_" + "g" * 32,
-        "art_" + "0" * 31,
-        "",
-        "/etc/passwd",
-        "ART_" + "0" * 32,
-        "art_" + "0" * 32 + "/..",
-    ],
-)
-async def test_malformed_ids_cannot_name_a_path(
-    store: LocalFilesystemArtifactStore, bad_id: str
-) -> None:
-    await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"x")
-    for call in (store.get, store.meta, store.verify):
-        with pytest.raises(ArtifactNotFoundError):
-            await call(SCOPE, bad_id)
-    assert not await store.exists(SCOPE, bad_id)
 
 
 async def test_a_symlinked_blob_is_refused_not_followed(
@@ -183,37 +114,6 @@ async def test_a_symlinked_scope_directory_is_refused(
     with pytest.raises(ArtifactStorageError):
         await store.put(victim, K.IMPLEMENTATION_PLAN, b"x")
     assert list(target.iterdir()) == []  # nothing was written through the link
-
-
-async def test_size_limit_is_enforced_on_write(store: LocalFilesystemArtifactStore) -> None:
-    with pytest.raises(ArtifactTooLargeError):
-        await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"x" * 1025)
-    assert await store.list(SCOPE) == []
-
-
-async def test_list_is_ordered_and_ignores_unrelated_files(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    a = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"a")
-    b = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"b")
-    (files_of(root) / "notes.txt").write_text("ignored")
-    assert [m.id for m in await store.list(SCOPE)] == [a.id, b.id]
-
-
-async def test_concurrent_puts_get_distinct_ids(store: LocalFilesystemArtifactStore) -> None:
-    metas = await asyncio.gather(*(store.put(SCOPE, K.VALIDATION_EVIDENCE, b"e") for _ in range(8)))
-    assert len({m.id for m in metas}) == 8
-
-
-async def test_blob_without_metadata_is_an_unreferenced_orphan(
-    store: LocalFilesystemArtifactStore, root: Path
-) -> None:
-    meta = await store.put(SCOPE, K.IMPLEMENTATION_PLAN, b"x")
-    (files_of(root) / f"{meta.id}.meta.json").chmod(0o600)
-    (files_of(root) / f"{meta.id}.meta.json").unlink()
-    with pytest.raises(ArtifactNotFoundError):
-        await store.get(SCOPE, meta.id)
-    assert await store.list(SCOPE) == []
 
 
 # ---- root validation
