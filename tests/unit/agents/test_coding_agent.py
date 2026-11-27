@@ -1,9 +1,17 @@
 """The coding agent: phase/sandbox pairing, structured output and error mapping (scripted model)."""
 
+import uuid
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
+import httpx2
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatResult
+from langchain_core.tools import tool
 
 from ai_code_change_agent.agents.coding.agent import AgentRunError, CodingAgent
 from ai_code_change_agent.agents.coding.configuration import AgentPhase, StoryContext
@@ -14,9 +22,13 @@ from ai_code_change_agent.agents.coding.prompts import (
     planning_task,
 )
 from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
+from ai_code_change_agent.application.costs.pricing import PriceTable, TokenUsage
+from ai_code_change_agent.application.costs.report import totals
+from ai_code_change_agent.application.costs.usage import BudgetGuard, UsageTracker
 from ai_code_change_agent.execution.docker.sandbox import DockerSandbox, SandboxLimits
-from tests.support.models import ScriptedChatModel, call
+from tests.support.models import ScriptedChatModel, anthropic_over_fake_http, call
 from tests.support.workflow import PLAN
+from tests.unit.costs.test_costs import MemoryStore
 
 STORY = StoryContext(
     "SHOP-1",
@@ -250,3 +262,187 @@ def test_repository_dependencies_render_only_when_present() -> None:
         "fastapi>=0.115, pytest>=8.3." in with_deps
     )
     assert "uv.lock, pyproject.toml, requirements*.txt" in PLANNING_SYSTEM
+
+
+# ---- provider failures, tool failures and the cost guard during a run ----------------------
+
+SECRET_KEY = "sk-ant-test-not-a-real-key"
+
+
+def anthropic_model(**kw: object) -> BaseChatModel:
+    from ai_code_change_agent.core.config import Settings
+    from ai_code_change_agent.providers.llm.factory import build_chat_model
+
+    settings = Settings(
+        _env_file=None,
+        llm_model="claude-haiku-5-5",
+        anthropic_api_key=SECRET_KEY,
+        llm_max_retries=2,
+        **kw,  # type: ignore[arg-type]
+    )
+    return build_chat_model(settings)
+
+
+def ledger(budget: str = "1") -> tuple[MemoryStore, UsageTracker, str]:
+    store = MemoryStore()
+    tracker = UsageTracker(
+        store,
+        PriceTable(),
+        provider="anthropic",
+        model="claude-haiku-5-5",
+        phase_budget_usd=Decimal(budget),
+    )
+    return store, tracker, f"attempt:{uuid.uuid4()}:planning:run1"
+
+
+def priced(message: AIMessage, msg_id: str, model: str = "claude-sonnet-5-5") -> AIMessage:
+    message.response_metadata = {
+        "id": msg_id,
+        "model": model,
+        "usage": {"input_tokens": 1000, "output_tokens": 1000},  # Sonnet: $0.012
+    }
+    return message
+
+
+def model_calls(model: ScriptedChatModel) -> int:
+    return sum(1 for prompt in model.seen if prompt)  # empty entries mark tool binding
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "code", "requests"),
+    [
+        (429, "rate_limit_error", "agent_error_anthropicratelimiterror", 3),
+        (401, "authentication_error", "agent_error_anthropicauthenticationerror", 1),
+        (403, "permission_error", "agent_error_anthropicpermissiondeniederror", 1),
+    ],
+)
+async def test_provider_http_failures_end_the_run_with_a_fixed_non_secret_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    error_type: str,
+    code: str,
+    requests: int,
+) -> None:
+    body = {"type": "error", "error": {"type": error_type, "message": "invalid x-api-key"}}
+    received = anthropic_over_fake_http(monkeypatch, lambda _: httpx2.Response(status, json=body))
+    store, tracker, thread = ledger()
+    with pytest.raises(AgentRunError) as err:
+        await CodingAgent(anthropic_model(), callbacks=tracker.handlers).plan(
+            STORY, sandbox(tmp_path, False), thread_id=thread
+        )
+    assert err.value.code == code and str(err.value) == code
+    assert SECRET_KEY not in code and "x-api-key" not in code
+    # rate limits: LLM_MAX_RETRIES (2) retries inside the SDK, then stop; auth: never retried,
+    # and the agent does not start another model call after the provider gave up
+    assert len(received) == requests
+    (failed,) = store.records  # one agent-level model call: recorded once, cost unknown
+    assert not failed.succeeded and failed.usage is None and failed.cost_usd is None
+    assert failed.error_code is not None and SECRET_KEY not in failed.error_code
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx2.Response(200, content=b"<html>bad gateway</html>"),  # not JSON at all
+        httpx2.Response(200, json={"unexpected": "shape"}),  # JSON, not a Messages response
+    ],
+)
+async def test_a_malformed_provider_response_is_a_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, response: httpx2.Response
+) -> None:
+    received = anthropic_over_fake_http(monkeypatch, lambda _: response)
+    store, tracker, thread = ledger()
+    with pytest.raises(AgentRunError) as err:
+        await CodingAgent(anthropic_model(), callbacks=tracker.handlers).plan(
+            STORY, sandbox(tmp_path, False), thread_id=thread
+        )
+    assert err.value.code.startswith("agent_error_") and len(err.value.code) <= 64
+    assert "html" not in err.value.code and "unexpected" not in err.value.code
+    assert len(received) == 1  # a 200 is not retried
+    assert [r.succeeded for r in store.records] == [False]
+    assert store.records[0].cost_usd is None
+
+
+async def test_a_tool_that_raises_fails_the_run_with_a_fixed_code_and_no_internals(
+    tmp_path: Path,
+) -> None:
+    @tool
+    def fetch_reference(url: str) -> str:
+        """Fetch allow-listed documentation."""
+        raise RuntimeError("boom at /srv/worker/internal token=abc123")
+
+    model = ScriptedChatModel(
+        script=[
+            call("fetch_reference", {"url": "https://docs.python.org/3/"}, 1),
+            call("ImplementationPlan", PLAN.model_dump(), 2),
+        ]
+    )
+    agent = CodingAgent(model, tools=lambda _thread: [fetch_reference])
+    with pytest.raises(AgentRunError) as err:
+        await agent.plan(STORY, sandbox(tmp_path, False), thread_id="t")
+    # the SDK's tool node re-raises unexpected tool exceptions: the run fails (no plan is
+    # accepted) and only the exception type reaches the code
+    assert err.value.code == "agent_error_runtimeerror"
+    assert "token" not in str(err.value) and "/srv" not in str(err.value)
+    assert model_calls(model) == 1  # the model was not called again after the crash
+
+
+async def test_the_cost_guard_stops_the_run_even_while_output_retries_remain(
+    tmp_path: Path,
+) -> None:
+    from ai_code_change_agent.agents.coding.configuration import CodingAgentConfig
+
+    store, tracker, thread = ledger(budget="0.001")
+    # every answer is an invalid plan (the structured-output retry would allow 3) and costs $0.012
+    model = ScriptedChatModel(
+        script=[
+            priced(call("ImplementationPlan", {"summary": "s"}, i), f"msg_{i}") for i in range(9)
+        ]
+    )
+    agent = CodingAgent(model, CodingAgentConfig(max_model_calls=20), callbacks=tracker.handlers)
+    with pytest.raises(AgentRunError, match="agent_cost_budget_exceeded"):
+        await agent.plan(STORY, sandbox(tmp_path, False), thread_id=thread)
+    assert model_calls(model) == 1  # the retry was refused before it reached the provider
+    (record,) = store.records  # the refused call is not a provider call: nothing recorded
+    assert record.succeeded and record.cost_usd == Decimal("0.012")
+    assert not tracker.search_allowed(thread)
+
+
+async def test_a_provider_error_after_a_priced_call_keeps_the_recorded_usage(
+    tmp_path: Path,
+) -> None:
+    class FailsOnSecondCall(ScriptedChatModel):
+        def _generate(self, messages: list[BaseMessage], *a: Any, **k: Any) -> ChatResult:
+            if model_calls(self) >= 1:
+                self.seen.append(list(messages))
+                raise ConnectionError("upstream reset")
+            return super()._generate(messages, *a, **k)
+
+    @tool
+    def fetch_reference(url: str) -> str:
+        """Fetch allow-listed documentation."""
+        return "docs"
+
+    store, tracker, thread = ledger()
+    built: list[BaseCallbackHandler] = []
+
+    def callbacks(thread_id: str) -> list[BaseCallbackHandler]:
+        handlers = list(tracker.handlers(thread_id))
+        built.extend(handlers)
+        return handlers
+
+    model = FailsOnSecondCall(
+        script=[priced(call("fetch_reference", {"url": "https://docs.python.org/3/"}, 1), "msg_1")]
+    )
+    agent = CodingAgent(model, tools=lambda _thread: [fetch_reference], callbacks=callbacks)
+    with pytest.raises(AgentRunError, match="agent_error_connectionerror"):
+        await agent.plan(STORY, sandbox(tmp_path, False), thread_id=thread)
+    ok, failed = store.records
+    assert ok.succeeded and ok.provider_message_id == "msg_1"
+    assert ok.usage == TokenUsage(1000, 1000) and ok.cost_usd == Decimal("0.012")
+    assert not failed.succeeded and failed.usage is None and failed.cost_usd is None
+    guard = next(h for h in built if isinstance(h, BudgetGuard))
+    assert guard.spent == Decimal("0.012")  # the error did not reset or add to the spend
+    t = totals(store.records)
+    assert t.cost == Decimal("0.012") and not t.complete

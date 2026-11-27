@@ -1,8 +1,12 @@
-"""A scripted, tool-calling chat model for agent tests (no provider, no network)."""
+"""A scripted, tool-calling chat model for agent tests (no provider, no network), and a fake
+HTTP layer for the real provider clients."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
+import anthropic
+import httpx2
+import pytest
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
@@ -39,3 +43,25 @@ class ScriptedChatModel(BaseChatModel):
 
 def call(name: str, args: dict[str, Any], i: int) -> AIMessage:
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": f"call_{i}"}])
+
+
+def anthropic_over_fake_http(
+    monkeypatch: pytest.MonkeyPatch, respond: Callable[[httpx2.Request], httpx2.Response]
+) -> list[httpx2.Request]:
+    """Routes every ChatAnthropic request through `respond` instead of the network. The real
+    Anthropic SDK client (and its retry policy) stays in place; only its backoff wait is zero, so
+    retries do not sleep. Returns the list of requests the provider "received"."""
+    import langchain_anthropic.chat_models as chat_models
+
+    received: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        received.append(request)
+        return respond(request)
+
+    def client(**_: Any) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+
+    monkeypatch.setattr(chat_models, "_get_default_async_httpx_client", client)
+    monkeypatch.setattr(anthropic.AsyncAnthropic, "_calculate_retry_timeout", lambda *_a, **_k: 0.0)
+    return received
