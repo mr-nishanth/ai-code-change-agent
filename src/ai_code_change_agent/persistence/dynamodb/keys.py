@@ -122,12 +122,16 @@ def attempt_gsi2(created_at: datetime, attempt_id: Id) -> dict[str, str]:
     return {"GSI2PK": GSI_LIST_ATTEMPT, "GSI2SK": _join(_ts(created_at), _id(attempt_id))}
 
 
+def attempt_pk(attempt_id: Id) -> str:
+    return _join("ATTEMPT", _id(attempt_id))
+
+
 def attempt_pointer(attempt_id: Id) -> Key:
-    return Key(_join("ATTEMPT", _id(attempt_id)), SK_POINTER)
+    return Key(attempt_pk(attempt_id), SK_POINTER)
 
 
 def agent_thread(attempt_id: Id, thread_id: str) -> Key:
-    return Key(_join("ATTEMPT", _id(attempt_id)), SK_THREAD + _last(thread_id))
+    return Key(attempt_pk(attempt_id), SK_THREAD + _last(thread_id))
 
 
 def active_attempt_guard(request_id: Id, repository_id: Id) -> Key:

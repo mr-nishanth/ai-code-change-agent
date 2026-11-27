@@ -7,6 +7,7 @@ from typing import Self
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_code_change_agent.application.changes.ports import AttemptListing
 from ai_code_change_agent.domain.changes.errors import ChangeConflictError
 from ai_code_change_agent.domain.changes.models import (
     Approval,
@@ -186,6 +187,27 @@ class SqlChangeStore:
             )
         ).scalars()
         return [_approval(m) for m in rows]
+
+    async def list_recent_attempts(self, limit: int) -> list[AttemptListing]:
+        rows = (
+            await self._s.execute(
+                select(CodeChangeAttemptModel)
+                .order_by(CodeChangeAttemptModel.created_at.desc())
+                .limit(max(limit, 0))
+            )
+        ).scalars()
+        return [AttemptListing(_attempt(m), m.created_at, m.updated_at) for m in rows]
+
+    async def get_attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing | None:
+        m = await self._s.get(CodeChangeAttemptModel, attempt_id)
+        return AttemptListing(_attempt(m), m.created_at, m.updated_at) if m else None
+
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        """No thread index here: the studio reads only the DynamoDB store (S2116 Task 11), and
+        this adapter is retired when the composition switches to DynamoDB."""
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        return []
 
 
 class SqlChangeUnitOfWork:

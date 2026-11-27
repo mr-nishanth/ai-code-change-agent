@@ -91,3 +91,20 @@ async def test_unknown_ids_and_lost_updates_are_refused() -> None:
     await svc.transition(att.id, S.PREPARING)
     with pytest.raises(ChangeConflictError):
         await m.uow().store.update_attempt(stale, expected_version=stale.row_version)
+
+
+async def test_studio_reads_listings_and_agent_threads() -> None:
+    m = MemoryChanges()
+    svc = m.service()
+    req = m.add_request(repository_id=uuid.uuid4(), profile_version_id=uuid.uuid4())
+    att = await svc.start_attempt(req.id)
+    assert [x.attempt.id for x in await svc.recent_attempts(5)] == [att.id]
+    assert (await svc.attempt_listing(att.id)).attempt == att
+    with pytest.raises(ChangeNotFoundError):
+        await svc.attempt_listing(uuid.uuid4())
+    thread = f"attempt:{att.id}:planning:00000000"
+    await svc.record_agent_thread(att.id, thread)
+    await svc.record_agent_thread(att.id, thread)
+    assert await svc.agent_threads(att.id) == [thread]
+    with pytest.raises(ValueError, match="does not belong"):
+        await svc.record_agent_thread(att.id, "attempt:other:planning:00000000")

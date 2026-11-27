@@ -7,8 +7,7 @@ import subprocess
 
 import pytest
 
-from tests.support.dynamo import app_table  # noqa: F401 - fixture
-from tests.support.floci import FLOCI_ENDPOINT, floci_reachable
+from tests.support.dynamo import app_table, floci  # noqa: F401 - fixtures
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -20,14 +19,6 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 @pytest.fixture(autouse=True)
 def clean_db() -> None:
     """Overrides the integration suite's autouse fixture: Floci tests never touch PostgreSQL."""
-
-
-@pytest.fixture(scope="session")
-def floci() -> str:
-    reason = floci_reachable()
-    if reason is not None:
-        pytest.skip(reason)
-    return FLOCI_ENDPOINT
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess[str]:

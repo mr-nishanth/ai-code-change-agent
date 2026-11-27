@@ -1,6 +1,8 @@
 """Persistence ports for code change requests, attempts and approvals."""
 
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from types import TracebackType
 from typing import Protocol, Self
 
@@ -9,6 +11,15 @@ from ai_code_change_agent.domain.changes.models import (
     CodeChangeAttempt,
     CodeChangeRequest,
 )
+
+
+@dataclass(frozen=True)
+class AttemptListing:
+    """An attempt with the times the store recorded (studio listings and headers)."""
+
+    attempt: CodeChangeAttempt
+    created_at: datetime
+    updated_at: datetime
 
 
 class ChangeStore(Protocol):
@@ -25,6 +36,21 @@ class ChangeStore(Protocol):
 
     async def add_approval(self, approval: Approval) -> None: ...
     async def list_approvals(self, attempt_id: uuid.UUID) -> list[Approval]: ...
+
+    # Studio (dev only, read-mostly) ------------------------------------------------------------
+    async def list_recent_attempts(self, limit: int) -> list[AttemptListing]:
+        """At most `limit` attempts, newest first (eventually consistent: may lag a write)."""
+        ...
+
+    async def get_attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing | None: ...
+
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        """Index the checkpoint thread of one agent run under its attempt; idempotent."""
+        ...
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        """The indexed thread ids of the attempt, oldest run first."""
+        ...
 
 
 class ChangeUnitOfWork(Protocol):

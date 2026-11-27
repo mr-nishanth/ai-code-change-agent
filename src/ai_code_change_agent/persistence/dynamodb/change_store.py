@@ -16,6 +16,10 @@ Items (DYNAMODB-DATA-MODEL.md 4, one item collection per Story, `PK = REQ#<rid>`
   (replaces the partial unique index): created with the attempt, deleted in the transaction that
   makes it terminal.
 - `REQ#<rid>/APR#<aid>#<decided_at>#<approval_id>`: append-only approvals, sorted by decision time.
+- `ATTEMPT#<aid>/THREAD#<thread_id>`: one per agent run (L3), written when the run starts, so the
+  studio finds an attempt's checkpoint threads (the checkpoint table has no thread-prefix query).
+
+The studio's attempt list (S1) is GSI2 `LIST#ATTEMPT`, newest first (eventually consistent).
 
 Attempt numbers are allocated under the request's `row_version` (`add_attempt` bumps it), so two
 attempts of one request never share a number. Nothing but an ACTIVE guard is ever deleted (C11)."""
@@ -24,6 +28,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Self
 
+from ai_code_change_agent.application.changes.ports import AttemptListing
 from ai_code_change_agent.domain.changes.errors import (
     ActiveAttemptError,
     ChangeConflictError,
@@ -51,6 +56,7 @@ from ai_code_change_agent.persistence.dynamodb.errors import CorruptItemError, F
 from ai_code_change_agent.persistence.dynamodb.table import Table
 from ai_code_change_agent.persistence.dynamodb.transactions import VERSION, DynamoUnitOfWork
 
+GSI2 = "GSI2"
 _TERMINAL_VALUES = tuple(sorted(status.value for status in TERMINAL))
 _OPTIONAL_ATTEMPT_FIELDS = (
     "base_commit_sha",
@@ -114,6 +120,14 @@ def _attempt(item: Item) -> CodeChangeAttempt:
         repair_count=decode_int(item.get("repair_count"), "repair_count"),
         failure_code=_opt_str(item, "failure_code"),
         row_version=decode_int(item.get(VERSION), VERSION),
+    )
+
+
+def _listing(item: Item) -> AttemptListing:
+    return AttemptListing(
+        _attempt(item),
+        decode_timestamp(item.get("created_at"), "created_at"),
+        decode_timestamp(item.get("updated_at"), "updated_at"),
     )
 
 
@@ -379,6 +393,49 @@ class DynamoChangeStore:
             return []
         rows = await self._u.query(keys.request_pk(request_id), keys.approval_prefix(attempt_id))
         return [_approval(row) for row in rows]
+
+    # Studio: S1, S3, L3 ------------------------------------------------------------------
+    async def list_recent_attempts(self, limit: int) -> list[AttemptListing]:
+        """S1: GSI2 `LIST#ATTEMPT`, descending by creation time (eventually consistent)."""
+        if limit < 1:
+            return []
+        rows = await self._u.table.query(
+            index=GSI2,
+            key_condition="GSI2PK = :pk",
+            values={":pk": keys.GSI_LIST_ATTEMPT},
+            forward=False,
+            limit=limit,
+            page_size=limit,
+        )
+        return [_listing(row) for row in rows]
+
+    async def get_attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing | None:
+        item = await self._attempt_item(attempt_id, depend=False)
+        return _listing(item) if item is not None else None
+
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        """L3: `ATTEMPT#<aid>/THREAD#<thread_id>`, created once (a second call changes nothing)."""
+        if await self._request_id(attempt_id) is None:
+            raise ChangeNotFoundError("attempt_not_found")
+        key = keys.agent_thread(attempt_id, thread_id)
+        if await self._u.get(key, depend=False) is not None:
+            return
+        self._u.create(
+            {
+                **key.as_dict(),
+                "entity": "agent_thread",
+                "attempt_id": str(attempt_id),
+                "thread_id": thread_id,
+                "started_at": self._now(),
+            },
+            on_exists=ConcurrentModificationError(),  # a racing writer: the retry sees it
+        )
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        """L3: `begins_with(SK, 'THREAD#')` on `ATTEMPT#<aid>`, ordered by run start."""
+        rows = await self._u.query(keys.attempt_pk(attempt_id), keys.SK_THREAD)
+        runs = sorted((_str(row, "started_at"), _str(row, "thread_id")) for row in rows)
+        return [thread_id for _, thread_id in runs]
 
 
 class DynamoChangeUnitOfWork(DynamoUnitOfWork):

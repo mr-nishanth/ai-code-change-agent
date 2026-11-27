@@ -10,7 +10,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 
-from ai_code_change_agent.application.changes.ports import ChangeUnitOfWork
+from ai_code_change_agent.application.changes.ports import AttemptListing, ChangeUnitOfWork
 from ai_code_change_agent.application.retry import Sleep, retry_concurrent
 from ai_code_change_agent.domain.changes.errors import (
     ActiveAttemptError,
@@ -55,6 +55,31 @@ class CodeChangeService:
     async def approvals(self, attempt_id: uuid.UUID) -> list[Approval]:
         async with self._uow() as uow:
             return await uow.store.list_approvals(attempt_id)
+
+    async def recent_attempts(self, limit: int) -> list[AttemptListing]:
+        """Newest first, at most `limit` (studio listing, eventually consistent)."""
+        async with self._uow() as uow:
+            return await uow.store.list_recent_attempts(limit)
+
+    async def attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing:
+        async with self._uow() as uow:
+            listing = await uow.store.get_attempt_listing(attempt_id)
+        if listing is None:
+            raise ChangeNotFoundError("attempt_not_found")
+        return listing
+
+    @retry_concurrent
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        """Index an agent run's checkpoint thread (`attempt:<aid>:...`) under its attempt."""
+        if not thread_id.startswith(f"attempt:{attempt_id}:"):
+            raise ValueError("thread id does not belong to the attempt")
+        async with self._uow() as uow:
+            await uow.store.record_agent_thread(attempt_id, thread_id)
+            await uow.commit()
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        async with self._uow() as uow:
+            return await uow.store.agent_threads(attempt_id)
 
     @retry_concurrent
     async def assign_repository(

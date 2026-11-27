@@ -15,7 +15,7 @@ import pytest
 from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.persistence.dynamodb import Table
-from tests.support.floci import unique_name
+from tests.support.floci import FLOCI_ENDPOINT, floci_reachable, unique_name
 
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "infra" / "floci" / "schema"
 
@@ -36,6 +36,15 @@ def create_table(client: Any, schema_name: str = "acca-app") -> str:
         TableName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 30}
     )
     return name
+
+
+@pytest.fixture(scope="session")
+def floci() -> str:
+    """The Floci endpoint; every test that uses it is a SKIP with a reason when Floci is down."""
+    reason = floci_reachable()
+    if reason is not None:
+        pytest.skip(reason)
+    return FLOCI_ENDPOINT
 
 
 @pytest.fixture

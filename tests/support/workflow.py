@@ -99,11 +99,13 @@ class FakeAgent:
     def __init__(self) -> None:
         self.edits: list[dict[str, bytes]] = [{"app/greeting.py": GOOD}]
         self.feedback: list[str | None] = []
+        self.threads: list[str] = []
 
     async def plan(
         self, story: StoryContext, sandbox: Any, *, thread_id: str, checkpointer: Any = None
     ) -> ImplementationPlan:
         assert not sandbox.writable and story.base_commit_sha == BASE
+        self.threads.append(thread_id)
         return self.plan_result or PLAN
 
     async def implement(
@@ -117,6 +119,7 @@ class FakeAgent:
         checkpointer: Any = None,
     ) -> ImplementationReport:
         assert sandbox.writable
+        self.threads.append(thread_id)
         self.feedback.append(feedback)
         edits = self.edits.pop(0) if len(self.edits) > 1 else self.edits[0]
         for path, data in edits.items():

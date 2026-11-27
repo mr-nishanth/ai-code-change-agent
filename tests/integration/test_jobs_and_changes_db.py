@@ -210,6 +210,17 @@ async def test_the_sql_store_round_trips_the_lifecycle(
     assert query(database_url, "SELECT status FROM code_change_requests") == [("IMPLEMENTING",)]
 
 
+async def test_the_sql_store_lists_attempts_but_keeps_no_thread_index(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    svc, aid = await _attempt(sessions)
+    (listed,) = await svc.recent_attempts(10)
+    assert listed.attempt.id == aid and listed.created_at <= listed.updated_at
+    assert (await svc.attempt_listing(aid)).attempt.id == aid
+    await svc.record_agent_thread(aid, f"attempt:{aid}:planning:00000000")
+    assert await svc.agent_threads(aid) == []  # studio reads only the DynamoDB index
+
+
 async def test_database_guarantees_hold_even_for_direct_sql(
     sessions: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:
