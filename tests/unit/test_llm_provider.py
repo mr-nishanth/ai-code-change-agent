@@ -92,7 +92,10 @@ def test_bedrock_passes_an_optional_named_profile(
 
 
 @pytest.mark.parametrize("env", ["staging", "production"])
-def test_bedrock_is_allowed_in_beta_and_production(env: str) -> None:
+def test_bedrock_is_allowed_in_beta_and_production(
+    env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ACCA_AWS_ENDPOINT_URL")  # real AWS only outside development/test
     settings = bedrock(
         app_env=env,
         database_url="postgresql://x",

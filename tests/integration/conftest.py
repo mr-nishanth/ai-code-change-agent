@@ -7,6 +7,8 @@ import psycopg
 import pytest
 from sqlalchemy.engine import make_url
 
+from tests.conftest import LOCAL_AWS_ENDPOINT
+
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_URL = "postgresql+psycopg://acca:acca_dev_only@127.0.0.1:5435/ai_code_change_agent_test"
 
@@ -16,7 +18,12 @@ def libpq(url: str) -> str:
 
 
 def run_alembic(url: str, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "DATABASE_URL": url, "APP_ENV": "test"}
+    env = {
+        **os.environ,
+        "DATABASE_URL": url,
+        "APP_ENV": "test",
+        "ACCA_AWS_ENDPOINT_URL": LOCAL_AWS_ENDPOINT,  # required by test Settings
+    }
     return subprocess.run(  # noqa: S603
         [sys.executable, "-m", "alembic", *args],
         cwd=ROOT,

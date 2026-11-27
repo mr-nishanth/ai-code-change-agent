@@ -17,7 +17,14 @@ _AMBIENT_AWS = (
     "AWS_ENDPOINT_URL",
     "AWS_CONFIG_FILE",
     "AWS_SHARED_CREDENTIALS_FILE",
+    "ACCA_AWS_REGION",
+    "ACCA_DYNAMODB_TABLE_NAME",
+    "ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME",
+    "ACCA_SQS_JOB_QUEUE_NAME",
+    "ACCA_S3_BUCKET_NAME",
 )
+# development/test Settings require a local AWS endpoint; tests never reach anything else.
+LOCAL_AWS_ENDPOINT = "http://127.0.0.1:4566"
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +35,7 @@ def _isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     for name in _AMBIENT_AWS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ACCA_AWS_ENDPOINT_URL", LOCAL_AWS_ENDPOINT)
 
 
 @pytest.fixture

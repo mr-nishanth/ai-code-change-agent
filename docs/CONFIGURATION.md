@@ -8,7 +8,8 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
   - partial GitHub App or Jira REST configuration is refused;
   - `GITHUB_PR_CREATE_ENABLED` and `JIRA_REPORTING_ENABLED` require their credentials;
   - `JOB_HEARTBEAT_SECONDS` must be at most half of `JOB_LEASE_SECONDS`;
-  - staging and production require `DATABASE_URL`, `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS` and `LLM_PROVIDER=bedrock`.
+  - staging and production require `DATABASE_URL`, `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS` and `LLM_PROVIDER=bedrock`;
+  - development and test require `ACCA_AWS_ENDPOINT_URL` (the local Floci endpoint), staging and production must not set it (see [AWS services](#aws-services-dynamodb-sqs-s3)); both violations raise `ConfigurationError`.
 
 | Variable | Default | Secret | Used by |
 |---|---|---|---|
@@ -54,6 +55,22 @@ Requested names that are **deliberately absent**, because nothing uses them:
 - `DOCKER_HOST`: honoured from the process environment if set, never in settings.
 - `DEEP_AGENT_MAX_ITERATIONS`: the SDK's limit is the recursion limit.
 - `LANGGRAPH_CHECKPOINT_CONFIGURATION`: replaced by `LANGGRAPH_CHECKPOINT_SCHEMA`.
+
+
+## AWS services (DynamoDB, SQS, S3)
+
+These variables carry the `ACCA_` prefix so the standard `AWS_*` variables of a shell (`AWS_PROFILE`, `AWS_REGION`, `AWS_ENDPOINT_URL*`) never configure the application. Clients are built only in `integrations/aws/clients.py` (`AwsClients`: one `boto3` session, clients `dynamodb`, `sqs` and `s3`, `connect_timeout` 5 s, `read_timeout` 60 s, standard retry mode, `ignore_configured_endpoint_urls=True`). Nothing calls them yet.
+
+| Variable | Default | Secret | Notes |
+|---|---|---|---|
+| ACCA_AWS_REGION | us-east-1 | | AWS region name |
+| ACCA_AWS_ENDPOINT_URL | - | | **Required in development and test**, refused in staging and production. Only `http://` on a loopback host (`127.0.0.1`, `localhost`, `[::1]`) or a single-label Docker host name, with an optional port and no path, query or credentials: host processes use `http://127.0.0.1:4566`, containers on the `acca-floci` network `http://acca-floci:4566`. Dotted names (for example `*.amazonaws.com`, `*.amazonaws.com.cn`, `*.api.aws`) are refused, so development and tests can never fall through to real AWS. With it set the clients use the static credentials `test`/`test` and never read the default credential chain, `AWS_PROFILE` or the AWS config files |
+| ACCA_DYNAMODB_TABLE_NAME | acca-local-app | | application table ([DYNAMODB-DATA-MODEL.md](DYNAMODB-DATA-MODEL.md)) |
+| ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME | acca-local-checkpoints | | LangGraph checkpoint table |
+| ACCA_SQS_JOB_QUEUE_NAME | acca-local-jobs | | job queue (standard queue; its URL is resolved once with `GetQueueUrl`) |
+| ACCA_S3_BUCKET_NAME | acca-local-artifacts | | artifact bucket |
+
+Without an endpoint (staging and production) the clients use the process's default AWS credential chain (for example an IAM role). `JOB_LEASE_SECONDS` is capped at 3,600 s, below the SQS visibility-timeout limit of 43,200 s.
 
 
 ## Automated pipeline

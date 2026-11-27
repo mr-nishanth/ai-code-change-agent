@@ -16,6 +16,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "boto3" },
     { name = "deepagents" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -36,7 +37,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "boto3" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -51,6 +51,7 @@ studio = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
+    { name = "boto3", specifier = ">=1.44" },
     { name = "deepagents", specifier = ">=0.7.41" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -71,7 +72,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3", specifier = ">=1.44" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },

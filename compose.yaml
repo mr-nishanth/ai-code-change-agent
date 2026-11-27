@@ -40,6 +40,8 @@ services:
       JIRA_STORY_ISSUE_TYPES: ${JIRA_STORY_ISSUE_TYPES:-Story}
       JIRA_WEBHOOK_EVENT: ${JIRA_WEBHOOK_EVENT:-jira:issue_created}
       JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+      # development/test Settings require a local AWS endpoint (the API does not call AWS yet)
+      ACCA_AWS_ENDPOINT_URL: http://acca-floci:4566
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

@@ -22,6 +22,7 @@ dependencies = [
     "deepagents>=0.7.41",
     "langchain-anthropic>=1.7",
     "langchain-aws>=1.0",
+    "boto3>=1.44",
 ]
 
 [project.scripts]
@@ -35,7 +36,6 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "types-pyyaml>=6.0",
-    "boto3>=1.44",
 ]
 studio = [
     "langgraph-cli[inmem]>=0.4.44",

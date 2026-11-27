@@ -9,16 +9,25 @@ import re
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from ai_code_change_agent.core.errors import ConfigurationError
 from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_reference_sources
 
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 _PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,31}")
 _SCHEMA = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+_AWS_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}")
+_DYNAMODB_TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
+_SQS_QUEUE = re.compile(r"[A-Za-z0-9_-]{1,80}")
+_S3_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+# A local AWS endpoint override (Floci): loopback, or a single-label Docker host (acca-floci).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DOCKER_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}(:[A-Za-z0-9._-]{1,128})?(@sha256:[0-9a-f]{64})?")
 _EMPTY_IS_UNSET = (
     "database_url",
@@ -42,6 +51,7 @@ _EMPTY_IS_UNSET = (
     "workspace_root",
     "artifact_root",
     "workspace_image",
+    "aws_endpoint_url",
 )
 
 
@@ -68,6 +78,25 @@ class Settings(BaseSettings):
     # ---- database ---------------------------------------------------------------------------
     database_url: SecretStr | None = None
     langgraph_checkpoint_schema: str = "langgraph"  # workflow state, separate from domain tables
+
+    # ---- AWS: DynamoDB, SQS and S3 (integrations/aws/clients.py) ------------------------------
+    # ACCA_-prefixed names so the standard AWS_* variables of a shell never configure the app.
+    # development/test must point at the local emulator (Floci); staging/production must not set
+    # an endpoint and use the default AWS credential chain of the process.
+    aws_region: str = Field(default="us-east-1", validation_alias="ACCA_AWS_REGION")
+    aws_endpoint_url: str | None = Field(default=None, validation_alias="ACCA_AWS_ENDPOINT_URL")
+    dynamodb_table_name: str = Field(
+        default="acca-local-app", validation_alias="ACCA_DYNAMODB_TABLE_NAME"
+    )
+    dynamodb_checkpoint_table_name: str = Field(
+        default="acca-local-checkpoints", validation_alias="ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME"
+    )
+    sqs_job_queue_name: str = Field(
+        default="acca-local-jobs", validation_alias="ACCA_SQS_JOB_QUEUE_NAME"
+    )
+    s3_bucket_name: str = Field(
+        default="acca-local-artifacts", validation_alias="ACCA_S3_BUCKET_NAME"
+    )
 
     # ---- Jira (webhook intake, read-only REST, optional outcome comment) ---------------------
     jira_base_url: str | None = None
@@ -183,6 +212,7 @@ class Settings(BaseSettings):
     # actor policy:automatic). manual: an operator decides with `ai-code-change changes approve`.
     workflow_approval_mode: Literal["automatic", "manual"] = "automatic"
     max_concurrent_jobs: int = Field(default=2, ge=1, le=32)
+    # at most 3,600 s, well under the SQS visibility-timeout cap of 43,200 s
     job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     job_heartbeat_seconds: int = Field(default=60, ge=5, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=10)
@@ -224,6 +254,38 @@ class Settings(BaseSettings):
     def _region(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}", value):
             msg = "BEDROCK_REGION must be an AWS region name such as us-east-1"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("aws_region")
+    @classmethod
+    def _aws_region(cls, value: str) -> str:
+        if not _AWS_REGION.fullmatch(value):
+            msg = "ACCA_AWS_REGION must be an AWS region name such as us-east-1"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("dynamodb_table_name", "dynamodb_checkpoint_table_name")
+    @classmethod
+    def _table_name(cls, value: str) -> str:
+        if not _DYNAMODB_TABLE.fullmatch(value):
+            msg = "DynamoDB table names are 3-255 characters of A-Z, a-z, 0-9, '_', '-' and '.'"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("sqs_job_queue_name")
+    @classmethod
+    def _queue_name(cls, value: str) -> str:
+        if not _SQS_QUEUE.fullmatch(value):
+            msg = "ACCA_SQS_JOB_QUEUE_NAME must be a standard SQS queue name (1-80 of A-Za-z0-9_-)"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("s3_bucket_name")
+    @classmethod
+    def _bucket_name(cls, value: str) -> str:
+        if not _S3_BUCKET.fullmatch(value) or ".." in value:
+            msg = "ACCA_S3_BUCKET_NAME must be a lower-case S3 bucket name"
             raise ValueError(msg)
         return value
 
@@ -324,7 +386,34 @@ class Settings(BaseSettings):
             if missing:
                 msg = f"{self.app_env} requires: {', '.join(missing)}"
                 raise ValueError(msg)
+        self._check_aws_endpoint()
         return self
+
+    def _check_aws_endpoint(self) -> None:
+        """The local endpoint guard: an override only in development/test and only to Floci.
+
+        Raised as ConfigurationError (not a validation error) so no caller can mistake a refused
+        endpoint for a typo it may retry with defaults; real AWS is never a silent fallback."""
+        url = self.aws_endpoint_url
+        local = self.app_env in ("development", "test")
+        if url is None:
+            if local:
+                msg = (
+                    f"APP_ENV={self.app_env} requires ACCA_AWS_ENDPOINT_URL (the local Floci"
+                    " endpoint, e.g. http://127.0.0.1:4566); it never falls back to real AWS"
+                )
+                raise ConfigurationError(msg)
+            return
+        if not local:
+            msg = f"APP_ENV={self.app_env} must not set ACCA_AWS_ENDPOINT_URL (real AWS only)"
+            raise ConfigurationError(msg)
+        if not _local_endpoint(url):
+            msg = (
+                "ACCA_AWS_ENDPOINT_URL must be http:// on a loopback host or a single-label"
+                " Docker host name (e.g. http://acca-floci:4566), without path or credentials"
+            )
+            raise ConfigurationError(msg)
+        self.aws_endpoint_url = url.rstrip("/")
 
     # ---- derived --------------------------------------------------------------------------
     @property
@@ -358,6 +447,24 @@ class Settings(BaseSettings):
         if self.llm_provider == "bedrock":
             return self.llm_model is not None and self.bedrock_region is not None
         return self.llm_model is not None and self.anthropic_api_key is not None
+
+
+def _local_endpoint(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+    return (
+        parts.scheme == "http"
+        and not parts.username
+        and not parts.password
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+        and (host in _LOOPBACK_HOSTS or (_DOCKER_HOST.fullmatch(host) is not None))
+    )
 
 
 @lru_cache

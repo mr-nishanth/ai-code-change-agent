@@ -32,8 +32,15 @@ def where(root_module: str) -> set[str]:
 def test_sdk_imports_are_confined() -> None:
     assert where("deepagents") <= {"agents/coding/agent.py", "execution/docker/sandbox.py"}
     assert where("langchain_anthropic") == {"providers/llm/factory.py"}
-    for sdk in ("langchain_aws", "boto3", "botocore"):
-        assert where(sdk) <= {"providers/llm/factory.py"}, sdk
+    assert where("langchain_aws") <= {"providers/llm/factory.py"}
+    for sdk in ("boto3", "botocore"):
+        outside = {
+            p
+            for p in where(sdk)
+            if not p.startswith(("integrations/aws/", "persistence/dynamodb/"))
+        }
+        assert outside <= {"providers/llm/factory.py"}, sdk
+    assert where("langgraph_checkpoint_aws") <= {"orchestration/langgraph/checkpointer.py"}
     assert {p for p in where("langgraph") if not p.startswith("orchestration/")} <= {
         "agents/coding/agent.py"
     }
