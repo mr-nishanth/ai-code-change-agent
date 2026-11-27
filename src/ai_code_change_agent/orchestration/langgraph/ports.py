@@ -6,6 +6,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+# DynamoDBSaver keys every checkpoint item by its thread id; DM 9.2 budgets item metadata for ids
+# under 200 characters, so the payload threshold keeps its headroom under the 400 KB item limit.
+MAX_THREAD_ID_LENGTH = 200
+
+
+def checked_thread_id(thread_id: str) -> str:
+    """`thread_id` unchanged when it is shorter than MAX_THREAD_ID_LENGTH, else ValueError."""
+    if len(thread_id) >= MAX_THREAD_ID_LENGTH:
+        msg = f"thread id is {len(thread_id)} characters; must be under {MAX_THREAD_ID_LENGTH}"
+        raise ValueError(msg)
+    return thread_id
+
 
 class GateState(StrEnum):
     PENDING = "pending"

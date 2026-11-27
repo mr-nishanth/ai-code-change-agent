@@ -23,6 +23,7 @@ dependencies = [
     "langchain-anthropic>=1.7",
     "langchain-aws>=1.0",
     "boto3>=1.44",
+    "langgraph-checkpoint-aws==1.3.0",
 ]
 
 [project.scripts]
@@ -36,6 +37,7 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "types-pyyaml>=6.0",
+    "langgraph-checkpoint-conformance==0.0.2",
 ]
 studio = [
     "langgraph-cli[inmem]>=0.4.44",

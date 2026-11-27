@@ -69,7 +69,11 @@ from ai_code_change_agent.domain.dependencies.policy import (
 from ai_code_change_agent.domain.repositories.command_policy import CommandKind
 from ai_code_change_agent.domain.repositories.models import MappingStatus, RepositoryStatus
 from ai_code_change_agent.domain.repositories.profile import RepositoryProfile
-from ai_code_change_agent.orchestration.langgraph.ports import GateState, StepResult
+from ai_code_change_agent.orchestration.langgraph.ports import (
+    GateState,
+    StepResult,
+    checked_thread_id,
+)
 from ai_code_change_agent.validation.engine import ValidationEngine, ValidationInput
 from ai_code_change_agent.validation.git_inspector import (
     changed_paths,
@@ -444,7 +448,9 @@ class CodeChangeSteps:
                 plan = await self._d.agent.plan(
                     story,
                     sandbox,
-                    thread_id=f"attempt:{a.id}:planning:{uuid.uuid4().hex[:8]}",  # fresh per run
+                    thread_id=checked_thread_id(  # fresh per run
+                        f"attempt:{a.id}:planning:{uuid.uuid4().hex[:8]}"
+                    ),
                     checkpointer=self._d.agent_checkpointer,
                 )
             await store_model(
@@ -600,9 +606,9 @@ class CodeChangeSteps:
                     plan,
                     sandbox,
                     feedback=feedback,
-                    thread_id=(
+                    thread_id=checked_thread_id(  # a re-run after a crash starts clean
                         f"attempt:{a.id}:implementation:{a.repair_count}:{uuid.uuid4().hex[:8]}"
-                    ),  # a re-run after a crash starts clean, not on stale history
+                    ),
                     checkpointer=self._d.agent_checkpointer,
                 )
                 if sandbox.disk_limit_exceeded:

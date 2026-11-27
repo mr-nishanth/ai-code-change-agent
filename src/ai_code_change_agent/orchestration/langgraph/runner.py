@@ -5,9 +5,11 @@ from typing import Any
 
 from langgraph.types import Command
 
+from ai_code_change_agent.orchestration.langgraph.ports import checked_thread_id
+
 
 def _config(attempt_id: uuid.UUID) -> dict[str, Any]:
-    return {"configurable": {"thread_id": f"attempt:{attempt_id}"}}
+    return {"configurable": {"thread_id": checked_thread_id(f"attempt:{attempt_id}")}}
 
 
 class WorkflowRunner:

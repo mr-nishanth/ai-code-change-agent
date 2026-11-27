@@ -23,6 +23,7 @@ dependencies = [
     { name = "langchain-anthropic" },
     { name = "langchain-aws" },
     { name = "langgraph" },
+    { name = "langgraph-checkpoint-aws" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "packaging" },
     { name = "psycopg", extra = ["binary", "pool"] },
@@ -37,6 +38,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "langgraph-checkpoint-conformance" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -58,6 +60,7 @@ requires-dist = [
     { name = "langchain-anthropic", specifier = ">=1.7" },
     { name = "langchain-aws", specifier = ">=1.0" },
     { name = "langgraph", specifier = ">=1.2.24" },
+    { name = "langgraph-checkpoint-aws", specifier = "==1.3.0" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.0" },
     { name = "packaging", specifier = ">=24.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
@@ -72,6 +75,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "langgraph-checkpoint-conformance", specifier = "==0.0.2" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
@@ -1583,6 +1587,32 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/27/1e/8c885180ba6a57bff177b9ecb2e273aa32d9d29a093ba0a5214ef8f5136f/langgraph_checkpoint-4.3.2.tar.gz", hash = "sha256:fcab8468c7e965d7055e2a35c253d73a145624ef4728b150ca7c361f4afca286", size = 185401, upload-time = "2026-11-14T01:31:05.25Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/f1/c84ac1431857640bfb9ea811a58ab5b9c040da3842fd1bcf080655184db0/langgraph_checkpoint-4.3.2-py3-none-any.whl", hash = "sha256:60e02eb2c2eefc4c22fb1549f1c90b85ce9617377604596c5f34fbd6af0bd6e9", size = 58321, upload-time = "2026-11-14T01:31:03.733Z" },
+]
+
+[[package]]
+name = "langgraph-checkpoint-aws"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "boto3" },
+    { name = "langgraph" },
+    { name = "langgraph-checkpoint" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/9b/8e35b1ce21aacf8289263660fe41dfa3a37c0b7988031b640ebc42ef3dfd/langgraph_checkpoint_aws-1.3.0.tar.gz", hash = "sha256:839edb8343fad75e8c3492dde9ff190aea3051d6b3c65a04d6fdb34ec1d3277c", size = 373692, upload-time = "2026-11-19T01:43:11.96Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/79/9df62bb8276a311fb5c9e8bc30f9eeb0bf03c2d8706e4335b0c7d1af40bd/langgraph_checkpoint_aws-1.3.0-py3-none-any.whl", hash = "sha256:9436ed3fba1b5ddba03436d7c418f79e836a5ecb96334ed8f33eecc1243859c5", size = 193407, upload-time = "2026-11-19T01:43:10.908Z" },
+]
+
+[[package]]
+name = "langgraph-checkpoint-conformance"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langgraph-checkpoint" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/da/93e4e31f1f64eb12eb9b1a721161708ed7cdcacf9a105d6f6c203f903721/langgraph_checkpoint_conformance-0.0.2.tar.gz", hash = "sha256:6718e00937bf2f04cdfd2cdfabea23e1dabb79a534ff4c127f305f6b40dad4e0", size = 93726, upload-time = "2026-04-08T23:02:08.74Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/ed/27dc4ce19f9c848521e45cbf778b1a8d8d774fa468bab67f5a5fd51e9fe0/langgraph_checkpoint_conformance-0.0.2-py3-none-any.whl", hash = "sha256:c112ddc0416b097c90a145fd1908ba570db4cba209e1ae0330205e9f466ad4f9", size = 28425, upload-time = "2026-04-08T23:02:07.668Z" },
 ]
 
 [[package]]
