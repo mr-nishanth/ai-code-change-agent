@@ -191,3 +191,7 @@ Observations O1 to O3 (section 6) remain owner decisions; no change was made for
 | `rg -n "JiraStory" src tests` | no match |
 
 The 22 deselected tests are the `docker` marker tests. They were not run in this session, by instruction, because the Docker tests can clash with a live worker sandbox. Run `uv run pytest` (full suite) on an idle Docker host before merging to close this gap. Compared with the start (section 1: 1395 unit passed, 1 xfailed, 1 warning), the xfail and the warning are gone.
+
+## S2113 final verification (2026-11-27)
+
+Run by the controller on the final S2113 tree (feature/s2112-edge-case-tests): `uv run pytest -W error::RuntimeWarning` (unit, PostgreSQL and Docker): **1,542 passed, 0 failed, 0 skipped, 0 xfailed, 0 warnings; coverage 91.87%** (gate 90%). ruff, ruff format and strict mypy (296 source files) clean. The S2112 strict xfail (streamed usage) was removed in S2113: production never streams, now pinned by `test_the_production_chat_models_never_stream`. All results are automated or mocked; no live Jira, GitHub or model call was made.
