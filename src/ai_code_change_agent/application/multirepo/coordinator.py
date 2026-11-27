@@ -12,7 +12,7 @@ a replayed webhook, a crashed worker or two concurrent advances never duplicate 
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ai_code_change_agent.application.artifacts.hashing import load_verified, store_model
@@ -174,7 +174,7 @@ class Coordinator:
                     key = alias.get(dep.lower()) or alias.get(_short(dep))
                     if key is None:
                         problems.append(f"{d.reference}: depends on unknown repository '{dep}'")
-                    else:
+                    elif key not in needs:  # one edge per upstream, however often it is named
                         needs.append(key)
                 edges[r.repository_key] = needs
             if not problems:
@@ -234,23 +234,25 @@ class Coordinator:
             upstream = [by_key[k] for k in child.depends_on]
             failed = [u for u in upstream if u.status in _FAILED]
             if failed:
-                await self._store.update_child(
+                if await self._store.update_child(
                     child.id,
                     frozenset({ChildStatus.WAITING}),
                     status=ChildStatus.BLOCKED,
                     failure_code=f"upstream_failed:{failed[0].repository_key}"[:120],
-                )
+                ):  # children run in dependency order: a block cascades within this pass
+                    by_key[child.repository_key] = replace(child, status=ChildStatus.BLOCKED)
                 continue
             if any(u.status not in _DONE for u in upstream):
                 continue
             missing = [u for u in upstream if not u.contract_sha256]
             if missing:  # never let a client guess the API shape
-                await self._store.update_child(
+                if await self._store.update_child(
                     child.id,
                     frozenset({ChildStatus.WAITING}),
                     status=ChildStatus.BLOCKED,
                     failure_code=f"upstream_contract_missing:{missing[0].repository_key}"[:120],
-                )
+                ):
+                    by_key[child.repository_key] = replace(child, status=ChildStatus.BLOCKED)
                 continue
             if await self._store.update_child(
                 child.id, frozenset({ChildStatus.WAITING}), status=ChildStatus.QUEUED

@@ -1,11 +1,18 @@
 """Multi-repository Stories: declarations, dependency order and the coordinator (fakes only)."""
 
+import json
+import os
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 
+from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
+from ai_code_change_agent.application.artifacts.service import ArtifactService
+from ai_code_change_agent.application.errors import ArtifactIntegrityError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
     REPORT_JOB,
@@ -21,16 +28,24 @@ from ai_code_change_agent.application.multirepo.models import (
     ReportClaim,
     ReportState,
 )
+from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
     dependency_order,
     parse_story,
 )
+from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.repositories.resolution import (
     ResolutionOutcome,
     ResolutionResult,
 )
+from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.integrations.jira.reporting import CommentResult, CommentStatus
+from ai_code_change_agent.orchestration.intake import ChildHandler
+from ai_code_change_agent.orchestration.langgraph.graph import build_graph
+from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
+from ai_code_change_agent.orchestration.steps import CodeChangeSteps
+from tests.support.workflow import make_rig
 
 STORY = """Implement order tracking across the existing applications.
 
@@ -541,3 +556,410 @@ async def test_report_job_raises_for_retryable_so_the_queue_backs_off() -> None:
     assert store.parents[parent.id].jira_report == "SUCCEEDED"
     with pytest.raises(JobFailedError):
         await handler(type("J", (), {"payload": {}})())
+
+
+# ---- cross-repository contracts, chains, failures and resumption ----------------------------
+
+CHAIN = """Repository: acme/web-app
+  Depends on: backend-api
+Repository: acme/backend-api
+  Depends on: schema-lib
+Repository: acme/schema-lib
+"""  # declared downstream-first on purpose: the order comes from the graph, not the text
+FAN = """Repository: acme/backend-api
+Repository: acme/web-app
+  Depends on: backend-api
+Repository: acme/worker
+"""  # web-app needs backend-api; worker is independent of both
+CONTRACT = "GET /orders/{id} -> {id: str, status: str}"
+
+
+class AttemptChanges(Changes):
+    """Changes fake that also knows the attempts the children ran (for context_for)."""
+
+    def __init__(self) -> None:
+        self.attempts: dict[uuid.UUID, CodeChangeAttempt] = {}
+
+    async def get_attempt(self, attempt_id: uuid.UUID) -> CodeChangeAttempt:
+        return self.attempts[attempt_id]
+
+
+def artifact_service(root: Path) -> ArtifactService:
+    return ArtifactService(
+        LocalFilesystemArtifactStore(root, max_artifact_bytes=5_000_000),
+        max_artifact_bytes=5_000_000,
+        max_attempt_bytes=50_000_000,
+    )
+
+
+def make_real(
+    artifacts: ArtifactService,
+) -> tuple[Coordinator, MemStore, Queue, Reporter, AttemptChanges]:
+    store, queue, reporter, changes = MemStore(), Queue(), Reporter(), AttemptChanges()
+    coordinator = Coordinator(
+        store=store, changes=changes, queue=queue, artifacts=artifacts,  # type: ignore[arg-type]
+        resolver=Resolver(), reporter=reporter, max_repositories=5, max_job_attempts=3,
+    )  # fmt: skip
+    return coordinator, store, queue, reporter, changes
+
+
+def by_key(store: MemStore, key: str) -> Child:
+    return next(c for c in store.children.values() if c.repository_key == key)
+
+
+def queued_keys(store: MemStore, queue: Queue) -> list[str]:
+    return [store.children[uuid.UUID(p["child_id"])].repository_key for p in queue.jobs.values()]
+
+
+async def begin(
+    store: MemStore, changes: AttemptChanges, key: str, attempt_id: uuid.UUID | None = None
+) -> CodeChangeAttempt:
+    """What the child job does before the workflow runs: an attempt, recorded on the child."""
+    child = by_key(store, key)
+    parent = store.parents[child.parent_id]
+    attempt = CodeChangeAttempt(
+        attempt_id or uuid.uuid4(), parent.request_id, 1, child.repository_id,
+        child.profile_version_id, status=AttemptStatus.IMPLEMENTING,
+    )  # fmt: skip
+    changes.attempts[attempt.id] = attempt
+    assert await store.update_child(
+        child.id, frozenset({ChildStatus.QUEUED}), status=ChildStatus.RUNNING, attempt_id=attempt.id
+    )
+    return attempt
+
+
+async def complete_with_report(
+    coordinator: Coordinator,
+    store: MemStore,
+    changes: AttemptChanges,
+    artifacts: ArtifactService,
+    key: str,
+    report: dict[str, Any],
+) -> CodeChangeAttempt:
+    """The real publication path: the attempt's implementation report -> child_finished."""
+    attempt = await begin(store, changes, key)
+    scope = ArtifactScope(attempt.request_id, attempt.id)
+    await artifacts.put(scope, ArtifactKind.IMPLEMENTATION_REPORT, json.dumps(report).encode())
+    attempt = replace(attempt, status=AttemptStatus.COMPLETED)
+    changes.attempts[attempt.id] = attempt
+    await coordinator.child_finished(by_key(store, key).id, attempt)
+    return attempt
+
+
+async def published_backend(
+    tmp_path: Path, story: str = FAN
+) -> tuple[Coordinator, MemStore, Queue, Reporter, AttemptChanges, ArtifactService]:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, queue, reporter, changes = make_real(artifacts)
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(story))
+    await complete_with_report(
+        coordinator, store, changes, artifacts, "backend-api", {"published_contract": CONTRACT}
+    )
+    return coordinator, store, queue, reporter, changes, artifacts
+
+
+async def test_a_published_contract_reaches_only_the_children_that_depend_on_it(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, _, _, changes, _ = await published_backend(tmp_path)
+    backend = by_key(store, "backend-api")
+    assert backend.status is ChildStatus.COMPLETED and backend.contract_sha256
+    web = await begin(store, changes, "web-app")
+    ctx = await coordinator.context_for(web.id)
+    assert ctx is not None
+    assert [(c.repository_key, c.text) for c in ctx.upstream_contracts] == [
+        ("backend-api", CONTRACT)
+    ]
+    worker = await begin(store, changes, "worker")
+    ctx = await coordinator.context_for(worker.id)
+    assert ctx is not None and ctx.upstream_contracts == ()  # it does not depend on backend-api
+    assert ctx.downstream == () and "backend-api" in ctx.siblings
+
+
+@pytest.mark.parametrize("tamper", ["recorded_hash", "stored_bytes"])
+async def test_a_contract_whose_content_no_longer_matches_its_hash_is_refused(
+    tmp_path: Path, tamper: str
+) -> None:
+    coordinator, store, _, _, changes, _ = await published_backend(tmp_path)
+    backend = by_key(store, "backend-api")
+    assert backend.contract_ref and backend.contract_sha256
+    if tamper == "recorded_hash":
+        store.children[backend.id] = replace(backend, contract_sha256="0" * 64)
+    else:  # the immutable bytes were edited after the hash was recorded
+        (blob,) = (tmp_path / "artifacts").rglob(f"{backend.contract_ref}.blob")
+        os.chmod(blob, 0o600)
+        blob.write_bytes(blob.read_bytes().replace(b"status", b"STATUS"))
+    web = await begin(store, changes, "web-app")
+    with pytest.raises(ArtifactIntegrityError) as err:
+        await coordinator.context_for(web.id)
+    assert err.value.code == "artifact_hash_mismatch"
+
+
+async def test_a_tampered_contract_fails_the_dependent_before_any_agent_or_workspace(
+    tmp_path: Path,
+) -> None:
+    """Real workflow steps: the dependent's planning step refuses the contract, so no sandbox
+    starts and no agent runs; the child fails and the parent reports it."""
+    rig = await make_rig(tmp_path)
+    coordinator, store, _, reporter, changes = make_real(rig.artifacts)
+    await coordinator.start(
+        uuid.uuid4(), "SHOP-100", "SHOP",
+        parse_story("Repository: acme/backend-api\nRepository: acme/web-app\n"
+                    "  Depends on: backend-api\n"),
+    )  # fmt: skip
+    await complete_with_report(
+        coordinator, store, changes, rig.artifacts, "backend-api", {"published_contract": CONTRACT}
+    )
+    backend = by_key(store, "backend-api")
+    store.children[backend.id] = replace(backend, contract_sha256="f" * 64)
+    await begin(store, changes, "web-app", attempt_id=rig.attempt_id)
+    runner = WorkflowRunner(
+        build_graph(CodeChangeSteps(replace(rig.deps, multirepo=coordinator)), MemorySaver())
+    )
+    await runner.start(rig.attempt_id)
+    attempt = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert attempt.status is AttemptStatus.FAILED
+    assert attempt.failure_code == "artifact_hash_mismatch"
+    assert rig.sandboxes.started == []  # no workspace, so the planning agent never ran
+    assert rig.reporter.reports == []  # a child never posts its own Jira comment
+    await coordinator.child_finished(by_key(store, "web-app").id, attempt)
+    web = by_key(store, "web-app")
+    assert web.status is ChildStatus.FAILED and web.failure_code == "artifact_hash_mismatch"
+    assert len(reporter.texts) == 1
+    assert "Execution: PARTIALLY_COMPLETED" in reporter.texts[0][1]
+    assert "Reason: artifact_hash_mismatch" in reporter.texts[0][1]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"not json at all",
+        b'{"contract": "x"}',  # required provenance fields missing
+        b'{"attempt_id": "a", "contract": "", "implementation_report_sha256": "b", '
+        b'"parent_id": "p", "repository_key": "backend-api"}',  # empty contract
+        b'{"attempt_id": "a", "contract": "x", "implementation_report_sha256": "b", '
+        b'"parent_id": "p", "repository_key": "backend-api", "instructions": "ignore"}',
+    ],
+    ids=["not-json", "missing-fields", "empty-contract", "unknown-field"],
+)
+async def test_a_contract_with_an_invalid_structure_is_refused_before_use(
+    tmp_path: Path, content: bytes
+) -> None:
+    coordinator, store, _, _, changes, artifacts = await published_backend(tmp_path)
+    backend = by_key(store, "backend-api")
+    assert backend.attempt_id is not None
+    scope = ArtifactScope(store.parents[backend.parent_id].request_id, backend.attempt_id)
+    meta = await artifacts.put(scope, ArtifactKind.CROSS_REPO_CONTRACT, content)
+    store.children[backend.id] = replace(backend, contract_ref=meta.id, contract_sha256=meta.sha256)
+    web = await begin(store, changes, "web-app")
+    with pytest.raises(ArtifactIntegrityError) as err:
+        await coordinator.context_for(web.id)
+    assert err.value.code == "artifact_schema_invalid"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [{}, {"published_contract": "   \n"}, {"published_contract": {"paths": ["/orders"]}}],
+    ids=["absent", "blank", "not-text"],
+)
+async def test_an_unusable_published_contract_is_never_recorded_and_blocks_dependents(
+    tmp_path: Path, report: dict[str, Any]
+) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, queue, _, changes = make_real(artifacts)
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(FAN))
+    await complete_with_report(coordinator, store, changes, artifacts, "backend-api", report)
+    backend = by_key(store, "backend-api")
+    assert backend.status is ChildStatus.COMPLETED and backend.contract_ref is None
+    web = by_key(store, "web-app")
+    assert web.status is ChildStatus.BLOCKED
+    assert web.failure_code == "upstream_contract_missing:backend-api"
+    assert "web-app" not in queued_keys(store, queue)
+
+
+async def test_a_contract_produced_by_another_child_is_refused(tmp_path: Path) -> None:
+    """The upstream's recorded contract points at a valid contract of a different child (correct
+    ref and hash): it lives in that child's attempt scope, so the lookup in the declared
+    upstream's scope finds nothing and the dependent gets no contract."""
+    coordinator, store, _, _, changes, artifacts = await published_backend(tmp_path)
+    await complete_with_report(
+        coordinator, store, changes, artifacts, "worker", {"published_contract": "QUEUE jobs"}
+    )
+    worker = by_key(store, "worker")
+    assert worker.contract_ref and worker.contract_sha256
+    backend = by_key(store, "backend-api")
+    store.children[backend.id] = replace(
+        backend, contract_ref=worker.contract_ref, contract_sha256=worker.contract_sha256
+    )
+    web = await begin(store, changes, "web-app")
+    with pytest.raises(ArtifactIntegrityError) as err:
+        await coordinator.context_for(web.id)
+    assert err.value.code == "artifact_missing"
+
+
+async def test_a_dependent_whose_upstream_has_no_recorded_contract_cannot_start(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, _, _, changes, _ = await published_backend(tmp_path)
+    web = await begin(store, changes, "web-app")
+    backend = by_key(store, "backend-api")
+    store.children[backend.id] = replace(backend, contract_ref=None, contract_sha256=None)
+    with pytest.raises(MultiRepoBlockedError, match="upstream_contract_missing"):
+        await coordinator.context_for(web.id)
+
+
+async def test_a_three_level_chain_runs_strictly_in_dependency_order() -> None:
+    coordinator, store, queue, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(CHAIN))
+    positions = {c.repository_key: c.position for c in store.children.values()}
+    assert positions == {"schema-lib": 0, "backend-api": 1, "web-app": 2}
+    assert queued_keys(store, queue) == ["schema-lib"]
+    await coordinator.advance(parent.id)  # a replayed advance starts nothing early
+    assert queued_keys(store, queue) == ["schema-lib"]
+    await finish(store, coordinator, "schema-lib", ChildStatus.COMPLETED)
+    assert queued_keys(store, queue) == ["schema-lib", "backend-api"]
+    assert by_key(store, "web-app").status is ChildStatus.WAITING  # B has no contract yet
+    await finish(store, coordinator, "backend-api", ChildStatus.COMPLETED)
+    assert queued_keys(store, queue) == ["schema-lib", "backend-api", "web-app"]
+    await finish(store, coordinator, "web-app", ChildStatus.COMPLETED)
+    assert store.parents[parent.id].status is ParentStatus.COMPLETED
+    (text,) = [t for _, t in reporter.texts]
+    assert text.index("1. schema-lib") < text.index("2. backend-api") < text.index("3. web-app")
+
+
+async def test_a_missing_contract_at_the_top_of_a_chain_blocks_every_level_below() -> None:
+    coordinator, store, queue, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(CHAIN))
+    await finish(store, coordinator, "schema-lib", ChildStatus.COMPLETED, contract=False)
+    assert by_key(store, "backend-api").failure_code == "upstream_contract_missing:schema-lib"
+    assert by_key(store, "web-app").failure_code == "upstream_failed:backend-api"
+    assert queued_keys(store, queue) == ["schema-lib"]  # neither level below ever ran
+    assert store.parents[parent.id].status is ParentStatus.PARTIALLY_COMPLETED
+    assert len(reporter.texts) == 1
+
+
+@pytest.mark.parametrize("outcome", [ChildStatus.FAILED, ChildStatus.REJECTED])
+async def test_an_upstream_that_fails_blocks_dependents_and_the_independent_sibling_still_runs(
+    outcome: ChildStatus,
+) -> None:
+    coordinator, store, queue, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(FAN))
+    assert queued_keys(store, queue) == ["backend-api", "worker"]
+    await finish(store, coordinator, "backend-api", outcome, failure_code="validation_failed")
+    web = by_key(store, "web-app")
+    assert web.status is ChildStatus.BLOCKED and web.failure_code == "upstream_failed:backend-api"
+    assert web.attempt_id is None and web.runs == 0  # never started
+    assert queued_keys(store, queue) == ["backend-api", "worker"]
+    assert reporter.texts == []  # the independent worker is still running
+    await finish(store, coordinator, "worker", ChildStatus.COMPLETED)
+    assert by_key(store, "worker").status is ChildStatus.COMPLETED
+    assert store.parents[parent.id].status is ParentStatus.PARTIALLY_COMPLETED
+    assert "web-app" not in queued_keys(store, queue)
+
+
+async def test_a_duplicate_dependency_edge_is_deduplicated(tmp_path: Path) -> None:
+    story = (
+        "Repository: acme/backend-api\nRepository: acme/web-app\n"
+        "  Depends on: backend-api, acme/backend-api, backend-api\n"
+        "Dependencies:\n- web-app depends on backend-api\n"
+    )
+    coordinator, store, _, _, changes, _ = await published_backend(tmp_path, story)
+    assert by_key(store, "web-app").depends_on == ("backend-api",)
+    web = await begin(store, changes, "web-app")
+    ctx = await coordinator.context_for(web.id)
+    assert ctx is not None and [c.repository_key for c in ctx.upstream_contracts] == [
+        "backend-api"
+    ]  # the agent is given the contract once
+
+
+async def test_several_failures_and_a_block_are_each_reported_in_one_comment() -> None:
+    coordinator, store, queue, reporter = make()
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(FAN))
+    await finish(store, coordinator, "backend-api", ChildStatus.FAILED)
+    await finish(
+        store, coordinator, "worker", ChildStatus.FAILED, failure_code="dependency_conflict"
+    )
+    final = store.parents[parent.id]
+    assert final.status is ParentStatus.FAILED
+    assert store.request_status[final.request_id] == "FAILED"
+    (text,) = [t for _, t in reporter.texts]
+    assert "Execution: FAILED" in text and "COMPLETED" not in text
+    for key, status, reason in [
+        ("backend-api", "FAILED", "validation_failed"),
+        ("web-app", "BLOCKED", "upstream_failed:backend-api"),
+        ("worker", "FAILED", "dependency_conflict"),
+    ]:
+        section = text.split(f". {key}", 1)[1].split("\n\n", 1)[0]
+        block = section.split("\n", 4)
+        assert f"Status: {status}" in block[1] and f"Reason: {reason}" in block[2]
+    assert text.count("Retryable: yes") == 3
+    assert "Cross-Repository Result: no repository was delivered." in text
+    await coordinator.advance(parent.id)
+    assert len(reporter.texts) == 1 and len(queue.jobs) == 2
+
+
+class HandlerChanges:
+    """What ChildHandler needs: attempts, and a new attempt per started child."""
+
+    def __init__(self, store: MemStore) -> None:
+        self.store = store
+        self.attempts: dict[uuid.UUID, CodeChangeAttempt] = {}
+        self.started: list[uuid.UUID] = []
+
+    async def get_attempt(self, attempt_id: uuid.UUID) -> CodeChangeAttempt:
+        return self.attempts[attempt_id]
+
+    async def start_repository_attempt(
+        self, request_id: uuid.UUID, repository_id: uuid.UUID, profile_version_id: uuid.UUID
+    ) -> CodeChangeAttempt:
+        attempt = CodeChangeAttempt(uuid.uuid4(), request_id, 1, repository_id, profile_version_id)
+        self.attempts[attempt.id] = attempt
+        return attempt
+
+    async def launch(self, attempt_id: uuid.UUID) -> None:
+        self.started.append(attempt_id)
+        self.attempts[attempt_id] = replace(
+            self.attempts[attempt_id], status=AttemptStatus.COMPLETED
+        )
+
+
+async def test_a_resumed_parent_never_reruns_completed_children(tmp_path: Path) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, queue, reporter, _ = make_real(artifacts)
+    changes = HandlerChanges(store)
+    handler = ChildHandler(
+        coordinator=coordinator,
+        changes=changes,  # type: ignore[arg-type]
+        start=changes.launch,
+    )
+    request = uuid.uuid4()
+    parent = await coordinator.start(request, "SHOP-100", "SHOP", parse_story(FAN))
+    await finish(store, coordinator, "backend-api", ChildStatus.COMPLETED)
+    # interruption: the worker's attempt finished, but the process died before recording it
+    worker = by_key(store, "worker")
+    done = CodeChangeAttempt(
+        uuid.uuid4(), request, 1, worker.repository_id, worker.profile_version_id,
+        status=AttemptStatus.COMPLETED,
+    )  # fmt: skip
+    changes.attempts[done.id] = done
+    await store.update_child(
+        worker.id, frozenset({ChildStatus.QUEUED}), status=ChildStatus.RUNNING, attempt_id=done.id
+    )
+    jobs = dict(queue.jobs)
+    assert set(queued_keys(store, queue)) == {"backend-api", "web-app", "worker"}
+    again = await coordinator.start(request, "SHOP-100", "SHOP", parse_story(FAN))  # replay
+    assert again.id == parent.id and queue.jobs == jobs
+    for payload in list(jobs.values()):  # every leased job runs again after the restart
+        await handler(type("J", (), {"payload": payload})())
+    backend, web, worker = (by_key(store, k) for k in ("backend-api", "web-app", "worker"))
+    assert backend.runs == 0 and backend.attempt_id is None  # completed: never re-executed
+    assert backend.pr_url == "https://example.invalid/backend-api/pull/1"
+    assert worker.status is ChildStatus.COMPLETED and worker.attempt_id == done.id
+    assert changes.started == [web.attempt_id]  # only the pending child ran
+    assert web.status is ChildStatus.COMPLETED and web.runs == 0
+    assert queue.jobs == jobs  # no new child job was needed
+    assert store.parents[parent.id].status is ParentStatus.COMPLETED
+    assert len(reporter.texts) == 1
+    for payload in list(jobs.values()):  # a second replay changes nothing
+        await handler(type("J", (), {"payload": payload})())
+    assert changes.started == [web.attempt_id] and len(reporter.texts) == 1
