@@ -104,7 +104,7 @@ The worker controls a container runtime, so it is privileged control plane. Opti
 2. A remote sandbox service, e.g. a microVM or Kubernetes sandbox backend, behind the same `SandboxStarter` protocol, so the worker needs no local daemon.
 3. A rootless Docker or Podman daemon per worker host.
 
-Do not mount the Docker socket into a general-purpose container, and never into a sandbox.
+Do not mount the Docker socket into a general-purpose container, and never into a sandbox. The one documented exception is the local, test-only Floci AWS emulator ([ADR-014](decisions/ADR-014-floci-local-aws-emulator.md)).
 
 ## Multi-repository Stories and research
 

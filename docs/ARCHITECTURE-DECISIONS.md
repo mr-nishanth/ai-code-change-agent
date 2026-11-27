@@ -42,3 +42,9 @@ These are OS-level guarantees and stronger than tool-level rules. Real-Docker te
 - **Python-only execution:** one Python execution image (`WORKSPACE_IMAGE`) for every repository; the command policy has only the `python` family. Other languages are out of scope. See [PYTHON-EXECUTION-AND-RESEARCH.md](PYTHON-EXECUTION-AND-RESEARCH.md).
 - **Documentation search:** worker-side Anthropic web search behind a `ReferenceSearcher` port. The sandbox stays offline.
 - **Runaway-cost guards for any model:** a call cap, a phase USD budget and bounded structured-output retries.
+
+## Local AWS emulator (2026-11-27)
+
+| Decision | As implemented |
+|---|---|
+| [ADR-014](decisions/ADR-014-floci-local-aws-emulator.md): **Floci as a local, test-only AWS emulator.** Own Compose project and network, loopback ports, dummy credentials, never wired into the application. The only container with the Docker socket (an explicit, local-only exception). No AWS service replaces an application component; see [aws/AWS-DEPLOYMENT-READINESS.md](aws/AWS-DEPLOYMENT-READINESS.md). | `infra/docker-compose.yml`, `infra/floci/init/`, `tests/integration/floci/`, `tests/support/floci.py` |

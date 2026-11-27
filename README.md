@@ -47,3 +47,23 @@ docker compose up -d --wait api && ngrok http 8000  # point the Jira webhook her
 uv run ai-code-change repositories register --from-provider <owner>/<repo> --project <KEY> --enable
 uv run ai-code-change worker
 ```
+
+## Local AWS emulator (Floci)
+
+Optional and **test-only**: [Floci](https://github.com/floci-io/floci) 2.5.0 emulates S3, SQS, Secrets Manager, CloudWatch, ECR, ECS, RDS, Lambda, API Gateway, IAM and STS on `127.0.0.1:4566`, with dummy credentials. The application never uses it. See [ADR-014](docs/decisions/ADR-014-floci-local-aws-emulator.md) (including its Docker-socket exception) and [docs/aws/AWS-DEPLOYMENT-READINESS.md](docs/aws/AWS-DEPLOYMENT-READINESS.md).
+
+```bash
+docker compose -f infra/docker-compose.yml up -d --wait   # own project "acca-floci"; compose.yaml untouched
+sh infra/floci/init/bootstrap.sh                          # idempotent; loopback + test/test only
+uv run pytest -m floci -rs                                # skips with a reason when Floci is down
+```
+
+Stop and clean up (Floci-spawned containers and volumes are labelled `floci=true` and are not part of the Compose project):
+
+```bash
+docker rm -f $(docker ps -aq --filter label=floci=true)   # e.g. the ECR registry sidecar
+docker compose -f infra/docker-compose.yml down -v        # Floci container, network and data volume
+docker volume ls --filter label=floci=true                # remove leftovers with docker volume rm
+```
+
+Never export `AWS_ENDPOINT_URL` in the shell that runs the worker: the Bedrock client would follow it.
