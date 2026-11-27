@@ -238,3 +238,19 @@ async def test_service_errors_are_persistence_errors_without_driver_text(
         assert SECRET not in repr(failure.value) and failure.value.__cause__ is None
     monkeypatch.undo()
     assert counts(app_table) == (0, 0, 0, 0)
+
+
+async def test_delivery_records_expire_after_the_retention_window(app_table: Table) -> None:
+    """Delivery dedupe only has to outlive Jira's redelivery window: TTL `expires_at` (30 days
+    by default); the Story guard and the job dedupe guard never expire."""
+    repo = DynamoWebhookRepository(app_table, delivery_retention_days=2)
+    assert await repo.record(accepted()) is Outcome.ACCEPTED
+    assert await repo.record(ignored()) is Outcome.IGNORED
+    grouped = by_entity(app_table)
+    for delivery in grouped["jira_delivery"]:
+        received = decode_timestamp(delivery["received_at"], "received_at")
+        assert int(delivery["expires_at"]) == int(received.timestamp()) + 2 * 86_400
+    for entity in ("jira_issue_guard", "job_dedupe_guard", "code_change_request"):
+        assert all("expires_at" not in i for i in grouped[entity])
+    with pytest.raises(ValueError, match=r"1\.\.365"):
+        DynamoWebhookRepository(app_table, delivery_retention_days=0)

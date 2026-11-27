@@ -6,6 +6,7 @@ Every test gets its own checkpoint table (schema `acca-checkpoints`) and bucket,
 are set to unusable values to prove they are ignored."""
 
 import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -216,3 +217,15 @@ def test_floci_enforces_the_dynamodb_item_size_limit(env: Env) -> None:
     assert raised.value.response["Error"]["Code"] == "ValidationException"
     assert DYNAMODB_ITEM_LIMIT < 410 * 1024
     assert env.table_items() == []
+
+
+async def test_checkpoints_expire_after_the_configured_retention(env: Env) -> None:
+    """ACCA_CHECKPOINT_TTL_DAYS (default 30) is the items' `ttl` and the S3 lifecycle rule."""
+    assert env.settings.checkpoint_ttl_days == 30
+    started = time.time()
+    await _blob_graph(env.saver(), "small").ainvoke({}, _config(f"attempt:{uuid.uuid4()}"))
+    expiries = [int(i["ttl"]["N"]) for i in env.table_items() if "ttl" in i]
+    assert expiries
+    assert all(started + 30 * 86_400 - 5 <= t <= time.time() + 30 * 86_400 + 5 for t in expiries)
+    rules = env.admin.s3.get_bucket_lifecycle_configuration(Bucket=env.bucket)["Rules"]
+    assert [r["Expiration"]["Days"] for r in rules] == [30]

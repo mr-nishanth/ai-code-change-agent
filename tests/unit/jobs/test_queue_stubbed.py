@@ -256,7 +256,7 @@ async def test_an_exhausted_expired_job_becomes_dead_and_its_message_is_deleted(
             "ConditionExpression": "row_version = :seen",
             "ExpressionAttributeNames": {"#s": "status"},
             "ExpressionAttributeValues": ANY,
-            "ReturnValues": "ALL_NEW",
+            "ReturnValues": "NONE",  # the result is not used: no item image travels back
         },
     )
     stubs.sqs.add_response("delete_message", {}, {"QueueUrl": URL, "ReceiptHandle": "receipt-1"})
@@ -316,6 +316,22 @@ async def test_our_own_job_received_again_keeps_the_newest_receipt(stubs: Stubs)
     assert await stubs.queue.complete(JID, "w1")
 
 
+def reread(s: Stubs, job_ids: list[uuid.UUID], *items: dict[str, Any]) -> None:
+    """The relay's and the sweep's one strongly consistent BatchGetItem for all index hits."""
+    s.ddb.add_response(
+        "batch_get_item",
+        {"Responses": {"s2116-app": [serialize_item(i) for i in items]}},
+        {
+            "RequestItems": {
+                "s2116-app": {
+                    "Keys": [serialize_item(keys.job(j).as_dict()) for j in job_ids],
+                    "ConsistentRead": True,
+                }
+            }
+        },
+    )
+
+
 async def test_relay_sends_due_outbox_jobs_and_skips_stale_index_rows(stubs: Stubs) -> None:
     other = uuid.uuid4()
     rows = [
@@ -324,8 +340,11 @@ async def test_relay_sends_due_outbox_jobs_and_skips_stale_index_rows(stubs: Stu
         serialize_item({"PK": "JOB#not-a-uuid", "SK": "JOB", "GSI3PK": "DISPATCH", "GSI3SK": "z"}),
     ]
     stubs.ddb.add_response("query", {"Items": rows})
-    stubs.ddb.add_response(
-        "get_item", {"Item": serialize_item(job_item(status="QUEUED", GSI3PK="DISPATCH"))}
+    reread(
+        stubs,
+        [JID, other],
+        job_item(status="QUEUED", GSI3PK="DISPATCH"),
+        job_item(**keys.job(other).as_dict(), id=str(other), GSI3PK="SWEEP"),  # already sent
     )
     stubs.sqs.add_response(
         "send_message",
@@ -333,16 +352,13 @@ async def test_relay_sends_due_outbox_jobs_and_skips_stale_index_rows(stubs: Stu
         {"QueueUrl": URL, "MessageBody": json.dumps({"job_id": str(JID)})},
     )
     stubs.ddb.add_response("update_item", {"Attributes": {}})
-    stubs.ddb.add_response("get_item", {"Item": serialize_item(job_item(GSI3PK="SWEEP"))})
     assert await stubs.queue.dispatch_pending() == 1
 
 
 async def test_relay_counts_only_messages_that_were_sent(stubs: Stubs) -> None:
     rows = [serialize_item({**keys.job(JID).as_dict(), "GSI3PK": "DISPATCH", "GSI3SK": "x"})]
     stubs.ddb.add_response("query", {"Items": rows})
-    stubs.ddb.add_response(
-        "get_item", {"Item": serialize_item(job_item(status="QUEUED", GSI3PK="DISPATCH"))}
-    )
+    reread(stubs, [JID], job_item(status="QUEUED", GSI3PK="DISPATCH"))
     stubs.sqs.add_client_error("send_message", "ServiceUnavailable", SECRET, 503)
     assert await stubs.queue.dispatch_pending() == 0
 
@@ -364,9 +380,7 @@ async def test_sweep_resends_only_overdue_live_jobs(
 ) -> None:
     rows = [serialize_item({**keys.job(JID).as_dict(), "GSI3PK": "SWEEP", "GSI3SK": "x"})]
     stubs.ddb.add_response("query", {"Items": rows})
-    stubs.ddb.add_response(
-        "get_item", {"Item": serialize_item(job_item(**{"GSI3PK": "SWEEP", **overrides}))}
-    )
+    reread(stubs, [JID], job_item(**{"GSI3PK": "SWEEP", **overrides}))
     if resent:
         stubs.sqs.add_response("send_message", {"MessageId": "m"})
         stubs.ddb.add_response("update_item", {"Attributes": {}})
@@ -376,7 +390,7 @@ async def test_sweep_resends_only_overdue_live_jobs(
 async def test_sweep_ignores_a_row_whose_job_is_gone(stubs: Stubs) -> None:
     rows = [serialize_item({**keys.job(JID).as_dict(), "GSI3PK": "SWEEP", "GSI3SK": "x"})]
     stubs.ddb.add_response("query", {"Items": rows})
-    stubs.ddb.add_response("get_item", {})
+    reread(stubs, [JID])
     assert await stubs.queue.sweep() == 0
 
 

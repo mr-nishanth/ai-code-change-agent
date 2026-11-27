@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     s3_bucket_name: str = Field(
         default="acca-local-artifacts", validation_alias="ACCA_S3_BUCKET_NAME"
     )
+    # Retention (DynamoDB TTL; checkpoints also an S3 lifecycle rule on their offloaded payloads).
+    # Checkpoints are only needed to resume a paused attempt; a Jira delivery record only has to
+    # outlive Jira's redelivery window (hours) because the Story guard is permanent.
+    checkpoint_ttl_days: int = Field(
+        default=30, ge=1, le=365, validation_alias="ACCA_CHECKPOINT_TTL_DAYS"
+    )
+    jira_delivery_retention_days: int = Field(
+        default=30, ge=1, le=365, validation_alias="ACCA_JIRA_DELIVERY_RETENTION_DAYS"
+    )
 
     # ---- Jira (webhook intake, read-only REST, optional outcome comment) ---------------------
     jira_base_url: str | None = None
@@ -216,6 +225,11 @@ class Settings(BaseSettings):
     job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     job_heartbeat_seconds: int = Field(default=60, ge=5, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=10)
+    # Dispatcher role of the worker: the outbox relay is only the fallback for a job whose direct
+    # send after commit failed (and for the API's intake jobs), the sweep only recovers lost
+    # messages; each tick is at least one GSI3 Query, so these intervals set the idle read cost.
+    job_relay_seconds: float = Field(default=30.0, ge=1, le=3600)
+    job_sweep_seconds: float = Field(default=300.0, ge=10, le=86_400)
     multi_repo_max_repositories: int = Field(default=5, ge=2, le=20)  # per Story
     max_repair_attempts: int = Field(default=1, ge=0, le=3)
 
@@ -369,6 +383,9 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         if self.job_heartbeat_seconds * 2 > self.job_lease_seconds:
             msg = "JOB_HEARTBEAT_SECONDS must be at most half of JOB_LEASE_SECONDS"
+            raise ValueError(msg)
+        if self.job_sweep_seconds < self.job_relay_seconds:
+            msg = "JOB_SWEEP_SECONDS must be at least JOB_RELAY_SECONDS"
             raise ValueError(msg)
         if self.app_env in ("staging", "production"):
             if self.llm_provider != "bedrock":

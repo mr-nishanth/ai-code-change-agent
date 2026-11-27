@@ -8,6 +8,7 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
   - partial GitHub App or Jira REST configuration is refused;
   - `GITHUB_PR_CREATE_ENABLED` and `JIRA_REPORTING_ENABLED` require their credentials;
   - `JOB_HEARTBEAT_SECONDS` must be at most half of `JOB_LEASE_SECONDS`;
+  - `JOB_SWEEP_SECONDS` must be at least `JOB_RELAY_SECONDS`;
   - staging and production require `DATABASE_URL`, `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS` and `LLM_PROVIDER=bedrock`;
   - development and test require `ACCA_AWS_ENDPOINT_URL` (the local Floci endpoint), staging and production must not set it (see [AWS services](#aws-services-dynamodb-sqs-s3)); both violations raise `ConfigurationError`.
 
@@ -45,6 +46,7 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
 | WORKSPACE_NETWORK_POLICY | none | | worker (only value) |
 | ARTIFACT_MAX_BYTES, ARTIFACT_MAX_ATTEMPT_BYTES | 5 MiB, 100 MiB | | worker |
 | MAX_CONCURRENT_JOBS, JOB_LEASE_SECONDS, JOB_HEARTBEAT_SECONDS, JOB_MAX_ATTEMPTS, MAX_REPAIR_ATTEMPTS | 2, 300, 60, 3, 1 | | worker, API (`JOB_MAX_ATTEMPTS`) |
+| JOB_RELAY_SECONDS, JOB_SWEEP_SECONDS | 30 (1..3600), 300 (10..86400) | | worker dispatcher: outbox relay (fallback for unsent jobs) and lost-message sweep; each tick is one GSI3 Query (docs/aws/DYNAMODB-DATA-MODEL.md 13) |
 
 Requested names that are **deliberately absent**, because nothing uses them:
 
@@ -69,6 +71,8 @@ These variables carry the `ACCA_` prefix so the standard `AWS_*` variables of a 
 | ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME | acca-local-checkpoints | | LangGraph checkpoint table |
 | ACCA_SQS_JOB_QUEUE_NAME | acca-local-jobs | | job queue (standard queue; its URL is resolved once with `GetQueueUrl`) |
 | ACCA_S3_BUCKET_NAME | acca-local-artifacts | | artifact bucket |
+| ACCA_CHECKPOINT_TTL_DAYS | 30 (1..365) | | checkpoint retention: DynamoDB TTL and the S3 lifecycle rule for offloaded payloads |
+| ACCA_JIRA_DELIVERY_RETENTION_DAYS | 30 (1..365) | | TTL of Jira delivery dedupe records (the Story guard is permanent) |
 
 Without an endpoint (staging and production) the clients use the process's default AWS credential chain (for example an IAM role). `JOB_LEASE_SECONDS` is capped at 3,600 s, below the SQS visibility-timeout limit of 43,200 s.
 

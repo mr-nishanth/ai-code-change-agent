@@ -122,10 +122,11 @@ class Table:
         names: Mapping[str, str] | None = None,
         values: Mapping[str, Any] | None = None,
         on_failed: Failure | None = None,
-        return_values: Literal["ALL_NEW", "ALL_OLD"] = "ALL_NEW",
+        return_values: Literal["ALL_NEW", "ALL_OLD", "NONE"] = "ALL_NEW",
     ) -> Item:
         """Apply an update expression; returns the item after (`ALL_NEW`, the default) or before
-        (`ALL_OLD`, empty when the item did not exist) the update."""
+        (`ALL_OLD`, empty when the item did not exist) the update, or `{}` with `NONE` (callers
+        that ignore the result: no item image travels back)."""
         request = {
             "TableName": self.name,
             "Key": serialize_item(key.as_dict()),
@@ -227,6 +228,14 @@ class Table:
                 await self.retry.sleep(self.retry.delay(retry))
                 pending = dict(unprocessed)
         return found
+
+    async def fetch(self, index_rows: Iterable[Item], *, consistent: bool) -> list[Item]:
+        """The base items behind index rows (GSI1 and GSI2 project keys only, DM 6), in the rows'
+        order, skipping a row whose item is gone: one `BatchGetItem` per 100 keys. Listings pass
+        `consistent=False` (display only, half the read units)."""
+        order = [Key.of(row) for row in index_rows]
+        found = await self.batch_get(order, consistent=consistent)
+        return [found[key] for key in order if key in found]
 
     async def transact_write(self, tx: "TxBuilder") -> None:
         request = tx.request()

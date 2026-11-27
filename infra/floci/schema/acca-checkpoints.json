@@ -19,5 +19,6 @@
       "KeyType": "RANGE"
     }
   ],
-  "BillingMode": "PAY_PER_REQUEST"
+  "BillingMode": "PAY_PER_REQUEST",
+  "TableClass": "STANDARD"
 }

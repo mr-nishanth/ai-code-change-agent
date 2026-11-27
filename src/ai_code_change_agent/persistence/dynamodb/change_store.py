@@ -19,7 +19,9 @@ Items (DYNAMODB-DATA-MODEL.md 4, one item collection per Story, `PK = REQ#<rid>`
 - `ATTEMPT#<aid>/THREAD#<thread_id>`: one per agent run (L3), written when the run starts, so the
   studio finds an attempt's checkpoint threads (the checkpoint table has no thread-prefix query).
 
-The studio's attempt list (S1) is GSI2 `LIST#ATTEMPT`, newest first (eventually consistent).
+The studio's attempt list (S1) is GSI2 `LIST#ATTEMPT`, newest first (eventually consistent): the
+index projects keys only, so the listed attempts are fetched with one eventually consistent
+`BatchGetItem` (an attempt update then never writes GSI2).
 
 Attempt numbers are allocated under the request's `row_version` (`add_attempt` bumps it), so two
 attempts of one request never share a number. Nothing but an ACTIVE guard is ever deleted (C11)."""
@@ -399,7 +401,7 @@ class DynamoChangeStore:
         """S1: GSI2 `LIST#ATTEMPT`, descending by creation time (eventually consistent)."""
         if limit < 1:
             return []
-        rows = await self._u.table.query(
+        index_rows = await self._u.table.query(
             index=GSI2,
             key_condition="GSI2PK = :pk",
             values={":pk": keys.GSI_LIST_ATTEMPT},
@@ -407,6 +409,7 @@ class DynamoChangeStore:
             limit=limit,
             page_size=limit,
         )
+        rows = await self._u.table.fetch(index_rows, consistent=False)
         return [_listing(row) for row in rows]
 
     async def get_attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing | None:

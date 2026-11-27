@@ -15,10 +15,14 @@ An accepted delivery is ONE `TransactWriteItems` (W1), every item created with
    worker relays the job.
 
 An ignored delivery is one conditional `PutItem` of the delivery item. Deliveries are never read
-back (W7), so `request_id` stays a plain attribute. Every failure that is not one of these
+back (W7), so `request_id` stays a plain attribute. A delivery item only has to outlive Jira's
+redelivery window (hours): it carries `expires_at` (TTL, `ACCA_JIRA_DELIVERY_RETENTION_DAYS`,
+default 30 days). The Story guard and the job dedupe guard stay permanent, so a redelivery after
+that still creates nothing. Every failure that is not one of these
 outcomes is `PersistenceError` whose message is a code or class name, never driver text."""
 
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from ai_code_change_agent.domain.changes.models import CodeChangeRequest
@@ -31,12 +35,13 @@ from ai_code_change_agent.domain.webhooks.models import (
 from ai_code_change_agent.persistence.dynamodb import keys
 from ai_code_change_agent.persistence.dynamodb.change_store import request_item
 from ai_code_change_agent.persistence.dynamodb.clock import Clock, SystemClock
-from ai_code_change_agent.persistence.dynamodb.codec import encode_timestamp
+from ai_code_change_agent.persistence.dynamodb.codec import encode_epoch_seconds, encode_timestamp
 from ai_code_change_agent.persistence.dynamodb.errors import Item
 from ai_code_change_agent.persistence.dynamodb.job_items import new_job
 from ai_code_change_agent.persistence.dynamodb.table import Table
 
 INTAKE_JOB_KIND = "code_change.intake"
+DELIVERY_RETENTION_DAYS = 30  # Settings.jira_delivery_retention_days
 _NEW = "attribute_not_exists(PK)"
 
 
@@ -59,11 +64,19 @@ def _issue_taken(old: Item | None) -> BaseException:
 
 class DynamoWebhookRepository:
     def __init__(
-        self, table: Table, *, job_max_attempts: int = 3, clock: Clock | None = None
+        self,
+        table: Table,
+        *,
+        job_max_attempts: int = 3,
+        clock: Clock | None = None,
+        delivery_retention_days: int = DELIVERY_RETENTION_DAYS,
     ) -> None:
+        if isinstance(delivery_retention_days, bool) or not 1 <= delivery_retention_days <= 365:
+            raise ValueError("delivery_retention_days must be 1..365")
         self._table = table
         self._max_attempts = job_max_attempts
         self._clock: Clock = clock or SystemClock()
+        self._retention = timedelta(days=delivery_retention_days)
 
     async def record(self, delivery: ReceivedDelivery) -> Outcome:
         try:
@@ -143,6 +156,7 @@ class DynamoWebhookRepository:
         self, delivery: ReceivedDelivery, result: str, request_id: str | None
     ) -> Item:
         issue = delivery.issue
+        now = self._clock.now()
         item: dict[str, Any] = {
             **keys.delivery(delivery.delivery_id).as_dict(),
             "entity": "jira_delivery",
@@ -152,7 +166,8 @@ class DynamoWebhookRepository:
             "retry_count": delivery.retry_count,
             "verification_result": "VERIFIED",
             "processing_result": result,
-            "received_at": encode_timestamp(self._clock.now()),
+            "received_at": encode_timestamp(now),
+            "expires_at": encode_epoch_seconds(now + self._retention),
         }
         optional = {
             "flow": delivery.flow,

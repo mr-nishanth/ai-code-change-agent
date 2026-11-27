@@ -23,7 +23,7 @@ from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.integrations.aws.clients import client_config
 
-CHECKPOINT_TTL_SECONDS = 7_776_000  # 90 days: DynamoDB TTL and an S3 lifecycle rule (DM 9.4)
+SECONDS_PER_DAY = 86_400
 CHECKPOINT_S3_PREFIX = "checkpoints/"
 
 
@@ -31,7 +31,9 @@ def dynamodb_checkpointer(clients: AwsClients, settings: Settings) -> BaseCheckp
     """The DynamoDB saver on the application's AWS session and client config.
 
     The S3 client gets an explicit endpoint only with the local override (Floci); otherwise it
-    resolves real S3 for the region like every other client."""
+    resolves real S3 for the region like every other client. Retention is
+    `ACCA_CHECKPOINT_TTL_DAYS` (default 30): the saver writes it as the items' `ttl` attribute and
+    installs the matching S3 lifecycle rule for offloaded payloads (whole days, DM 9.4)."""
     s3_offload: dict[str, str] = {
         "bucket_name": settings.s3_bucket_name,
         "key_prefix": CHECKPOINT_S3_PREFIX,
@@ -44,11 +46,15 @@ def dynamodb_checkpointer(clients: AwsClients, settings: Settings) -> BaseCheckp
         region_name=clients.region,
         endpoint_url=clients.endpoint_url,
         boto_config=client_config(),
-        ttl_seconds=CHECKPOINT_TTL_SECONDS,
+        ttl_seconds=checkpoint_ttl_seconds(settings),
         s3_offload_config=s3_offload,
         consistent_read=True,
     )
     return saver
+
+
+def checkpoint_ttl_seconds(settings: Settings) -> int:
+    return settings.checkpoint_ttl_days * SECONDS_PER_DAY
 
 
 def libpq_url(database_url: str) -> str:

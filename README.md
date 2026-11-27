@@ -58,6 +58,14 @@ sh infra/floci/init/bootstrap.sh                          # idempotent; loopback
 uv run pytest -m floci -rs                                # skips with a reason when Floci is down
 ```
 
+When a schema change alters a DynamoDB index (for example a GSI projection), the bootstrap refuses the
+existing local table (exit 5) because DynamoDB cannot change a projection in place. Floci holds local
+dev data only; recreate the tables from `infra/floci/schema` (their items are lost):
+
+```bash
+ACCA_DYNAMODB_RECREATE_ON_DRIFT=1 sh infra/floci/init/60-dynamodb.sh
+```
+
 Stop and clean up (Floci-spawned containers and volumes are labelled `floci=true` and are not part of the Compose project):
 
 ```bash

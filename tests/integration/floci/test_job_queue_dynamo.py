@@ -391,7 +391,10 @@ async def test_the_worker_relays_claims_and_completes_an_outbox_job(
         seen.append(job)
         done.set()
 
-    w = Worker(q, {"k.test": handler}, lease_seconds=30, heartbeat_seconds=10, poll_seconds=0.2)
+    w = Worker(
+        q, {"k.test": handler}, lease_seconds=30, heartbeat_seconds=10, poll_seconds=0.2,
+        relay_seconds=0.2,
+    )  # fmt: skip
     stop = asyncio.Event()
     task = asyncio.create_task(w.run(stop))
     await asyncio.wait_for(done.wait(), 15)

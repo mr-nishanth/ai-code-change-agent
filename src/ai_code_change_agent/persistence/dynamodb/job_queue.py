@@ -219,6 +219,7 @@ class DynamoSqsJobQueue:
                     ":one": 1,
                 },
                 on_failed=_Stale(None),
+                return_values="NONE",
             )
 
     # Claim (J2, J3) ----------------------------------------------------------------------------
@@ -325,6 +326,7 @@ class DynamoSqsJobQueue:
                     **self._terminal_values(),
                 },
                 on_failed=_Stale(None),
+                return_values="NONE",
             )
         except _Stale:
             return  # changed meanwhile; the next receipt decides again
@@ -369,6 +371,7 @@ class DynamoSqsJobQueue:
                     ":one": 1,
                 },
                 on_failed=_Stale(None),
+                return_values="NONE",
             )
         except _Stale:
             self._forget(job_id, owner)
@@ -390,6 +393,7 @@ class DynamoSqsJobQueue:
                     **self._terminal_values(),
                 },
                 on_failed=_Stale(None),
+                return_values="NONE",
             )
         except _Stale:
             return False
@@ -419,6 +423,7 @@ class DynamoSqsJobQueue:
                         ":one": 1,
                     },
                     on_failed=_stale,
+                    return_values="NONE",
                 )
             except _Stale as stale:
                 if not _owned_by(stale.old, owner):
@@ -437,6 +442,7 @@ class DynamoSqsJobQueue:
                 names=_S,
                 values={**base, ":dead": JobStatus.DEAD.value, **self._terminal_values()},
                 on_failed=_Stale(None),
+                return_values="NONE",
             )
         except _Stale:
             self._forget(job_id, owner)
@@ -457,8 +463,7 @@ class DynamoSqsJobQueue:
             page_size=RELAY_BATCH,
         )
         sent = 0
-        for job_id in _ids(rows):
-            item = await self._table.get(keys.job(job_id))  # the index is eventual
+        for job_id, item in await self._reread(rows):  # the index is eventual
             if item is None or item.get("GSI3PK") != keys.GSI_DISPATCH:
                 continue
             if await self._send(job_id):
@@ -474,8 +479,7 @@ class DynamoSqsJobQueue:
             key_condition="GSI3PK = :p", values={":p": keys.GSI_SWEEP}, index="GSI3"
         )
         sent = 0
-        for job_id in _ids(rows):
-            item = await self._table.get(keys.job(job_id))
+        for job_id, item in await self._reread(rows):
             if item is None or item.get("GSI3PK") != keys.GSI_SWEEP or not self._overdue(item, now):
                 continue
             if await self._send(job_id):
@@ -483,6 +487,13 @@ class DynamoSqsJobQueue:
                 sent += 1
                 _log.info("job_message_resent", job_id=str(job_id))
         return sent
+
+    async def _reread(self, rows: list[Item]) -> list[tuple[uuid.UUID, Item | None]]:
+        """The job items behind GSI3 hits, strongly consistent, in one `BatchGetItem` per 100
+        jobs instead of one `GetItem` each (same read units, far fewer requests)."""
+        job_ids = _ids(rows)
+        found = await self._table.batch_get(keys.job(job_id) for job_id in job_ids)
+        return [(job_id, found.get(keys.job(job_id))) for job_id in job_ids]
 
     def _overdue(self, item: Item, now: datetime) -> bool:
         status = decode_enum(JobStatus, item.get("status"), "status")

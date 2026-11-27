@@ -5,10 +5,12 @@ registered by job kind; there is no default handler. A lost lease cancels the ru
 two workers never act on the same job.
 
 `run` starts one claim loop per concurrency slot (with SQS each claim is one long-poll receive) and
-the dispatcher role: the queue's outbox relay (`dispatch_pending`) every `poll_seconds` and its
+the dispatcher role: the queue's outbox relay (`dispatch_pending`) every `relay_seconds` and its
 sweep for lost messages every `sweep_seconds`, inside this process (DYNAMODB-DATA-MODEL.md 8.2).
-A failing claim or dispatcher tick is logged and retried after `poll_seconds`; it never stops
-the worker.
+The relay is only a fallback (producers send right after commit), so both intervals are long by
+default (30 s and 300 s, `JOB_RELAY_SECONDS` / `JOB_SWEEP_SECONDS`): each tick costs a GSI3 Query.
+A failing claim is logged and retried after `poll_seconds`, a failing dispatcher tick at the next
+relay tick; neither stops the worker.
 """
 
 import asyncio
@@ -67,7 +69,8 @@ class Worker:
         heartbeat_seconds: float,
         concurrency: int = 1,
         poll_seconds: float = 2.0,
-        sweep_seconds: float = 60.0,
+        relay_seconds: float = 30.0,
+        sweep_seconds: float = 300.0,
         owner: str | None = None,
     ) -> None:
         self._queue = queue
@@ -76,6 +79,7 @@ class Worker:
         self._beat = heartbeat_seconds
         self._concurrency = concurrency
         self._poll = poll_seconds
+        self._relay = relay_seconds
         self._sweep = sweep_seconds
         self.owner = owner or f"{socket.gethostname()[:64]}:{uuid.uuid4().hex[:12]}"
 
@@ -115,7 +119,7 @@ class Worker:
             if loop.time() >= next_sweep:
                 await self._tick("sweep", self._queue.sweep)
                 next_sweep = loop.time() + self._sweep
-            await self._wait(stop, self._poll)
+            await self._wait(stop, self._relay)
 
     @staticmethod
     async def _tick(name: str, step: Callable[[], Coroutine[Any, Any, int]]) -> None:

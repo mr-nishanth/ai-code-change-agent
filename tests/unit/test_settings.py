@@ -272,3 +272,43 @@ def test_job_lease_stays_under_the_sqs_visibility_cap() -> None:
     with pytest.raises(ValidationError):
         s(job_lease_seconds=3601)
     assert s(job_lease_seconds=3600).job_lease_seconds <= 43_200
+
+
+def test_cost_settings_default_to_the_documented_values() -> None:
+    d = s()
+    assert (d.job_relay_seconds, d.job_sweep_seconds) == (30.0, 300.0)
+    assert d.checkpoint_ttl_days == 30 and d.jira_delivery_retention_days == 30
+
+
+def test_cost_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JOB_RELAY_SECONDS", "10")
+    monkeypatch.setenv("JOB_SWEEP_SECONDS", "600")
+    monkeypatch.setenv("ACCA_CHECKPOINT_TTL_DAYS", "7")
+    monkeypatch.setenv("ACCA_JIRA_DELIVERY_RETENTION_DAYS", "2")
+    loaded = s()
+    assert (loaded.job_relay_seconds, loaded.job_sweep_seconds) == (10.0, 600.0)
+    assert (loaded.checkpoint_ttl_days, loaded.jira_delivery_retention_days) == (7, 2)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"job_relay_seconds": 0.5},
+        {"job_relay_seconds": 3601},
+        {"job_sweep_seconds": 9},
+        {"job_sweep_seconds": 86_401},
+        {"job_relay_seconds": 120, "job_sweep_seconds": 60},  # the sweep must not outpace the relay
+        {"ACCA_CHECKPOINT_TTL_DAYS": 0},
+        {"ACCA_CHECKPOINT_TTL_DAYS": 366},
+        {"ACCA_JIRA_DELIVERY_RETENTION_DAYS": 0},
+        {"ACCA_JIRA_DELIVERY_RETENTION_DAYS": 366},
+    ],
+)
+def test_cost_settings_out_of_bounds_fail_fast(kw: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        s(**kw)
+
+
+def test_sweep_may_equal_the_relay_interval() -> None:
+    same = s(job_relay_seconds=60, job_sweep_seconds=60)
+    assert same.job_relay_seconds == same.job_sweep_seconds == 60

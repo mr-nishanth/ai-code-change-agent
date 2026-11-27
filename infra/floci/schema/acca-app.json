@@ -57,7 +57,7 @@
         }
       ],
       "Projection": {
-        "ProjectionType": "ALL"
+        "ProjectionType": "KEYS_ONLY"
       }
     },
     {
@@ -73,7 +73,11 @@
         }
       ],
       "Projection": {
-        "ProjectionType": "ALL"
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": [
+          "entity_type",
+          "entity_id"
+        ]
       }
     },
     {
@@ -93,5 +97,6 @@
       }
     }
   ],
-  "BillingMode": "PAY_PER_REQUEST"
+  "BillingMode": "PAY_PER_REQUEST",
+  "TableClass": "STANDARD"
 }

@@ -221,9 +221,12 @@ class FlakyQueue(MemoryQueue):
         return await super().complete(job_id, owner)
 
 
-async def test_the_dispatcher_relays_every_poll_and_sweeps_on_its_own_interval() -> None:
+async def test_the_dispatcher_relays_on_its_interval_and_sweeps_on_its_own() -> None:
     q = MemoryQueue()
-    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01, sweep_seconds=0.05)
+    w = Worker(
+        q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+        sweep_seconds=0.05,
+    )  # fmt: skip
     stop = asyncio.Event()
     task = asyncio.create_task(w.run(stop))
     await asyncio.sleep(0.2)
@@ -237,7 +240,10 @@ async def test_claim_dispatcher_and_recording_failures_never_stop_the_worker() -
         return None
 
     q = FlakyQueue([job(), job()])
-    w = Worker(q, {"k.one": ok}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
+    w = Worker(
+        q, {"k.one": ok}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01,
+        relay_seconds=0.01,
+    )  # fmt: skip
     stop = asyncio.Event()
     task = asyncio.create_task(w.run(stop))
     while len(q.completed) < 2 or q.relays < 3:  # noqa: ASYNC110 - polling a test double

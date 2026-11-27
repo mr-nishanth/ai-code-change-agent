@@ -13,8 +13,9 @@ call id or provider message id records nothing. Rows are immutable (no update or
 `Numeric(16, 10)` column stored it); token counts are numbers, absent when usage is unknown.
 
 U2-U4 `rows`: the ledger copies of one attempt (U2, consistent query per attempt) or one session
-(U4, consistent query), or the attempts of a Story (U3: GSI1 `ISSUEKEY#<key>` -> requests, then a
-consistent query of each request's `ATT#` items). Each row is joined to its attempt (C4: number and
+(U4, consistent query), or the attempts of a Story (U3: GSI1 `ISSUEKEY#<key>` -> request ids from
+the index keys alone (GSI1 projects keys only), then a consistent query of each request's `ATT#`
+items). Each row is joined to its attempt (C4: number and
 current status), request (C1: Jira issue key) and repository (R4: key) with batched, strongly
 consistent `BatchGetItem` reads, each item read at most once per call. Filters combine with AND,
 rows come back ordered by (created_at, call id), as the SQL query did. U5 (no filter, the whole
@@ -174,6 +175,7 @@ class _Joins:
 
     async def issue_attempts(self, issue_keys: Iterable[str]) -> list[uuid.UUID]:
         """U3: the attempts of every request with one of these Jira issue keys."""
+        unique = list(dict.fromkeys(issue_keys))
         requests = await asyncio.gather(
             *(
                 self._table.query(
@@ -181,15 +183,18 @@ class _Joins:
                     values={":pk": keys.issue_key_gsi1pk(key)},
                     index=GSI1,
                 )
-                for key in dict.fromkeys(issue_keys)
+                for key in unique
             )
         )
         request_ids: list[uuid.UUID] = []
-        for items in requests:
-            for item in items:
-                if item.get("entity") == "code_change_request":
-                    self.add_request(item)
-                    request_ids.append(decode_uuid(item.get("id"), "id"))
+        for issue_key, items in zip(unique, requests, strict=True):
+            for item in items:  # keys only: `REQ#<rid>` / `REQUEST`, GSI1PK = this issue key
+                pk = item.get("PK")
+                if item.get("SK") != keys.SK_REQUEST or not isinstance(pk, str):
+                    continue
+                request_id = decode_uuid(pk.removeprefix("REQ#"), "PK")
+                self.issue_keys[request_id] = issue_key
+                request_ids.append(request_id)
         attempt_lists = await asyncio.gather(
             *(
                 self._table.query(

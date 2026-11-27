@@ -541,6 +541,8 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             lease_seconds=settings.job_lease_seconds,
             heartbeat_seconds=settings.job_heartbeat_seconds,
             concurrency=settings.max_concurrent_jobs,
+            relay_seconds=settings.job_relay_seconds,
+            sweep_seconds=settings.job_sweep_seconds,
         )
         try:
             yield WorkerApp(worker, runner, changes, costs)

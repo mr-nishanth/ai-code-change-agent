@@ -203,7 +203,7 @@ def test_bootstrap_creates_tables_queues_and_bucket_idempotently(
         assert {kind for _, kind in first["app"]["attributes"]} == {"S"}
         assert first["app"]["gsis"] == [
             (f"GSI{n}", ((f"GSI{n}PK", "HASH"), (f"GSI{n}SK", "RANGE")), projection)
-            for n, projection in ((1, "ALL"), (2, "ALL"), (3, "KEYS_ONLY"))
+            for n, projection in ((1, "KEYS_ONLY"), (2, "INCLUDE"), (3, "KEYS_ONLY"))
         ]
         assert first["app"]["ttl"] == ("ENABLED", "expires_at")
 
@@ -221,6 +221,48 @@ def test_bootstrap_creates_tables_queues_and_bucket_idempotently(
         _delete_tables(app, checkpoints)
         _delete_queues(queue, f"{queue}-dlq")
         _delete_bucket(bucket)
+
+
+def test_dynamodb_script_refuses_index_drift_and_recreates_on_request(
+    floci: str, tmp_path: Path
+) -> None:
+    """A table with an old GSI layout (projection ALL) is refused with the recreate command, then
+    recreated from the schema when ACCA_DYNAMODB_RECREATE_ON_DRIFT=1 (local data only)."""
+    if shutil.which("aws") is None:
+        pytest.skip("aws CLI not found (the bootstrap scripts use it)")
+    prefix = f"s2116-{uuid.uuid4().hex[:12]}"
+    app, checkpoints = f"{prefix}-app", f"{prefix}-checkpoints"
+    old = json.loads((SCHEMA_DIR / "acca-app.json").read_text())
+    for index in old["GlobalSecondaryIndexes"]:
+        index["Projection"] = {"ProjectionType": "ALL"}
+    ddb = floci_client("dynamodb")
+    ddb.create_table(TableName=app, **old)
+    env = _script_env(
+        tmp_path, ACCA_DYNAMODB_TABLE_NAME=app, ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME=checkpoints
+    )
+    try:
+        refused = _run(["sh", str(INIT_DIR / "60-dynamodb.sh")], env)
+        assert refused.returncode == 5, refused.stdout + refused.stderr
+        assert "ACCA_DYNAMODB_RECREATE_ON_DRIFT=1" in refused.stderr
+        recreated = _run(
+            ["sh", str(INIT_DIR / "60-dynamodb.sh")],
+            {**env, "ACCA_DYNAMODB_RECREATE_ON_DRIFT": "1"},
+        )
+        assert recreated.returncode == 0, recreated.stdout + recreated.stderr
+        assert "recreated" in recreated.stdout
+        table = ddb.describe_table(TableName=app)["Table"]
+        assert {i["IndexName"]: i["Projection"] for i in table["GlobalSecondaryIndexes"]} == {
+            "GSI1": {"ProjectionType": "KEYS_ONLY"},
+            "GSI2": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["entity_type", "entity_id"]},
+            "GSI3": {"ProjectionType": "KEYS_ONLY"},
+        }
+        assert table["TableClassSummary"]["TableClass"] == "STANDARD"
+        again = _run(["sh", str(INIT_DIR / "60-dynamodb.sh")], env)  # idempotent once aligned
+        assert again.returncode == 0 and f"dynamodb table {app} exists" in again.stdout
+        names = ddb.list_tables()["TableNames"]
+        assert not [n for n in names if n.startswith(prefix) and n.endswith("-schema-probe")]
+    finally:
+        _delete_tables(app, checkpoints)
 
 
 def test_sqs_script_updates_an_existing_queue(floci: str, tmp_path: Path) -> None:

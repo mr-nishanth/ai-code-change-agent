@@ -55,7 +55,7 @@ def test_the_local_saver_uses_the_app_session_and_the_floci_endpoint_for_s3(
         "session": clients.session,
         "region_name": "us-east-1",
         "endpoint_url": "http://127.0.0.1:4566",
-        "ttl_seconds": 7_776_000,
+        "ttl_seconds": 2_592_000,  # ACCA_CHECKPOINT_TTL_DAYS default: 30 days
         "s3_offload_config": {
             "bucket_name": "s2116-bucket",
             "key_prefix": "checkpoints/",
@@ -88,3 +88,17 @@ def test_thread_ids_must_stay_under_200_characters() -> None:
 def test_the_runner_builds_short_thread_ids() -> None:
     attempt = uuid.uuid4()
     assert _config(attempt) == {"configurable": {"thread_id": f"attempt:{attempt}"}}
+
+
+def test_the_checkpoint_ttl_follows_acca_checkpoint_ttl_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        ACCA_AWS_ENDPOINT_URL="http://127.0.0.1:4566",
+        ACCA_CHECKPOINT_TTL_DAYS=7,
+    )
+    _, kwargs = _build(monkeypatch, settings)
+    assert kwargs["ttl_seconds"] == 7 * 86_400  # the saver's S3 lifecycle rule: 7 days
+    assert kwargs["consistent_read"] is True  # resume correctness, never traded for cost

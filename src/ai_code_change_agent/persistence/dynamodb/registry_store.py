@@ -246,12 +246,13 @@ class DynamoRegistryStore:
         return _repo(item) if item is not None else None
 
     async def list_repositories(self) -> list[Repository]:
-        items = await self._u.table.query(
+        """R5, display only: GSI2 `LIST#REPOSITORY` keys, then the items (eventual)."""
+        rows = await self._u.table.query(
             key_condition="GSI2PK = :pk",
             values={":pk": keys.GSI_LIST_REPOSITORY},
             index=GSI2,
         )
-        return [_repo(item) for item in items]
+        return [_repo(item) for item in await self._u.table.fetch(rows, consistent=False)]
 
     async def _bump(self, repository_id: uuid.UUID, changes: Item, **kwargs: Any) -> Repository:
         key = keys.repository(repository_id)
@@ -464,16 +465,18 @@ class DynamoRegistryStore:
             rows = [item] if item is not None else []
         elif jira_project_key is not None:
             rows = await self._u.query(keys.project_pk(jira_project_key), keys.SK_MAPPING)
-        elif repository_id is not None:  # display only (eventual GSI1)
-            rows = await self._u.table.query(
+        elif repository_id is not None:  # display only (eventual GSI1 keys, eventual items)
+            index_rows = await self._u.table.query(
                 key_condition="GSI1PK = :pk",
                 values={":pk": keys.repository_mappings_gsi1pk(repository_id)},
                 index=GSI1,
             )
-        else:  # display only (eventual GSI2, sorted by project, created_at)
-            rows = await self._u.table.query(
+            rows = await self._u.table.fetch(index_rows, consistent=False)
+        else:  # display only (eventual GSI2 keys and items, sorted by project, created_at)
+            index_rows = await self._u.table.query(
                 key_condition="GSI2PK = :pk", values={":pk": keys.GSI_LIST_MAPPING}, index=GSI2
             )
+            rows = await self._u.table.fetch(index_rows, consistent=False)
         mappings = sorted(
             (_mapping(row) for row in rows), key=lambda m: (m.jira_project_key, m.created_at)
         )
@@ -508,8 +511,9 @@ class DynamoAuditLog:
     async def list_events(
         self, *, entity_type: str | None = None, entity_id: uuid.UUID | None = None, limit: int = 50
     ) -> list[AuditEvent]:
-        """R19: newest first. Both filters: the entity's partition; otherwise the GSI2 listing,
-        filtered by whichever one is given."""
+        """R19 (display only, eventually consistent): newest first. Both filters: the entity's
+        partition; otherwise the GSI2 listing, filtered by whichever one is given on the index
+        (GSI2 projects `entity_type` and `entity_id`), then the matching events are fetched."""
         if limit < 1:
             return []
         if entity_type is not None and entity_id is not None:
@@ -519,6 +523,7 @@ class DynamoAuditLog:
                     ":pk": keys.audit_pk(entity_type, str(entity_id)),
                     ":ev": keys.SK_AUDIT_EVENT,
                 },
+                consistent=False,
                 forward=False,
                 limit=limit,
             )
@@ -539,6 +544,7 @@ class DynamoAuditLog:
                 forward=False,
                 limit=limit,
             )
+            rows = await self._u.table.fetch(rows, consistent=False)
         return [_event(row) for row in rows]
 
 

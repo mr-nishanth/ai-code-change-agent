@@ -104,7 +104,7 @@ async def test_randomised_kill_and_restart_loses_no_job_and_never_runs_one_twice
         queue = make(app_table, job_queues, sweep_grace_seconds=2)
         return Worker(queue, {"k.test": tracker.handle}, lease_seconds=2,
                       heartbeat_seconds=0.5, concurrency=2, poll_seconds=0.05,
-                      sweep_seconds=1)  # fmt: skip
+                      relay_seconds=0.05, sweep_seconds=1)  # fmt: skip
 
     for _ in range(100):
         task = asyncio.create_task(worker().run(asyncio.Event()))

@@ -67,7 +67,7 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 
 | Entity | PK | SK | GSIs | Notes / example |
 |---|---|---|---|---|
-| Jira delivery | `DELIVERY#<delivery_id>` | `DELIVERY` | - | `DELIVERY#5b2c...-webhook-17`. Written once with final `processing_result`, `request_id` |
+| Jira delivery | `DELIVERY#<delivery_id>` | `DELIVERY` | - | `DELIVERY#5b2c...-webhook-17`. Written once with final `processing_result`, `request_id`; TTL `expires_at` (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30 days) |
 | Issue guard | `JIRAISSUE#<jira_issue_id>` | `GUARD` | - | `JIRAISSUE#10042` -> `request_id`. Unique Story |
 | Code change request | `REQ#<rid>` | `REQUEST` | GSI1 `ISSUEKEY#<jira_issue_key>` / `REQ#<created_at>#<rid>` | Status projection, assignment, `row_version` |
 | Attempt | `REQ#<rid>` | `ATT#<aid>` | GSI2 `LIST#ATTEMPT` / `<created_at>#<aid>` | Same attributes as today, plus `request_id` |
@@ -138,18 +138,22 @@ optimistic race. `CodeChangeService` and `RepositoryRegistryService` retry the w
 
 | Index | Keys | Projection | Items | Used by | Consistency note |
 |---|---|---|---|---|---|
-| GSI1 | `GSI1PK`, `GSI1SK` | ALL | Request (`ISSUEKEY#`), mapping (`REPOMAPS#`) | U3 issue -> requests; R17 by repository (display) | Eventual. Requests exist long before a cost query; display only for mappings. Authorisation never uses a GSI |
-| GSI2 | `GSI2PK`, `GSI2SK` | ALL | `LIST#REPOSITORY`, `LIST#MAPPING`, `LIST#AUDIT`, `LIST#ATTEMPT` | R5, R17 (no filter), R19 (no filter), studio S1 | Eventual; operator and studio listings |
+| GSI1 | `GSI1PK`, `GSI1SK` | KEYS_ONLY | Request (`ISSUEKEY#`), mapping (`REPOMAPS#`) | U3 issue -> request ids (from the index keys alone); R17 by repository (display: keys, then an eventual `BatchGetItem`) | Eventual. Requests exist long before a cost query; display only for mappings. Authorisation never uses a GSI |
+| GSI2 | `GSI2PK`, `GSI2SK` | INCLUDE `entity_type`, `entity_id` | `LIST#REPOSITORY`, `LIST#MAPPING`, `LIST#AUDIT`, `LIST#ATTEMPT` | R5, R17 (no filter), R19 (filters on the two projected attributes), studio S1; keys, then an eventual `BatchGetItem` | Eventual; operator and studio listings |
 | GSI3 | `GSI3PK`, `GSI3SK` | KEYS_ONLY | Non-terminal jobs: `DISPATCH` (outbox, not sent) or `SWEEP` (sent) / `<due_at>#<jid>` | Relay (`DISPATCH`) and sweep (`SWEEP`) (J8) | Eventual; each hit is re-checked with a consistent `GetItem` |
 
-No LSIs (they would cap item collections at 10 GB and must be created with the table).
+No LSIs (they would cap item collections at 10 GB and must be created with the table). No index projects
+ALL: an index stores (and is written for) only what a listing needs to find its items, see section 13.
 
 ## 7. TTL, item size, hot partitions, pagination
 
-**TTL.** Attribute `expires_at` on `acca-app`. Set only on terminal job items (`SUCCEEDED`/`DEAD`;
-default retention 90 days). Never set on domain records, the usage ledger, the audit log or dedupe
-guards: job dedupe is permanent today. The checkpoint table uses the library's `ttl` attribute
-(90 days, owner-approved). TTL deletion is lazy, "within a few days" on AWS and about 60 s on Floci
+**TTL.** Attribute `expires_at` on `acca-app`. Set on terminal job items (`SUCCEEDED`/`DEAD`;
+retention 90 days) and on Jira delivery records (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30
+days: Jira redelivers within hours, and the permanent Story guard keeps a late redelivery from creating
+anything). Never set on domain records, the usage ledger, the audit log or dedupe guards
+(`JIRAISSUE#`, `JOBKEY#`, `LLMCALL#`, `LLMMSG#` stay forever). The checkpoint table uses the
+library's `ttl` attribute (`ACCA_CHECKPOINT_TTL_DAYS`, default 30 days, owner cost request; the
+saver installs the matching S3 lifecycle rule for offloaded payloads). TTL deletion is lazy, "within a few days" on AWS and about 60 s on Floci
 (`dynamodb.md:151-155`). Correctness never depends on it.
 
 **Item size (400 KB).** Enforced by Floci (probe: a 410 KB item was rejected with
@@ -185,8 +189,8 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 | Step | DynamoDB (authoritative) | SQS (delivery) |
 |---|---|---|
 | Enqueue (J1, W6) | `TransactWriteItems`: `JOBKEY#` guard + `JOB#` item (QUEUED, `GSI3` set = outbox row) | Worker-side producers send `{"job_id"}` right after commit and then move the GSI3 entry from `DISPATCH` to `SWEEP` (`dispatched_at` set; conditional on still being in `DISPATCH`). The API never sends (no SQS permission); the relay picks its jobs up |
-| Relay (J8) | `Query GSI3 DISPATCH` for due rows, consistent re-read | `SendMessage`, then move the job from `DISPATCH` to `SWEEP` (the outbox entry is cleared). Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
-process) every 2 s, the poll interval today |
+| Relay (J8) | `Query GSI3 DISPATCH` for due rows, one consistent `BatchGetItem` re-read | `SendMessage`, then move the job from `DISPATCH` to `SWEEP` (the outbox entry is cleared). Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
+process) every `JOB_RELAY_SECONDS` (default 30 s; only a fallback, producers send right after commit) |
 | Claim (J2) | Conditional `UpdateItem` (same predicate as `_CLAIM`), `ALL_NEW` | `ReceiveMessage` (`WaitTimeSeconds` 20, `VisibilityTimeout` = lease, `MaxNumberOfMessages` 1 per free slot) |
 | Not claimable | Read the item | Terminal -> `DeleteMessage`; not due -> `ChangeMessageVisibility(available_at - now)`; leased elsewhere -> visibility = remaining lease; exhausted and expired -> mark DEAD, `DeleteMessage` |
 | Heartbeat (J4) | Conditional lease extension (owner, RUNNING, not expired) | `ChangeMessageVisibility(lease)`; failure is non-fatal (DynamoDB decides) |
@@ -194,7 +198,7 @@ process) every 2 s, the poll interval today |
 | Fail, retry (J6) | Conditional QUEUED, `available_at = now + retry` (le 900 s) | `ChangeMessageVisibility(retry)` on the same message: no new message, no outbox row |
 | Fail, dead | Conditional DEAD | `DeleteMessage` |
 | Worker crash | Lease expires | Visibility expires with the lease; the next receiver's conditional claim succeeds (`attempts + 1`), as today |
-| Lost or dead-lettered message for a live job | Sweep (every 60 s) queries GSI3 `SWEEP` (non-terminal, sent) and, after a consistent re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. Terminal transitions `REMOVE` the GSI3 keys |
+| Lost or dead-lettered message for a live job | Sweep (every `JOB_SWEEP_SECONDS`, default 300 s, at least the relay interval) queries GSI3 `SWEEP` (non-terminal, sent) and, after one consistent `BatchGetItem` re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. Terminal transitions `REMOVE` the GSI3 keys |
 
 ### 8.3 Outbox evaluated
 
@@ -273,7 +277,7 @@ process) every 2 s, the poll interval today |
 
 `DynamoDBSaver(table_name=<checkpoint table>, session=<app session>, boto_config=<app config>,
 consistent_read=True, s3_offload_config={"bucket_name": <bucket>, "endpoint_url": <local only>},
-ttl_seconds=7_776_000)` (90 days), pinned `langgraph-checkpoint-aws==1.3.0` (exact: 15 releases since
+ttl_seconds=ACCA_CHECKPOINT_TTL_DAYS * 86_400)` (default 30 days, 1..365; was 90 days), pinned `langgraph-checkpoint-aws==1.3.0` (exact: 15 releases since
 1.0.4). Add the conformance suite to the `floci` tests so an upgrade is gated.
 
 ## 10. Floci 2.5.0 verification
@@ -388,3 +392,90 @@ for real Bedrock spend.
 | Workspaces (`WORKSPACE_ROOT`) | Local | **Stay local** (Docker sandbox) |
 | JSON documents in domain items (declaration, profile content, audit metadata) | JSONB | DynamoDB string attributes (all far below 400 KB) |
 | Studio PR link (`studio/history.py:148-166` reads the artifact folder) | Filesystem | Through the `ArtifactStore` port |
+
+## 13. Cost
+
+Prices change and differ by region, so this section reasons in request units and bytes only. The
+unit rules and the current prices are on the AWS pricing page (aws.amazon.com/dynamodb/pricing, "on-demand
+capacity"): one read request unit (RRU) is a strongly consistent read of up to 4 KB, an eventually
+consistent read is half an RRU, a transactional read two; one write request unit (WRU) is a write of up
+to 1 KB, a transactional write two. A `Query` is charged on the summed size of the items it reads
+(rounded up to 4 KB once), `GetItem` and every `BatchGetItem` item on its own size (each rounded up to
+4 KB). `ProjectionExpression` and `FilterExpression` reduce what comes back, never what is charged.
+Every write that adds, changes or removes an index entry is also charged as an index write; a write that
+touches no projected attribute and no index key writes no index. Storage is charged per GB-month,
+indexes included. On-demand has no per-table or per-index fixed charge.
+
+**Billing mode: on-demand (`PAY_PER_REQUEST`) for both tables.** Traffic is bursty and low (a Story is
+tens of writes spread over minutes to hours; idle most of the day), so paying per request beats paying
+for provisioned capacity by the hour. Provisioned capacity with auto-scaling pays off only for steady,
+predictable traffic: compare `RRU/month * price_rru + WRU/month * price_wru` (on-demand) with
+`(RCU + WCU provisioned at the auto-scaling target utilisation) * hours * hourly price`; revisit for the
+production milestone once Task 18's per-Story unit counts and real Story volume are known.
+
+**Table class: `STANDARD` for both tables** (`TableClass` in `infra/floci/schema/*.json`). Both tables
+are request-dominated (the checkpoint table is written on every graph step; the app table is read and
+written on every transition). `STANDARD_INFREQUENT_ACCESS` lowers the storage price and raises the
+request price, so it pays off only when storage is the larger part of a table's bill (large, rarely
+read data); the app table's ledger and audit history could reach that after years, the checkpoint table
+never will with a 30-day TTL. The class can be switched with `UpdateTable` (AWS limits how often).
+
+**Point-in-time recovery and deletion protection** are production choices, not enabled locally.
+Deletion protection has no charge and should be on for both production tables. Point-in-time recovery is
+charged per GB-month of table size: worth it for `acca-app` (the only copy of requests, registry,
+ledger and audit history), optional for `acca-checkpoints` (re-creatable state, 30-day TTL).
+
+**Indexes: three, each serving real queries.** GSI1: U3 (cost report by Story: issue key -> request ids)
+and R17 by repository. GSI2: studio S1 (recent attempts), R5 (repositories), R17 (all mappings), R19
+(audit, optionally filtered). GSI3: the outbox relay and the sweep (J8). Merging GSI2 into GSI1 would not
+save money: on-demand has no per-index charge, and the same items would be written to the merged index.
+Projections are minimal (section 6):
+
+| Index | Projection | Why | Effect |
+|---|---|---|---|
+| GSI1 | KEYS_ONLY | U3 needs only the request id (from `PK`); R17 re-reads the mappings | A request's status projection changes on every attempt transition: no GSI1 write any more (at least 1 WRU saved per transition) |
+| GSI2 | INCLUDE `entity_type`, `entity_id` | Listings fetch their items with one eventual `BatchGetItem`; R19 filters on the two attributes inside the index | An attempt changes on every transition: no GSI2 write any more (at least 1 WRU per transition); audit events are stored in the index as keys plus two short attributes instead of their metadata |
+| GSI3 | KEYS_ONLY | The relay and the sweep re-read every hit consistently anyway | Heartbeats, claims and lease changes never write GSI3; only the DISPATCH -> SWEEP move and the terminal REMOVE do |
+
+The price is paid on listings: a studio page of 50 attempts reads about 1.5 RRU of index keys plus
+25 RRU (50 eventual `BatchGetItem` reads) instead of about 3.5 RRU from an ALL index. A Story's attempt
+makes 10-20 transitions, each saving at least 2 index writes, so the trade pays off unless the attempt
+list is opened many times per attempt (the studio lists on demand; it never polls the list).
+
+**Sparse indexes.** Only these items carry index keys: GSI1 `code_change_request`, `project_mapping`;
+GSI2 `attempt`, `repository`, `project_mapping`, `audit_event`; GSI3 `job` while not terminal (the
+terminal transition removes the keys). Guards, pointers, deliveries, aliases, profile versions,
+approvals, threads, parents, children and usage rows carry none (`tests/unit/persistence_dynamodb/
+test_table_schema.py`).
+
+**Reads.** Decision paths (claims, state transitions, dedupe, approvals, authorisation:
+project -> repository mapping and repository status) read strongly consistent and are never cached.
+Display-only paths read eventually consistent (half price): the studio attempt list, R5, R17 without a
+project, R19 (both the GSI2 listing and the entity partition). The cost report (U2-U4) stays consistent
+because the parent's Jira report is built from it. Hot-path request counts are pinned by
+`tests/integration/floci/test_dynamo_call_counts.py`: webhook intake 1 `TransactWriteItems`; job claim
+1 `ReceiveMessage` + 1 `UpdateItem`; heartbeat and completion 1 `UpdateItem` each; an attempt
+transition 3 reads (attempt, approvals, request) + 1 `TransactWriteItems`; an idle relay or sweep tick
+1 `Query`. Writes whose result is not used ask for `ReturnValues=NONE` (no charge difference: it saves
+the response bytes). The relay and the sweep re-read their hits with one `BatchGetItem` per 100 jobs
+(same units as one `GetItem` each, far fewer requests).
+
+**Polling defaults and idle cost.** Per worker, with no work: the relay (`JOB_RELAY_SECONDS`, default
+30 s) runs 2,880 GSI3 Queries a day, the sweep (`JOB_SWEEP_SECONDS`, default 300 s) 288; an empty
+eventually consistent Query is charged the 0.5 RRU minimum, so about 1,584 RRU per worker per day
+(before: 2 s and 60 s, about 22,320 RRU a day). Each sweep also reads every live job (1 RRU each,
+consistent). The relay is only a fallback: worker-side producers send right after commit, so a lower
+relay rate delays only intake jobs written by the API (up to one relay interval) and jobs whose direct
+send failed. SQS long polling (`WaitTimeSeconds` 20) bounds idle `ReceiveMessage` calls per claim slot
+to about 4,320 a day (SQS is priced per request; see its pricing page).
+
+**TTLs** (section 7): terminal jobs 90 days, Jira delivery records 30 days, checkpoints 30 days (DynamoDB
+TTL plus the S3 lifecycle rule on offloaded payloads). TTL deletes are not charged as writes. Audit
+events, the usage ledger and every dedupe guard are permanent.
+
+**Item size and S3 offload.** Hot items stay within one write unit: measured on Floci (largest of each
+in `test_dynamo_call_counts.py`) `code_change_request` 526 bytes, `attempt` 551, `job` 557,
+`jira_delivery` 420. Large text never sits in hot items: artifacts (plans, manifests, reports) are in
+S3 and attempts hold only a reference and a hash; checkpoint payloads over the library threshold
+(358,400 bytes) go to S3. The largest JSON documents (parent declaration, profile content, audit
+metadata) are read only by their own operations. Attribute names stay readable.
