@@ -19,3 +19,10 @@ node_modules/
 .swarm/
 .claude/settings.local.json
 *.log
+# Terraform (infra/terraform/local): provider cache and state stay local;
+# .terraform.lock.hcl is committed on purpose.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
