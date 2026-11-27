@@ -6,7 +6,7 @@ mypy
 # Web stack for repositories whose approved plan builds a FastAPI service (added for KAN-7, whose
 # stored plan declares FastAPI/Uvicorn/Pydantic at runtime and httpx for FastAPI's TestClient).
 # Installed at BUILD time only; the sandbox stays network-less (ADR C2). Dynamic per-repository
-# provisioning is proposed in docs/decisions/ADR-010-dynamic-dependency-provisioning.md.
+# provisioning is implemented as described in docs/decisions/ADR-010-dynamic-dependency-provisioning.md.
 fastapi
 uvicorn
 pydantic

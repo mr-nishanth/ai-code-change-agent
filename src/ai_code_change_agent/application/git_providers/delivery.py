@@ -29,16 +29,6 @@ class DeliveryOutcome(StrEnum):
     DELIVERY_OUTCOME_UNKNOWN = "DELIVERY_OUTCOME_UNKNOWN"  # a write may or may not have happened
 
 
-FAILURE_OUTCOMES = frozenset(
-    {
-        DeliveryOutcome.FAILED,
-        DeliveryOutcome.DELIVERY_FAILED,
-        DeliveryOutcome.DELIVERY_OUTCOME_UNKNOWN,
-        DeliveryOutcome.GITHUB_BRANCH_PUBLISHED,  # a branch without a pull request is not success
-    }
-)
-
-
 @dataclass(frozen=True)
 class DeliveryTarget:
     """The registered repository, read from the registry by the platform (never from a caller)."""

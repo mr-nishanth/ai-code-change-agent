@@ -31,7 +31,6 @@ SCOPES: dict[str, dict[str, str]] = {
     "read": {"metadata": "read", "contents": "read"},
     "write": {"metadata": "read", "contents": "write", "pull_requests": "write"},
 }
-REQUIRED_PERMISSIONS = SCOPES["write"]  # what the installation must grant for delivery
 METADATA_ONLY = {"metadata": "read"}
 _RANK = {"read": 1, "write": 2}
 HEADERS = {

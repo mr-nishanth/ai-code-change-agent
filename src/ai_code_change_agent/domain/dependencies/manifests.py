@@ -54,7 +54,6 @@ _WHEEL_TAGS_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?-[A-Za-z0-9.!+_]+"
     r"(?:-[0-9][A-Za-z0-9._]*)?-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$"
 )
-_SELF_EXTRA_RE = re.compile(r"^([A-Za-z0-9._-]+)(?:\[([^\]]*)\])?(?:\s*;(.*))?$")
 
 _TEST_DEV_GROUP_NAMES = frozenset(
     {"dev", "test", "tests", "testing", "lint", "typing", "typecheck", "check", "qa", "ci"}

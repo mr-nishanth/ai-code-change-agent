@@ -22,11 +22,11 @@
 
 Planning showed that Stories need packages known only after the agent investigates the repository (KAN-7: FastAPI, Uvicorn, Pydantic, httpx). Today packages exist only if an operator bakes them into the single execution image. Everything else is BLOCKED.
 
-## Current approved behaviour (C2)
+## Behaviour before this ADR (C2)
 
 The Deep Agent executes only inside its sandbox, which has no network (plus the other hardening listed in C2). The validation container also has no network. **When dependencies cannot be prepared offline, the attempt is BLOCKED and network access is never granted.** `orchestration/steps.py::dependency_preparation` enforces this by blocking any INSTALL command or any command with `network != none`.
 
-## Proposed behaviour
+## Decision
 
 1. Unchanged: the coding sandbox and the validation container never have network.
 2. The plan carries a structured, pinned dependency request. The PLAN approval (bound to the plan hash) approves exactly those packages.
@@ -38,7 +38,7 @@ The Deep Agent executes only inside its sandbox, which has no network (plus the 
 5. Installation happens offline (`pip install --no-index --require-hashes --no-deps`).
 6. Missing wheels, hash mismatches, unapproved or changed dependencies all fail closed as BLOCKED. A changed dependency set changes the plan hash and requires fresh approval.
 
-Proposed new C2 wording (dependencies clause): "Dependencies: repository profiles plus human-approved, hash-locked wheel bundles prepared by a trusted resolver with egress only to allow-listed package indexes, mounted read-only into the offline sandbox. Anything that cannot be prepared that way (sdist or native builds, unapproved packages) is BLOCKED. The sandbox and validation containers are never given network access."
+Amended C2 wording (dependencies clause): "Dependencies: repository profiles plus human-approved, hash-locked wheel bundles prepared by a trusted resolver with egress only to allow-listed package indexes, mounted read-only into the offline sandbox. Anything that cannot be prepared that way (sdist or native builds, unapproved packages) is BLOCKED. The sandbox and validation containers are never given network access."
 
 ## Security implications
 
@@ -57,20 +57,20 @@ Proposed new C2 wording (dependencies clause): "Dependencies: repository profile
 | C. Network-enabled sandbox (allow-list proxy) | **Rejected**: prompt-injected agents could install arbitrary or typosquatted packages, exfiltrate code through allowed hosts (URLs and package-name lookups), reach internal networks and run install scripts. It removes the main isolation boundary |
 | D. Agent-requested install at runtime through a broker tool | Rejected: it gives the model an acquisition capability and bypasses the plan-time approval |
 
-## Recommendation
+## Outcome
 
-Approve B as an amendment to C2, implemented in the roadmap order of the design document. Keep A for stacks needing native builds. Never adopt C.
+B was approved as an amendment to C2 and implemented in the roadmap order of the design document (see *Implemented form* above). A is kept for stacks needing native builds. C is never adopted.
 
 ## Interim change already made (within current C2)
 
 `execution-python:0.2.0` adds hash-pinned fastapi, uvicorn, pydantic and httpx at **build time** (operator action, current process), justified by the stored KAN-7 plan. The sandbox remains offline.
 
-## Required owner approval
+## Owner approval (given; see Status)
 
-- [ ] Approve amending C2 as proposed.
-- [ ] Approve the allowed package index list (default: `https://pypi.org/simple` only).
-- [ ] Approve egress enforcement for the resolver container (Docker network + egress proxy, or host firewall).
-- [ ] Approve limits (direct and transitive package counts, bundle size, preparation timeout).
+- [x] Amending C2 as described above.
+- [x] The allowed package index list (default: `https://pypi.org/simple` only).
+- [x] Egress enforcement for the resolver container (Docker network + egress proxy, or host firewall).
+- [x] Limits (direct and transitive package counts, bundle size, preparation timeout).
 
 ## Hardening and verified behaviour (2026-11-26)
 

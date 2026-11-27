@@ -21,7 +21,6 @@ from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.delivery.manifest import DeliveryManifest
 from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.multirepo.models import (
-    CHILD_TERMINAL,
     Child,
     ChildStatus,
     ContractDoc,
@@ -528,10 +527,3 @@ class Coordinator:
         refreshed = await self._store.child(child_id)
         assert refreshed is not None  # noqa: S101
         return refreshed
-
-
-def child_statuses(children: Sequence[Child]) -> dict[str, str]:
-    return {c.repository_key: c.status.value for c in children}
-
-
-TERMINAL_CHILD = CHILD_TERMINAL

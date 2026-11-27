@@ -51,7 +51,7 @@ Details are in [SETUP-JIRA-WEBHOOK.md](SETUP-JIRA-WEBHOOK.md).
 
 ```bash
 uv run ai-code-change repositories register --from-provider <owner>/<repo> --project <JIRA_KEY> --enable
-#   --toolchain node   for a Node repository; --test-command "..." via init-profile to override
+#   --test-command "..." via init-profile to override
 uv run ai-code-change repositories list
 ```
 

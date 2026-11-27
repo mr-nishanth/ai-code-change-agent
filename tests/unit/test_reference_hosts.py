@@ -11,7 +11,6 @@ from ai_code_change_agent.application.references.ports import ReferenceRefusedEr
 from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.reference_hosts import (
     host_allowed,
-    load_allowed_hosts,
     load_reference_sources,
     normalize_host,
 )
@@ -71,11 +70,11 @@ def write(tmp_path: Path, text: str) -> Path:
 
 def test_the_host_file_is_loaded_and_normalised(tmp_path: Path) -> None:
     path = write(tmp_path, "version: 1\nallowed_hosts:\n  - Pydantic.dev.\n  - docs.python.org\n")
-    assert load_allowed_hosts(path) == TRUSTED
+    assert load_reference_sources(path).allowed_hosts == TRUSTED
 
 
 def test_a_missing_host_file_means_no_trusted_host(tmp_path: Path) -> None:
-    assert load_allowed_hosts(tmp_path / "absent.yaml") == frozenset()
+    assert load_reference_sources(tmp_path / "absent.yaml").allowed_hosts == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -93,7 +92,7 @@ def test_a_missing_host_file_means_no_trusted_host(tmp_path: Path) -> None:
 )
 def test_an_invalid_host_file_fails(tmp_path: Path, text: str) -> None:
     with pytest.raises(ValueError, match=r"reference_sources\.yaml"):
-        load_allowed_hosts(write(tmp_path, text))
+        load_reference_sources(write(tmp_path, text))
 
 
 def test_settings_load_the_host_file_and_fail_on_an_invalid_one(tmp_path: Path) -> None:
@@ -124,7 +123,6 @@ def test_secondary_hosts_are_optional_normalised_and_must_be_trusted(tmp_path: P
     sources = load_reference_sources(ranked)
     assert sources.secondary_hosts == frozenset({"pypi.org"})
     assert sources.allowed_hosts == frozenset({"pypi.org", "docs.python.org"})
-    assert load_allowed_hosts(ranked) == sources.allowed_hosts
 
 
 @pytest.mark.parametrize(

@@ -116,11 +116,6 @@ def _hosts(path: Path, entries: list[object]) -> frozenset[str]:
     return frozenset(hosts)
 
 
-def load_allowed_hosts(path: Path) -> frozenset[str]:
-    """The trusted hosts of `load_reference_sources`."""
-    return load_reference_sources(path).allowed_hosts
-
-
 def load_reference_sources(path: Path) -> ReferenceSources:
     """Read and validate the host file. A missing file means no trusted host (the research tools
     are not offered); a present but invalid file raises ValueError so startup fails. The only

@@ -82,15 +82,6 @@ S = AttemptStatus
 _log = get_logger("workflow")
 
 
-class Sandbox(Protocol):
-    @property
-    def id(self) -> str: ...
-    @property
-    def writable(self) -> bool: ...
-    @property
-    def disk_limit_exceeded(self) -> bool: ...
-
-
 class SandboxStarter(Protocol):
     async def start(
         self, handle: WorkspaceHandle, work: Path, *, writable: bool, toolchain: str = "python"
