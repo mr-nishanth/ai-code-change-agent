@@ -35,6 +35,17 @@ services:
       FLOCI_SERVICES_RDS_ENDPOINT_HOST: localhost
       FLOCI_SERVICES_ECR_URI_STYLE: path # Docker Engine 29 containerd image store
       FLOCI_SERVICES_ECS_IMAGE_PULL_BEHAVIOR: prefer-cached
+      # Bedrock Runtime proxy (opt-in, local only; Floci 2.5.0 docs/services/bedrock-runtime.md:34-41).
+      # The default backend is `stub` (fixed reply, no model). With `proxy`, Converse and
+      # ConverseStream from ChatBedrockConverse (LLM_PROVIDER=bedrock, ACCA_BEDROCK_ENDPOINT_URL)
+      # are forwarded to Anthropic's OpenAI-compatible endpoint. That is a real, paid model call:
+      # it needs the owner's explicit authorisation. The key is read from the developer's shell at
+      # `up` time (export ANTHROPIC_API_KEY first) and never written to a committed file. Map each
+      # Bedrock model id the application uses to a Claude API model id.
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_BACKEND: proxy
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_URL: https://api.anthropic.com/v1
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_API_KEY: ${ANTHROPIC_API_KEY:?export ANTHROPIC_API_KEY in the shell}
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_MODEL_MAPPING: us.anthropic.claude-haiku-4-5-20251001-v1:0=claude-haiku-4-5
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"] # probes /_floci/init; the image has no curl
       interval: 5s

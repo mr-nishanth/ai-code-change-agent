@@ -57,6 +57,17 @@ def probe_config(timeout_seconds: float) -> Config:
     )
 
 
+def local_session(region: str) -> Any:
+    """A boto3 session for the local emulator: static dummy credentials, no profile, no AWS config
+    or shared-credentials file (also used by the LLM factory's Floci Bedrock mode)."""
+    return boto3.session.Session(
+        aws_access_key_id=LOCAL_ACCESS_KEY_ID,
+        aws_secret_access_key=LOCAL_SECRET_ACCESS_KEY,
+        region_name=region,
+        botocore_session=botocore.session.Session(session_vars=_NO_AMBIENT_FILES),
+    )
+
+
 class AwsClients:
     """DynamoDB, SQS and S3 clients for one Settings; `queue_url()` resolves the job queue once."""
 
@@ -65,12 +76,7 @@ class AwsClients:
         self.endpoint_url: str | None = settings.aws_endpoint_url
         self.region: str = settings.aws_region
         if self.endpoint_url is not None:
-            self.session = boto3.session.Session(
-                aws_access_key_id=LOCAL_ACCESS_KEY_ID,
-                aws_secret_access_key=LOCAL_SECRET_ACCESS_KEY,
-                region_name=self.region,
-                botocore_session=botocore.session.Session(session_vars=_NO_AMBIENT_FILES),
-            )
+            self.session = local_session(self.region)
         else:
             self.session = boto3.session.Session(region_name=self.region)
         self._queue_url: str | None = None

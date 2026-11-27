@@ -222,3 +222,143 @@ def test_bedrock_retries_throttling_within_the_policy_and_never_retries_access_d
         model.invoke([HumanMessage(content="hi")])
     assert err.value.response["Error"]["Code"] == error_type
     assert len(received) == expected_requests
+
+
+# ---- bedrock via the local Floci proxy (ACCA_BEDROCK_ENDPOINT_URL) ----------------------------
+
+FLOCI = "http://127.0.0.1:4577"
+
+
+def floci_bedrock(**kw: object) -> Settings:
+    return bedrock(**({"ACCA_BEDROCK_ENDPOINT_URL": FLOCI + "/"} | kw))
+
+
+def test_floci_mode_uses_the_local_endpoint_and_the_dummy_credentials_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The developer's AWS identity and endpoint settings are never read: a missing profile, a
+    bogus endpoint in the environment and in the config file change nothing."""
+    from botocore.awsrequest import AWSResponse
+    from langchain_core.messages import HumanMessage
+
+    config = tmp_path / "aws_config"
+    config.write_text("[default]\nendpoint_url = http://203.0.113.1:1\nregion = ap-south-1\n")
+    for key, value in {
+        "AWS_PROFILE": "does-not-exist",
+        "AWS_ENDPOINT_URL": "http://203.0.113.1:1",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME": "http://203.0.113.1:1",
+        "AWS_CONFIG_FILE": str(config),
+        "AWS_ACCESS_KEY_ID": "AKIAREALLOOKING",
+        "AWS_SECRET_ACCESS_KEY": "real-looking",
+        "AWS_SESSION_TOKEN": "real-looking-token",
+    }.items():
+        monkeypatch.setenv(key, value)
+    settings = floci_bedrock()
+    assert (
+        settings.bedrock_endpoint_url == FLOCI and settings.llm_ledger_provider == "bedrock-floci"
+    )
+    model = build_chat_model(settings)
+    assert model.__class__.__name__ == "ChatBedrockConverse"
+    for client in (model.client, model.bedrock_client):  # type: ignore[attr-defined]
+        assert client.meta.endpoint_url == FLOCI
+        creds = client._request_signer._credentials
+        assert (creds.access_key, creds.secret_key, creds.token) == ("test", "test", None)
+    assert model.config.ignore_configured_endpoint_urls is True  # type: ignore[attr-defined]
+    assert model.client.meta.config.retries["total_max_attempts"] == 3  # type: ignore[attr-defined]
+
+    class Raw:
+        def stream(self, **_: object) -> Iterator[bytes]:
+            yield b'{"message":"stop here"}'
+
+    sent: list[object] = []
+
+    def send(request: object, **_: object) -> AWSResponse:
+        sent.append(request)
+        headers = {"x-amzn-ErrorType": "ValidationException", "content-type": "application/json"}
+        return AWSResponse(request.url, 400, headers, Raw())  # type: ignore[attr-defined]
+
+    model.client.meta.events.register("before-send.bedrock-runtime.Converse", send)  # type: ignore[attr-defined]
+    with pytest.raises(Exception, match="stop here"):
+        model.invoke([HumanMessage(content="hi")])
+    url = sent[0].url  # type: ignore[attr-defined]
+    assert url.startswith(FLOCI + "/model/") and "Credential=test/" in str(
+        sent[0].headers["Authorization"]  # type: ignore[attr-defined]
+    )
+
+
+def test_real_bedrock_has_no_endpoint_override_and_keeps_its_label() -> None:
+    settings = bedrock()
+    assert settings.bedrock_endpoint_url is None and settings.llm_ledger_provider == "bedrock"
+    model = build_chat_model(settings)
+    assert model.endpoint_url is None  # type: ignore[attr-defined]
+    assert s(llm_model="m", anthropic_api_key="k").llm_ledger_provider == "anthropic"
+
+
+def test_floci_mode_never_streams_on_its_own() -> None:
+    model = build_chat_model(floci_bedrock())
+    assert "streaming" not in model.model_fields_set
+    assert model._should_stream(async_api=True, run_manager=None) is False
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_deployed_environments_refuse_the_bedrock_endpoint(
+    env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ACCA_AWS_ENDPOINT_URL")
+    with pytest.raises(ConfigurationError, match="must not set ACCA_BEDROCK_ENDPOINT_URL"):
+        floci_bedrock(app_env=env, **PROD)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1:4566",
+        "http://bedrock-runtime.us-east-1.amazonaws.com",
+        "http://bedrock-runtime.us-east-1.api.aws",
+        "http://bedrock-runtime.cn-north-1.amazonaws.com.cn",
+        "http://floci.example.com:4566",
+        "http://203.0.113.1:4566",
+        "http://user:pw@127.0.0.1:4566",
+        "http://127.0.0.1:4566/v1",
+        "http://127.0.0.1:notaport",
+    ],
+)
+def test_non_local_bedrock_endpoints_are_refused(url: str) -> None:
+    with pytest.raises(ConfigurationError, match="ACCA_BEDROCK_ENDPOINT_URL must be http://"):
+        floci_bedrock(ACCA_BEDROCK_ENDPOINT_URL=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:4566",
+        "http://localhost:4566",
+        "http://[::1]:4566",
+        "http://acca-floci:4566",
+    ],
+)
+def test_local_bedrock_endpoints_are_accepted(url: str) -> None:
+    assert floci_bedrock(ACCA_BEDROCK_ENDPOINT_URL=url).bedrock_endpoint_url == url
+
+
+def test_the_bedrock_endpoint_needs_bedrock_and_no_profile() -> None:
+    with pytest.raises(ConfigurationError, match="needs LLM_PROVIDER=bedrock"):
+        s(llm_model="m", anthropic_api_key="k", ACCA_BEDROCK_ENDPOINT_URL=FLOCI)
+    with pytest.raises(ConfigurationError, match="unset BEDROCK_CREDENTIALS_PROFILE"):
+        floci_bedrock(bedrock_credentials_profile="beta-worker")
+
+
+def test_an_empty_bedrock_endpoint_means_real_bedrock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCA_BEDROCK_ENDPOINT_URL", "")
+    assert bedrock().bedrock_endpoint_url is None
+    monkeypatch.setenv("ACCA_BEDROCK_ENDPOINT_URL", FLOCI)
+    assert bedrock().bedrock_endpoint_url == FLOCI
+
+
+def test_the_cost_ledger_and_reports_label_floci_calls_bedrock_floci() -> None:
+    import uuid
+
+    from ai_code_change_agent.composition import build_cost_reporter
+
+    reporter = build_cost_reporter(object(), floci_bedrock(), object(), uuid.uuid4())  # type: ignore[arg-type]
+    assert reporter._provider == "bedrock-floci"

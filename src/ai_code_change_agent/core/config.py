@@ -52,6 +52,7 @@ _EMPTY_IS_UNSET = (
     "artifact_root",
     "workspace_image",
     "aws_endpoint_url",
+    "bedrock_endpoint_url",
 )
 
 
@@ -142,6 +143,13 @@ class Settings(BaseSettings):
     # environment); never from this file. An optional named profile selects one of them.
     bedrock_region: str | None = None
     bedrock_credentials_profile: str | None = None
+    # Local only (development/test): the Bedrock Runtime of the Floci emulator, whose `proxy`
+    # backend forwards Converse to an OpenAI-compatible endpoint. Same guard as
+    # ACCA_AWS_ENDPOINT_URL; the client then uses the dummy credentials test/test. Unset,
+    # LLM_PROVIDER=bedrock is real AWS Bedrock (the only option in staging/production).
+    bedrock_endpoint_url: str | None = Field(
+        default=None, validation_alias="ACCA_BEDROCK_ENDPOINT_URL"
+    )
     llm_request_timeout_seconds: float = Field(default=180.0, gt=0, le=1800)
     llm_max_retries: int = Field(default=2, ge=0, le=10)
     llm_max_output_tokens: int = Field(default=8192, ge=256, le=128_000)
@@ -403,6 +411,7 @@ class Settings(BaseSettings):
                 msg = f"{self.app_env} requires: {', '.join(missing)}"
                 raise ValueError(msg)
         self._check_aws_endpoint()
+        self._check_bedrock_endpoint()
         return self
 
     def _check_aws_endpoint(self) -> None:
@@ -431,6 +440,32 @@ class Settings(BaseSettings):
             raise ConfigurationError(msg)
         self.aws_endpoint_url = url.rstrip("/")
 
+    def _check_bedrock_endpoint(self) -> None:
+        """The Floci Bedrock mode: the same local endpoint guard, bedrock only, dummy credentials
+        only (a named profile would mean real credentials sent to an emulator)."""
+        url = self.bedrock_endpoint_url
+        if url is None:
+            return
+        if self.app_env not in ("development", "test"):
+            msg = f"APP_ENV={self.app_env} must not set ACCA_BEDROCK_ENDPOINT_URL (real Bedrock)"
+            raise ConfigurationError(msg)
+        if self.llm_provider != "bedrock":
+            msg = "ACCA_BEDROCK_ENDPOINT_URL needs LLM_PROVIDER=bedrock"
+            raise ConfigurationError(msg)
+        if self.bedrock_credentials_profile is not None:
+            msg = (
+                "ACCA_BEDROCK_ENDPOINT_URL uses the dummy credentials test/test; unset"
+                " BEDROCK_CREDENTIALS_PROFILE"
+            )
+            raise ConfigurationError(msg)
+        if not _local_endpoint(url):
+            msg = (
+                "ACCA_BEDROCK_ENDPOINT_URL must be http:// on a loopback host or a single-label"
+                " Docker host name (e.g. http://acca-floci:4566), without path or credentials"
+            )
+            raise ConfigurationError(msg)
+        self.bedrock_endpoint_url = url.rstrip("/")
+
     # ---- derived --------------------------------------------------------------------------
     @property
     def jira_webhook_configured(self) -> bool:
@@ -457,6 +492,14 @@ class Settings(BaseSettings):
             and self.github_app_installation_id is not None
             and self.github_app_private_key_path is not None
         )
+
+    @property
+    def llm_ledger_provider(self) -> str:
+        """The provider recorded in the usage ledger: `bedrock-floci` for the local Floci proxy,
+        so its rows (input/output tokens only, no cache) are never mistaken for Bedrock spend."""
+        if self.llm_provider == "bedrock" and self.bedrock_endpoint_url is not None:
+            return "bedrock-floci"
+        return self.llm_provider
 
     @property
     def llm_configured(self) -> bool:

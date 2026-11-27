@@ -451,7 +451,7 @@ def build_cost_reporter(
     return CostReporter(
         query,
         build_price_table(settings),
-        provider=settings.llm_provider,
+        provider=settings.llm_ledger_provider,
         primary_model=settings.llm_model or "-",
         session_id=session_id,
         status_of=status_of,
@@ -518,7 +518,7 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
     usage = UsageTracker(
         usage_store,
         build_price_table(settings),
-        provider=settings.llm_provider,
+        provider=settings.llm_ledger_provider,
         model=settings.llm_model or "-",
         session_id=costs.session_id,
         phase_budget_usd=Decimal(str(settings.llm_max_cost_per_phase_usd)),
