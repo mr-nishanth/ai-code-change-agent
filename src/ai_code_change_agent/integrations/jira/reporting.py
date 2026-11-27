@@ -20,7 +20,8 @@ MAX_COMMENT = 8_000
 class ReportOutcome(StrEnum):
     DISABLED = "DISABLED"
     POSTED = "POSTED"
-    FAILED = "FAILED"
+    FAILED = "FAILED"  # retryable only: 429, 5xx, timeout, transport error
+    PERMANENT_FAILURE = "PERMANENT_FAILURE"  # 400/401/403/404/..., invalid key: never repost
 
 
 def _adf(text: str) -> dict[str, object]:
@@ -102,11 +103,11 @@ class JiraOutcomeReporter:
 
     async def report(self, issue_key: str, text: str) -> ReportOutcome:
         result = await self.post_comment(issue_key, text)
-        if result.status is CommentStatus.DISABLED:
-            return ReportOutcome.DISABLED
-        return (
-            ReportOutcome.POSTED if result.status is CommentStatus.POSTED else ReportOutcome.FAILED
-        )
+        return {
+            CommentStatus.DISABLED: ReportOutcome.DISABLED,
+            CommentStatus.POSTED: ReportOutcome.POSTED,
+            CommentStatus.PERMANENT: ReportOutcome.PERMANENT_FAILURE,
+        }.get(result.status, ReportOutcome.FAILED)
 
     async def post_comment(self, issue_key: str, text: str) -> CommentResult:
         """One comment POST, never retried here: a timeout may hide a comment Jira created, so

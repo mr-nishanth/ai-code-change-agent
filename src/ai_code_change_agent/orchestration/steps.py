@@ -946,7 +946,10 @@ class CodeChangeSteps:
         )
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
-        """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as posted. A
+        """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either
+        posted or permanently failed (PERMANENT_FAILURE: Jira refused it with 400/401/403/404 or
+        similar, so posting again cannot help). Only a retryable failure (FAILED) stores nothing,
+        so a later cleanup may try again. Reporting never changes or re-runs the attempt. A
         multi-repository child reports nothing here: its parent posts one aggregated comment."""
         if self._d.multirepo is not None and await self._d.multirepo.is_child(a.id):
             return
@@ -955,6 +958,8 @@ class CodeChangeSteps:
             return
         outcome = await self._d.reporter.report(issue_key, text)
         _log.info("jira_report", attempt_id=str(a.id), outcome=str(outcome))
+        if str(outcome) == "PERMANENT_FAILURE":
+            _log.warning("jira_report_permanent_failure", attempt_id=str(a.id))
         if str(outcome) != "FAILED":
             await store_model(
                 self._d.artifacts,

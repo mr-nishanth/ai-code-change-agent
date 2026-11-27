@@ -71,20 +71,39 @@ async def test_one_comment_is_posted_and_nothing_else() -> None:
     assert req.headers["authorization"].startswith("Basic ")
 
 
-async def test_failures_are_reported_not_raised() -> None:
-    assert (
-        await reporter(lambda req: httpx.Response(403)).report("SHOP-1", "x")
-        is ReportOutcome.FAILED
-    )
-
-    def boom(req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("down", request=req)
-
-    assert await reporter(boom).report("SHOP-1", "x") is ReportOutcome.FAILED
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+async def test_a_permanent_comment_failure_is_reported_as_permanent(code: int) -> None:
+    outcome = await reporter(lambda req: httpx.Response(code)).report("SHOP-1", "x")
+    assert outcome is ReportOutcome.PERMANENT_FAILURE
     assert (
         await reporter(lambda req: httpx.Response(201)).report("bad key", "x")
-        is ReportOutcome.FAILED
+        is ReportOutcome.PERMANENT_FAILURE
     )
+
+
+def _timeout(req: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("slow", request=req)
+
+
+def _transport_error(req: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("down", request=req)
+
+
+@pytest.mark.parametrize(
+    "handle",
+    [
+        lambda req: httpx.Response(429),
+        lambda req: httpx.Response(500),
+        lambda req: httpx.Response(503),
+        _timeout,
+        _transport_error,
+    ],
+    ids=["429", "500", "503", "timeout", "transport"],
+)
+async def test_a_retryable_comment_failure_is_reported_as_failed_not_raised(
+    handle: object,
+) -> None:
+    assert await reporter(handle).report("SHOP-1", "x") is ReportOutcome.FAILED
 
 
 @pytest.mark.parametrize(

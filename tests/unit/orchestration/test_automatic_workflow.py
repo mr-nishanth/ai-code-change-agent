@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
+from ai_code_change_agent.application.artifacts.hashing import load_verified
 from ai_code_change_agent.application.artifacts.models import ArtifactKind
 from ai_code_change_agent.application.dependencies.ports import DependencyBundle, LockedPackage
 from ai_code_change_agent.domain.changes.models import ApprovalGate
@@ -17,7 +18,7 @@ from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyErro
 from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.integrations.jira.authentication import BasicAuthenticator
 from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
-from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps
+from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps, JiraReportDoc
 from tests.support import workflow
 from tests.support.changes import python_profile
 from tests.support.workflow import make_rig
@@ -32,6 +33,16 @@ def plan_with(**over: Any) -> ImplementationPlan:
 async def run(rig: Any) -> AttemptStatus:
     await rig.runner.start(rig.attempt_id)
     return AttemptStatus((await rig.deps.changes.get_attempt(rig.attempt_id)).status)
+
+
+async def jira_reports(rig: Any) -> list[JiraReportDoc]:
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    scope = CodeChangeSteps._scope(att)
+    return [
+        await load_verified(rig.artifacts, scope, m.id, m.sha256, JiraReportDoc)
+        for m in await rig.artifacts.list(scope)
+        if m.kind is ArtifactKind.JIRA_REPORT
+    ]
 
 
 async def kinds(rig: Any) -> list[ArtifactKind]:
@@ -70,7 +81,7 @@ async def test_failed_validation_never_publishes_and_is_reported_once(tmp_path: 
 
 @pytest.mark.parametrize("code", [400, 401, 403])
 @pytest.mark.parametrize("validation_passes", [True, False], ids=["completed", "failed"])
-async def test_a_permanent_jira_comment_failure_is_not_retried_or_marked_reported(
+async def test_a_permanent_jira_comment_failure_is_recorded_once_and_never_reposted(
     tmp_path: Path, code: int, validation_passes: bool
 ) -> None:
     rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
@@ -93,8 +104,34 @@ async def test_a_permanent_jira_comment_failure_is_not_retried_or_marked_reporte
     assert [(p.method, p.url.path) for p in posts] == [
         ("POST", "/rest/api/3/issue/SHOP-1/comment")
     ]  # one POST, not retried
-    assert ArtifactKind.JIRA_REPORT not in await kinds(rig)  # not recorded as reported
+    # durable and visible in the attempt's artifacts (status is the attempt's status at report
+    # time: REPORTING on the pull-request path, FAILED after a failed validation)
+    assert [d.outcome for d in await jira_reports(rig)] == ["PERMANENT_FAILURE"]
+    await CodeChangeSteps(rig.deps).cleanup(rig.attempt_id)  # a second cleanup: no new request
+    assert len(posts) == 1 and len(await jira_reports(rig)) == 1
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.status is expected  # the attempt is neither changed nor re-run
     assert len(rig.publisher.requests) == int(validation_passes)
+
+
+async def test_a_retryable_jira_comment_failure_is_not_recorded(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    rig.agent.edits = [{"app/greeting.py": b"x = 1\n", ".github/workflows/ci.yml": b"x"}]
+    posts: list[httpx.Request] = []
+
+    def jira(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        return httpx.Response(503)
+
+    rig.deps.reporter = JiraOutcomeReporter(
+        enabled=True,
+        base_url="https://x.atlassian.net",
+        authenticator=BasicAuthenticator("a@b.c", SecretStr("tok")),
+        transport=httpx.MockTransport(jira),
+    )
+    assert await run(rig) is S.FAILED
+    assert len(posts) == 1
+    assert ArtifactKind.JIRA_REPORT not in await kinds(rig)  # retryable: nothing stored
 
 
 async def test_a_profile_without_a_test_command_uses_the_toolchain_default(
