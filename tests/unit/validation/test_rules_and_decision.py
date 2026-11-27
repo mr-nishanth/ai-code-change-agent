@@ -1,13 +1,18 @@
 """Independent validation: rules, decision and the engine's refusal paths."""
 
+import json
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ai_code_change_agent.application.artifacts.hashing import load_verified
+from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
+from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.workspaces.models import ChangeOp, FileChange
 from ai_code_change_agent.domain.repositories.profile import RepositoryProfile
+from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.validation import rules
 from ai_code_change_agent.validation.decision import commands_check, decide, required_tests
@@ -19,6 +24,7 @@ from ai_code_change_agent.validation.schemas import (
     CheckStatus,
     CommandRecord,
     Decision,
+    ValidationReport,
 )
 from ai_code_change_agent.validation.security_scanner import secrets
 from tests.support.changes import python_profile
@@ -232,7 +238,31 @@ async def test_each_validation_command_failing_or_not_running_fails_closed(
     tests = next(c for c in report.checks if c.kind is CheckKind.REQUIRED_TESTS)
     assert tests.status is (CheckStatus.FAILED if target == "test" else CheckStatus.PASSED)
     assert f"command {target} ({status})" in report.feedback()
+    reasons = {c.command_id: c.reason for c in report.commands}
+    expected = {"TIMED_OUT": "command_timeout", "ERROR": "command_not_found"}.get(status)
+    assert reasons == {cid: (expected if cid == target else None) for cid in QUALITY_ARGV}
     assert list((tmp_path / "ws").glob("*/ws_*")) == []  # destroyed even on failure
+
+
+async def test_a_stored_report_without_command_reasons_still_loads(tmp_path: Path) -> None:
+    """Reports written before CommandRecord.reason existed stay readable (hash-verified)."""
+    runtime, runner = make_runtime(tmp_path)
+    runner.on_run = outcome_for("test", NOT_FOUND)
+    report = await ValidationEngine(runtime).validate(_input(GOOD, quality_profile()))
+    doc = report.model_dump(mode="json")
+    for command in doc["commands"]:
+        del command["reason"]
+    content = json.dumps(doc).encode()
+    artifacts = ArtifactService(
+        LocalFilesystemArtifactStore(tmp_path / "artifacts", max_artifact_bytes=1_000_000),
+        max_artifact_bytes=1_000_000,
+        max_attempt_bytes=10_000_000,
+    )
+    scope = ArtifactScope(uuid.uuid4(), uuid.uuid4())
+    meta = await artifacts.put(scope, ArtifactKind.VALIDATION_REPORT, content)
+    loaded = await load_verified(artifacts, scope, meta.id, meta.sha256, ValidationReport)
+    assert [c.reason for c in loaded.commands] == [None] * len(doc["commands"])
+    assert loaded.decision is Decision.FAILED
 
 
 async def test_a_docker_crash_while_running_tests_fails_rebuild_integrity(tmp_path: Path) -> None:

@@ -288,7 +288,8 @@ async def test_exit_codes_map_to_statuses_and_output_truncation_is_reported(tmp_
         (ProcessResult(1, b"fail", b"", False, False), CommandStatus.FAILED, None),
         (ProcessResult(5, b"", b"", False, False), CommandStatus.FAILED, None),
         (ProcessResult(125, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
-        (ProcessResult(127, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
+        (ProcessResult(126, b"", b"", False, False), CommandStatus.ERROR, "container_start_failed"),
+        (ProcessResult(127, b"", b"", False, False), CommandStatus.ERROR, "command_not_found"),
         (
             ProcessResult(None, b"partial", b"", False, True),
             CommandStatus.TIMED_OUT,

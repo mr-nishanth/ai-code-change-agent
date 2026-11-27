@@ -43,7 +43,9 @@ The rebuilt tree must equal baseline + changes. Also checked: path safety, prote
 | Duplicate webhook or duplicate Story | API dedupe on delivery id and issue id (200 `duplicate`); no second request or job |
 | LLM timeouts, 429/5xx | SDK retries (`LLM_MAX_RETRIES`; Anthropic SDK backoff, botocore standard retries on Bedrock); per-phase wall-clock budget `DEEP_AGENT_RUN_TIMEOUT_SECONDS` → `agent_run_timeout` |
 | Dependency failure | `dependency_*` code (wheel unavailable, conflict, Python unsupported, limit, corrupted bundle) → attempt FAILED, Jira comment; nothing falls back to network |
-| Validation failure | Bounded repair with the validator's feedback, then FAILED; nothing is published |
+| Validation failure | A code failure (a check or command failed, or a command exceeded the profile's per-command timeout) gets one bounded repair with the validator's feedback, then FAILED (`validation_failed`). A timeout counts as a code failure because the change itself is the usual cause (a hang, or a call blocking under `--network none`). Nothing is published |
+| Validation infrastructure failure | Docker unavailable, a container that did not start (exit 125/126), or a sandbox or workspace runtime failure: FAILED `validation_infrastructure_unavailable` with no repair run; retryable once the cause is resolved |
+| Validation command not found | A profile command's executable is missing from the image (exit 127): FAILED `validation_command_not_found` with no repair run (the agent cannot install tools in the network-less sandbox); not retryable until the profile or image is fixed |
 | GitHub timeout or unknown outcome | The publisher re-reads remote state before every write and reconciles; create-only refs; no duplicate branch, commit or PR |
 | Jira comment | At most one per attempt outcome (`jira_report` artifact marker); multi-repository parents: one per report round, with a durable lifecycle and Report-ID reconciliation ([MULTI-REPOSITORY.md](MULTI-REPOSITORY.md#jira-reporting-parent-story)); a reporting failure never changes the outcome |
 | Security or policy failures | Never retried automatically |

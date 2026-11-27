@@ -419,9 +419,15 @@ BOUNDARY: dict[str, Boundary] = {
         "test",
         ProcessResult(127, b"", b"not found", False, False),
         None,
-        "validation_failed",
+        "validation_command_not_found",
     ),
-    "docker_crash": ("test", OSError("daemon gone"), None, "validation_failed"),
+    "container_start_125": (
+        "test",
+        ProcessResult(125, b"", b"docker: error", False, False),
+        None,
+        "validation_infrastructure_unavailable",
+    ),
+    "docker_crash": ("test", OSError("daemon gone"), None, "validation_infrastructure_unavailable"),
     "runtime_error": ("test", RuntimeError("runner bug"), None, "runtimeerror"),
     "secret_detected": (None, None, {"app/greeting.py": _KEY}, "validation_failed"),
     "protected_file_modified": (
@@ -433,11 +439,18 @@ BOUNDARY: dict[str, Boundary] = {
 }
 
 
+# Only a code failure (including a command timeout: the profile's own per-command budget, most
+# often exceeded by the change itself) spends the repair run. Infrastructure failures and a missing
+# executable never reach the agent as feedback: it cannot fix either inside the sandbox.
+_REPAIRED = {"validation_failed"}
+_RETRYABLE = {"validation_infrastructure_unavailable"}
+
+
 @pytest.mark.parametrize("case", list(BOUNDARY))
 async def test_no_validation_failure_mode_reaches_the_publisher(tmp_path: Path, case: str) -> None:
     target, result, edits, code = BOUNDARY[case]
     rig = await make_rig(
-        tmp_path, approval_mode="automatic", max_repairs=0, profile=_quality_profile()
+        tmp_path, approval_mode="automatic", max_repairs=1, profile=_quality_profile()
     )
     if target is not None and result is not None:
         rig.deps.runtime._runner.on_run = _container(target, result)  # type: ignore[attr-defined]
@@ -453,3 +466,7 @@ async def test_no_validation_failure_mode_reaches_the_publisher(tmp_path: Path, 
     assert [a.gate for a in await rig.deps.changes.approvals(rig.attempt_id)] == [ApprovalGate.PLAN]
     ((_, text),) = rig.reporter.reports
     assert code in text
+    repaired = code in _REPAIRED
+    assert len(rig.agent.feedback) == (2 if repaired else 1)  # implement runs (1 = no repair)
+    assert att.repair_count == int(repaired)
+    assert ("Retryable: yes" if code in _RETRYABLE else "Retryable: no") in text

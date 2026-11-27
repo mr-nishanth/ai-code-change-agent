@@ -51,6 +51,9 @@ class CommandRecord(BaseModel):
     exit_code: int | None
     duration_ms: int
     output_tail: str = Field(default="", max_length=8000)
+    # Fixed runtime code when the command did not run to completion (container_start_failed,
+    # command_not_found, command_timeout...). Absent from reports stored before it existed.
+    reason: str | None = Field(default=None, max_length=64)
 
 
 class ChangedFile(BaseModel):

@@ -208,6 +208,16 @@ class JiraReportDoc(BaseModel):
 AUTOMATIC_ACTOR = "policy:automatic"
 # Codes of transient infrastructure failures (Git host or network), never code defects.
 INFRA_CODES = frozenset({"provider_unavailable", "rate_limited", "provider_timeout"})
+# Validation could not run the checks at all (Docker gone, a container that never started, the
+# sandbox or workspace runtime failing): retryable, and never spent on a repair run. A command
+# timeout is deliberately absent: it is the profile's per-command budget, most often exceeded by the
+# change itself (a hang, or a call blocking under --network none), so it stays a repairable failure.
+VALIDATION_INFRA_CODES = INFRA_CODES | {
+    "docker_unavailable",
+    "container_start_failed",
+    "workspace_runtime_failed",
+    "sandbox_start_failed",
+}
 _RETRYABLE = (
     "timeout",
     "unavailable",
@@ -688,9 +698,15 @@ class CodeChangeSteps:
             )
             if not report.passed:
                 failed = [c for c in report.checks if c.mandatory and c.status.value == "FAILED"]
-                if failed and all((c.detail or "") in INFRA_CODES for c in failed):
+                reasons = {c.reason for c in report.commands if c.reason}
+                if any((c.detail or "") in VALIDATION_INFRA_CODES for c in failed) or (
+                    reasons & VALIDATION_INFRA_CODES
+                ):
                     # an infrastructure failure is not a code defect: no repair run
                     return await self._fail(attempt_id, "validation_infrastructure_unavailable")
+                if "command_not_found" in reasons:
+                    # the agent cannot install tools in the network-less sandbox: no repair run
+                    return await self._fail(attempt_id, "validation_command_not_found")
                 if a.repair_count < self._d.max_repairs:
                     a = await self._d.changes.transition(attempt_id, S.IMPLEMENTING)
                     return StepResult(a.status.value, feedback=report.feedback())

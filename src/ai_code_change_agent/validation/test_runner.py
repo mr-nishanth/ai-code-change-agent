@@ -51,6 +51,7 @@ async def run_commands(
                 exit_code=result.exit_code,
                 duration_ms=result.duration_ms,
                 output_tail=tail,
+                reason=result.reason,
             )
         )
     return records
