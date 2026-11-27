@@ -31,7 +31,7 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
 ## Security implications
 
 - New outbound traffic comes from the worker, only to the allow-listed documentation sites.
-- A residual exfiltration channel exists: the URL path requested from an allow-listed site, which is logged. Keep the list to documentation hosts you trust.
+- Exfiltration through URLs is limited in code: a URL the agent requests may not carry a query string (documentation such as Pydantic's `llms.txt` asks agents to append `goal`/`organization` parameters; that is refused, never prompted away), may not exceed 300 characters and may not contain a secret. A residual channel remains in the path of a requested URL (bounded by the length cap and logged). Keep the list to documentation hosts you trust.
 - Prompt injection through fetched text is treated like Story text: quoted as untrusted data. Its effects are bounded by the offline sandbox, automatic policy gates and independent validation.
 - There's a short DNS-rebinding window between the address check and the connection; the allow-list limits it to listed sites.
 

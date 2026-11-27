@@ -47,6 +47,7 @@ The coding sandbox stays offline. Two research tools run in the worker:
   - each search is recorded in the cost ledger as stage `research` (tokens plus $0.01 per search).
 - **`fetch_reference(url)`:**
   - https only on the default port, no credentials in the URL, exact hosts from `config/reference_sources.yaml` (any path on a listed host, including `.md`, `.txt` and `llms.txt`; subdomains are not implied; a missing file means no research tools), at most `REFERENCE_MAX_FETCHES` per phase;
+  - the agent's URL may not carry a query string (`reference_query_not_allowed`), exceed 300 characters (`reference_url_too_long`) or contain a secret (`reference_url_contains_secret`); fragments are dropped; server redirects may carry a query;
   - GET only, no cookies, authorization headers or environment proxies;
   - DNS is resolved and private, loopback and link-local addresses are refused;
   - redirects are followed manually, at most three, and every hop is re-checked;

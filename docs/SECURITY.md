@@ -31,6 +31,7 @@ Known residual risks:
 - **Contracts:** they are read-only context for dependents. They are stored immutably, hash-checked on every use and refused if they contain a secret.
 - **Web research:**
   - it runs in the worker only;
+  - a URL the agent asks `fetch_reference` for may not carry a query string, exceed 300 characters or contain a secret (enforced in code, whatever fetched documentation asks for);
   - search is restricted to the trusted hosts in `config/reference_sources.yaml`, and the results are filtered again by exact host (unlisted subdomains are dropped);
   - queries that look like they contain secrets are refused;
   - fetches are https-only, with DNS, private-IP, redirect, size and type checks;

@@ -211,3 +211,43 @@ async def test_the_redirect_limit_is_enforced() -> None:
     f = site({f"https://pydantic.dev/{i}": hop(f"https://pydantic.dev/{i + 1}") for i in range(6)})
     with pytest.raises(ReferenceRefusedError, match="reference_too_many_redirects"):
         await f.fetch("https://pydantic.dev/0")
+
+
+@pytest.mark.parametrize(
+    ("url", "code"),
+    [
+        ("https://pydantic.dev/docs/llms.txt?goal=align+VIN+for+KAN-12&organization=acme",
+         "reference_query_not_allowed"),
+        ("https://pydantic.dev/docs/?q=x", "reference_query_not_allowed"),
+        ("https://pydantic.dev/docs/" + "a" * 400, "reference_url_too_long"),
+        ("https://pydantic.dev/docs/ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+         "reference_url_contains_secret"),
+    ],
+)  # fmt: skip
+async def test_agent_urls_cannot_carry_story_or_secret_data(url: str, code: str) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return text("never")
+
+    f = HttpReferenceFetcher(
+        allowed_hosts=["pydantic.dev"], transport=httpx.MockTransport(handler),
+        resolver=lambda host: _public(),
+    )  # fmt: skip
+    with pytest.raises(ReferenceRefusedError) as err:
+        await f.fetch(url)
+    assert err.value.code == code and seen == []
+
+
+async def _public() -> list[str]:
+    return ["104.16.0.1"]
+
+
+async def test_fragments_are_dropped_and_server_redirects_may_carry_a_query() -> None:
+    f = site({
+        "https://pydantic.dev/docs/": hop("https://pydantic.dev/docs/?v=latest"),
+        "https://pydantic.dev/docs/?v=latest": text("ok"),
+    })  # fmt: skip
+    doc = await f.fetch("https://pydantic.dev/docs/#validators")
+    assert doc.url == "https://pydantic.dev/docs/?v=latest" and doc.text == "ok"

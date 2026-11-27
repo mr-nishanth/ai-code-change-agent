@@ -8,6 +8,8 @@ Permission rules, all enforced here and none by the model:
   multicast or reserved ranges: no SSRF into the host or internal network);
 - redirects are followed manually, at most three, and each hop is checked again (scheme, port,
   exact host, public addresses), so a redirect to another host needs that host listed too;
+- a URL the agent asks for has no query string, at most MAX_REQUESTED_URL characters and no
+  secret (server redirects may carry a query; they come from the listed site, not the agent);
 - GET only, no cookies, no authorization headers, no proxy settings from the environment;
 - text-like content types only, a byte cap while streaming, HTML reduced to text.
 A small DNS-rebinding window remains between the check and the connection; the allow-list keeps
@@ -21,10 +23,11 @@ import socket
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from ai_code_change_agent.application.artifacts.redaction import find_secrets
 from ai_code_change_agent.application.references.ports import (
     ReferenceDocument,
     ReferenceRefusedError,
@@ -35,6 +38,7 @@ from ai_code_change_agent.core.reference_hosts import host_allowed, normalize_ho
 Resolver = Callable[[str], Awaitable[list[str]]]
 _TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
 _MAX_REDIRECTS = 3
+MAX_REQUESTED_URL = 300  # characters, for a URL the agent asks for
 _log = get_logger("references")
 
 
@@ -103,9 +107,22 @@ class HttpReferenceFetcher:
     def allowed_hosts(self) -> tuple[str, ...]:
         return self._hosts
 
-    async def _check(self, url: str) -> str:
+    async def _check(self, url: str, *, requested: bool = False) -> str:
+        """`requested`: the URL comes from the agent (not a server redirect). Such a URL may not
+        carry a query string, may not be long, and may not contain a secret, so Story text,
+        organisation details or repository content cannot be sent to a site in a URL, whatever
+        a fetched page (an llms.txt, for example) asks for. Path text remains a small channel;
+        the length cap bounds it and every requested URL is logged."""
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
+        if requested:
+            if parts.query:
+                raise ReferenceRefusedError("reference_query_not_allowed")
+            if len(url) > MAX_REQUESTED_URL:
+                raise ReferenceRefusedError("reference_url_too_long")
+            if find_secrets(url):
+                raise ReferenceRefusedError("reference_url_contains_secret")
+            url = urlunsplit(parts._replace(fragment=""))
         if parts.scheme != "https" or not host or parts.username or parts.password:
             raise ReferenceRefusedError("reference_url_not_allowed")
         if parts.port not in (None, 443):
@@ -125,7 +142,7 @@ class HttpReferenceFetcher:
         return url
 
     async def fetch(self, url: str) -> ReferenceDocument:
-        current = await self._check(url.strip())
+        current = await self._check(url.strip(), requested=True)
         async with httpx.AsyncClient(
             timeout=self._timeout,
             follow_redirects=False,
