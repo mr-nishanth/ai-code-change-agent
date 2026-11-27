@@ -84,3 +84,40 @@ def test_production_requires_its_core_settings() -> None:
         jira_project_keys="SHOP",
     )
     assert ok.jira_webhook_configured
+
+
+def test_reference_limits_default_to_the_documented_values() -> None:
+    d = s()
+    assert (d.reference_max_url_chars, d.reference_max_redirects, d.reference_search_max_hits) == (
+        300,
+        3,
+        8,
+    )
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"reference_max_url_chars": 49},
+        {"reference_max_url_chars": 2001},
+        {"reference_max_redirects": -1},
+        {"reference_max_redirects": 11},
+        {"reference_search_max_hits": 0},
+        {"reference_search_max_hits": 21},
+    ],
+)
+def test_reference_limits_out_of_bounds_fail_fast(kw: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        s(**kw)
+
+
+def test_reference_limits_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REFERENCE_MAX_URL_CHARS", "120")
+    monkeypatch.setenv("REFERENCE_MAX_REDIRECTS", "0")
+    monkeypatch.setenv("REFERENCE_SEARCH_MAX_HITS", "4")
+    d = s()
+    assert (d.reference_max_url_chars, d.reference_max_redirects, d.reference_search_max_hits) == (
+        120,
+        0,
+        4,
+    )

@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_allowed_hosts
+from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_reference_sources
 
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -152,7 +152,12 @@ class Settings(BaseSettings):
     # wildcards); a missing file means the tools are not offered, an invalid one fails startup.
     reference_sources_file: Path = DEFAULT_SOURCES_FILE
     _reference_hosts: frozenset[str] = PrivateAttr(default=frozenset())
+    _reference_secondary_hosts: frozenset[str] = PrivateAttr(default=frozenset())
     reference_max_fetches: int = Field(default=20, ge=1, le=200)  # per agent phase
+    # Longest URL the agent may request (fetch_reference; search hits above it are dropped).
+    reference_max_url_chars: int = Field(default=300, ge=50, le=2000)
+    reference_max_redirects: int = Field(default=3, ge=0, le=10)  # each hop re-checked
+    reference_search_max_hits: int = Field(default=8, ge=1, le=20)  # per search_docs call
     # Web search (Anthropic server-side tool, worker side) restricted to the same exact hosts.
     reference_search_enabled: bool = True
     reference_max_searches: int = Field(default=5, ge=1, le=50)  # per agent phase
@@ -267,7 +272,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _coherent(self) -> "Settings":
-        self._reference_hosts = load_allowed_hosts(self.reference_sources_file)
+        sources = load_reference_sources(self.reference_sources_file)
+        self._reference_hosts = sources.allowed_hosts
+        self._reference_secondary_hosts = sources.secondary_hosts
         app = [
             self.github_app_id,
             self.github_app_installation_id,
@@ -328,6 +335,11 @@ class Settings(BaseSettings):
     def reference_allowed_hosts(self) -> frozenset[str]:
         """The exact trusted documentation hosts loaded from reference_sources_file."""
         return self._reference_hosts
+
+    @property
+    def reference_secondary_hosts(self) -> frozenset[str]:
+        """Trusted hosts that search ranks after documentation (secondary_hosts in the file)."""
+        return self._reference_secondary_hosts
 
     @property
     def jira_rest_configured(self) -> bool:

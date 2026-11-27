@@ -23,6 +23,8 @@ def fetcher(
     *,
     resolve: dict[str, list[str]] | None = None,
     max_bytes: int = 1_048_576,
+    max_redirects: int = 3,
+    max_url_chars: int = 300,
 ) -> HttpReferenceFetcher:
     table = resolve or {}
 
@@ -34,6 +36,8 @@ def fetcher(
         transport=httpx.MockTransport(handler),
         resolver=resolver,
         max_bytes=max_bytes,
+        max_redirects=max_redirects,
+        max_url_chars=max_url_chars,
     )
 
 
@@ -367,3 +371,50 @@ async def test_prompt_injection_in_a_document_stays_inside_the_untrusted_markers
     assert injection in body and out.count(injection) == 1
     # later calls stay checked and counted: see
     # test_the_agent_tool_marks_untrusted_data_and_enforces_its_budget
+
+
+@pytest.mark.parametrize("limit", [0, 1, 5])
+async def test_a_configured_redirect_limit_is_honoured(limit: int) -> None:
+    seen: list[str] = []
+
+    def loop(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(302, headers={"location": f"/r{len(seen)}"})
+
+    with pytest.raises(ReferenceRefusedError, match="reference_too_many_redirects"):
+        await fetcher(loop, max_redirects=limit).fetch("https://docs.python.org/a")
+    assert len(seen) == limit + 1  # the first request plus `limit` redirects
+
+    def once(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/a":
+            return httpx.Response(301, headers={"location": "/b"})
+        return ok("moved")
+
+    if limit >= 1:
+        assert (await fetcher(once, max_redirects=limit).fetch("https://docs.python.org/a")).url
+    else:
+        with pytest.raises(ReferenceRefusedError, match="reference_too_many_redirects"):
+            await fetcher(once, max_redirects=limit).fetch("https://docs.python.org/a")
+
+
+async def test_a_configured_url_cap_is_enforced_and_stated_in_the_tool_description() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return ok("doc")
+
+    base = "https://docs.python.org/3/"
+    at_cap, over = base + "a" * (60 - len(base)), base + "a" * (61 - len(base))
+    f = fetcher(handler, max_url_chars=60)
+    assert (await f.fetch(at_cap)).text == "doc"
+    with pytest.raises(ReferenceRefusedError, match="reference_url_too_long"):
+        await f.fetch(over)
+    assert requested == [at_cap]  # the refused URL was never requested
+    # the default stays 300 characters
+    assert (await fetcher(handler).fetch(base + "a" * (300 - len(base)))).text == "doc"
+    with pytest.raises(ReferenceRefusedError, match="reference_url_too_long"):
+        await fetcher(handler).fetch(base + "a" * (301 - len(base)))
+    tool = build_reference_tool(f, max_calls=1, max_url_chars=60)
+    assert "longer than 60 characters" in tool.description
+    assert "longer than 300 characters" in build_reference_tool(f, max_calls=1).description

@@ -307,6 +307,8 @@ def build_reference_tools(
         allowed_hosts=hosts,
         max_bytes=settings.reference_max_bytes,
         timeout_seconds=settings.reference_timeout_seconds,
+        max_url_chars=settings.reference_max_url_chars,
+        max_redirects=settings.reference_max_redirects,
     )
     searcher = None
     if (
@@ -319,12 +321,18 @@ def build_reference_tools(
             api_key=settings.anthropic_api_key.get_secret_value(),
             model=settings.llm_model,
             allowed_hosts=hosts,
+            secondary_hosts=sorted(settings.reference_secondary_hosts),
+            max_hits=settings.reference_search_max_hits,
+            max_url_chars=settings.reference_max_url_chars,
         )
 
     def tools(thread_id: str) -> list[BaseTool]:
         out = [
             build_reference_tool(
-                fetcher, max_calls=settings.reference_max_fetches, thread_id=thread_id
+                fetcher,
+                max_calls=settings.reference_max_fetches,
+                thread_id=thread_id,
+                max_url_chars=settings.reference_max_url_chars,
             )
         ]
         if searcher is not None:

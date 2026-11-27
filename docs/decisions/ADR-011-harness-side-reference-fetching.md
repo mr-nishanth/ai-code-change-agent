@@ -17,7 +17,7 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
   - https only, default port, no credentials in the URL;
   - the host must exactly equal a host listed in `config/reference_sources.yaml` (case-insensitive, trailing dot ignored, IDNA compared in punycode). Every path on a listed host is allowed; subdomains are never implied (amended 2026-11-27: the earlier rule also trusted subdomains);
   - every resolved address must be public (no private, loopback, link-local, metadata or multicast ranges);
-  - at most 3 redirects, each re-checked;
+  - at most `REFERENCE_MAX_REDIRECTS` redirects (default 3), each re-checked;
   - GET only, no cookies or authorization headers, `trust_env=False`.
 - **Content:**
   - text types only, a `REFERENCE_MAX_BYTES` cap, HTML reduced to text (scripts and styles dropped, links kept);
@@ -27,11 +27,12 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
   - every fetch is logged (host, status, size, truncation);
   - refusals return a fixed `REFUSED: <code>` string to the agent.
 - A missing `config/reference_sources.yaml` (or an empty `allowed_hosts`) disables the tools; an invalid file fails startup.
+- The limits are configurable within validated bounds (amended 2026-11-27): `REFERENCE_MAX_URL_CHARS` (default 300), `REFERENCE_MAX_REDIRECTS` (default 3) and `REFERENCE_SEARCH_MAX_HITS` (default 8). Search ranking uses the optional `secondary_hosts` list in the same file (exact hosts that must also be trusted) instead of a constant in code. The static URL check shared by both tools lives in `core/reference_hosts.py`.
 
 ## Security implications
 
 - New outbound traffic comes from the worker, only to the allow-listed documentation sites.
-- Exfiltration through URLs is limited in code: a URL the agent requests may not carry a query string (documentation such as Pydantic's `llms.txt` asks agents to append `goal`/`organization` parameters; that is refused, never prompted away), may not exceed 300 characters and may not contain a secret. A residual channel remains in the path of a requested URL (bounded by the length cap and logged). Keep the list to documentation hosts you trust.
+- Exfiltration through URLs is limited in code: a URL the agent requests may not carry a query string (documentation such as Pydantic's `llms.txt` asks agents to append `goal`/`organization` parameters; that is refused, never prompted away), may not exceed `REFERENCE_MAX_URL_CHARS` characters (default 300; the tool description states the configured cap) and may not contain a secret. A residual channel remains in the path of a requested URL (bounded by the length cap and logged). Keep the list to documentation hosts you trust.
 - Prompt injection through fetched text is treated like Story text: quoted as untrusted data. Its effects are bounded by the offline sandbox, automatic policy gates and independent validation.
 - There's a short DNS-rebinding window between the address check and the connection; the allow-list limits it to listed sites.
 

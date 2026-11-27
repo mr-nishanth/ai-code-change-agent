@@ -12,6 +12,7 @@ from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.reference_hosts import (
     host_allowed,
     load_allowed_hosts,
+    load_reference_sources,
     normalize_host,
 )
 from ai_code_change_agent.integrations.web.fetcher import HttpReferenceFetcher
@@ -105,8 +106,57 @@ def test_settings_load_the_host_file_and_fail_on_an_invalid_one(tmp_path: Path) 
 
 
 def test_the_repository_host_file_is_valid() -> None:
-    hosts = load_allowed_hosts(Path(__file__).parents[2] / "config" / "reference_sources.yaml")
+    sources = load_reference_sources(
+        Path(__file__).parents[2] / "config" / "reference_sources.yaml"
+    )
+    hosts = sources.allowed_hosts
     assert hosts and all(normalize_host(h) == h for h in hosts)
+    assert sources.secondary_hosts == frozenset({"pypi.org", "raw.githubusercontent.com"})
+
+
+def test_secondary_hosts_are_optional_normalised_and_must_be_trusted(tmp_path: Path) -> None:
+    plain = write(tmp_path, "version: 1\nallowed_hosts: [pypi.org, docs.python.org]\n")
+    assert load_reference_sources(plain).secondary_hosts == frozenset()  # missing key: none
+    ranked = write(
+        tmp_path,
+        "version: 1\nallowed_hosts: [pypi.org, docs.python.org]\nsecondary_hosts: [PyPI.org.]\n",
+    )
+    sources = load_reference_sources(ranked)
+    assert sources.secondary_hosts == frozenset({"pypi.org"})
+    assert sources.allowed_hosts == frozenset({"pypi.org", "docs.python.org"})
+    assert load_allowed_hosts(ranked) == sources.allowed_hosts
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("version: 1\nallowed_hosts: [docs.python.org]\nsecondary_hosts: [pypi.org]\n",
+         "must also be in allowed_hosts: pypi.org"),
+        ("version: 1\nallowed_hosts: [pypi.org]\nsecondary_hosts: [files.pypi.org]\n",
+         "must also be in allowed_hosts: files.pypi.org"),  # no implied subdomains here either
+        ("version: 1\nallowed_hosts: [pypi.org]\nsecondary_hosts: pypi.org\n",
+         "optionally a 'secondary_hosts' list"),
+        ("version: 1\nallowed_hosts: [pypi.org]\nsecondary_hosts:\n",
+         "optionally a 'secondary_hosts' list"),
+        ("version: 1\nallowed_hosts: [pypi.org]\nsecondary_hosts: ['*.pypi.org']\n",
+         "not an exact host name"),
+        ("version: 1\nallowed_hosts: [pypi.org]\nsecondary_hosts: []\nprimary_hosts: []\n",
+         "nothing else"),
+    ],
+)  # fmt: skip
+def test_invalid_secondary_hosts_fail(tmp_path: Path, text: str, match: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(match)):
+        load_reference_sources(write(tmp_path, text))
+
+
+def test_settings_expose_the_secondary_hosts(tmp_path: Path) -> None:
+    path = write(
+        tmp_path, "version: 1\nallowed_hosts: [pypi.org, a.dev]\nsecondary_hosts: [pypi.org]\n"
+    )
+    s = Settings(_env_file=None, reference_sources_file=path)
+    assert s.reference_secondary_hosts == frozenset({"pypi.org"})
+    assert Settings(_env_file=None, reference_sources_file=tmp_path / "none.yaml")\
+        .reference_secondary_hosts == frozenset()  # fmt: skip
 
 
 # ---- fetching under the exact-host policy -------------------------------------------------------

@@ -151,10 +151,57 @@ async def test_official_documentation_ranks_before_registries_and_raw_sources() 
     )
     s = AnthropicDocumentSearch(
         api_key="k", model="m", allowed_hosts=["pypi.org", "docs.python.org"],
-        client=SimpleNamespace(messages=messages),
+        secondary_hosts=["pypi.org"], client=SimpleNamespace(messages=messages),
     )  # fmt: skip
     r = await s.search("x")
     assert r.hits[0].url == "https://docs.python.org/3/x.html"
+
+
+async def test_ranking_uses_only_the_configured_secondary_hosts_by_exact_match() -> None:
+    urls = (
+        "https://pypi.org/project/a/",
+        "https://raw.githubusercontent.com/o/r/main/README.md",
+        "https://docs.python.org/3/a.html",
+        "https://files.pypi.org/b",  # a subdomain is not a secondary host (and not trusted)
+        "https://fastapi.tiangolo.com/a/",
+    )
+    hosts = ["pypi.org", "raw.githubusercontent.com", "docs.python.org", "fastapi.tiangolo.com"]
+
+    def run(secondary: list[str]) -> AnthropicDocumentSearch:
+        return AnthropicDocumentSearch(
+            api_key="k", model="m", allowed_hosts=hosts, secondary_hosts=secondary,
+            client=SimpleNamespace(messages=FakeMessages([result_block(*urls)])),
+        )  # fmt: skip
+
+    ranked = await run(["PyPI.org."]).search("x")  # normalised like the trust list
+    assert [h.url for h in ranked.hits] == [
+        "https://raw.githubusercontent.com/o/r/main/README.md",
+        "https://docs.python.org/3/a.html",
+        "https://fastapi.tiangolo.com/a/",
+        "https://pypi.org/project/a/",
+    ]
+    unranked = await run([]).search("x")  # nothing configured: provider order is kept
+    assert [h.url for h in unranked.hits] == [u for u in urls if "files." not in u]
+
+
+async def test_search_honours_a_configured_hit_cap_and_url_length() -> None:
+    urls = [f"https://docs.python.org/3/{i}.html" for i in range(10)]
+    s = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org"], max_hits=3,
+        client=SimpleNamespace(messages=FakeMessages([result_block(*urls)])),
+    )  # fmt: skip
+    assert [h.url for h in (await s.search("x")).hits] == urls[:3]
+    default = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org"],
+        client=SimpleNamespace(messages=FakeMessages([result_block(*urls)])),
+    )  # fmt: skip
+    assert len((await default.search("x")).hits) == 8
+    short, long = "https://docs.python.org/3/a.html", "https://docs.python.org/3/" + "b" * 40
+    capped = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org"], max_url_chars=len(short),
+        client=SimpleNamespace(messages=FakeMessages([result_block(long, short)])),
+    )  # fmt: skip
+    assert [h.url for h in (await capped.search("x")).hits] == [short]
 
 
 async def test_search_hits_with_a_query_string_or_an_unlisted_host_are_not_returned() -> None:

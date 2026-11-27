@@ -8,10 +8,12 @@ Permission rules, all enforced here and none by the model:
   multicast or reserved ranges: no SSRF into the host or internal network); IPv6 forms that
   embed or stand for an IPv4 address (IPv4-compatible ::/96, SIIT ::ffff:0:0:0/96) and
   site-local fec0::/10 are refused outright, and NAT64 64:ff9b::/96 only reaches a public IPv4;
-- redirects are followed manually, at most three, and each hop is checked again (scheme, port,
+- redirects are followed manually, at most REFERENCE_MAX_REDIRECTS (default three), and each hop
+  is checked again (scheme, port,
   exact host, public addresses), so a redirect to another host needs that host listed too;
-- a URL the agent asks for has no query string, at most MAX_REQUESTED_URL characters and no
-  secret (server redirects may carry a query; they come from the listed site, not the agent);
+- a URL the agent asks for has no query string, at most REFERENCE_MAX_URL_CHARS (default 300)
+  characters and no secret (server redirects may carry a query; they come from the listed site,
+  not the agent); the static part of these checks is core.reference_hosts.url_refusal;
 - GET only, no cookies, no authorization headers, no proxy settings from the environment;
 - text-like content types only, a byte cap while streaming, HTML reduced to text.
 A small DNS-rebinding window remains between the check and the connection; the allow-list keeps
@@ -35,12 +37,15 @@ from ai_code_change_agent.application.references.ports import (
     ReferenceRefusedError,
 )
 from ai_code_change_agent.core.logging import get_logger
-from ai_code_change_agent.core.reference_hosts import host_allowed, normalize_host
+from ai_code_change_agent.core.reference_hosts import (
+    DEFAULT_MAX_URL_CHARS,
+    normalize_host,
+    url_refusal,
+)
 
 Resolver = Callable[[str], Awaitable[list[str]]]
 _TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
-_MAX_REDIRECTS = 3
-MAX_REQUESTED_URL = 300  # characters, for a URL the agent asks for
+DEFAULT_MAX_REDIRECTS = 3
 # Python's is_global misses these (they report global on 3.12); listed explicitly so the result
 # does not depend on the stdlib patch level.
 _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")
@@ -68,29 +73,6 @@ def address_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool
         if any(ip in net for net in _REFUSED_V6):
             return False
     return True
-
-
-def url_refusal(url: str, hosts: Sequence[str], *, requested: bool = True) -> str | None:
-    """The static (no DNS) part of the URL check: the refusal code, or None when the URL passes.
-    `requested`: the URL comes from the agent (not a server redirect), so it also may not carry
-    a query string, be long, or contain a secret. `hosts` are normalised trusted hosts. Raises
-    ValueError for a URL urlsplit cannot parse (for example a non-numeric port)."""
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    if requested:
-        if parts.query:
-            return "reference_query_not_allowed"
-        if len(url) > MAX_REQUESTED_URL:
-            return "reference_url_too_long"
-        if find_secrets(url):
-            return "reference_url_contains_secret"
-    if parts.scheme != "https" or not host or parts.username or parts.password:
-        return "reference_url_not_allowed"
-    if parts.port not in (None, 443):
-        return "reference_url_not_allowed"
-    if not host_allowed(host, hosts):
-        return "reference_domain_not_allowed"
-    return None
 
 
 async def _resolve(host: str) -> list[str]:
@@ -141,6 +123,8 @@ class HttpReferenceFetcher:
         max_bytes: int = 1_048_576,
         max_chars: int = 40_000,
         timeout_seconds: float = 20.0,
+        max_url_chars: int = DEFAULT_MAX_URL_CHARS,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver = _resolve,
     ) -> None:
@@ -148,6 +132,8 @@ class HttpReferenceFetcher:
         self._max_bytes = max_bytes
         self._max_chars = max_chars
         self._timeout = timeout_seconds
+        self._max_url_chars = max_url_chars
+        self._max_redirects = max_redirects
         self._transport = transport
         self._resolve = resolver
 
@@ -164,7 +150,13 @@ class HttpReferenceFetcher:
         organisation details or repository content cannot be sent to a site in a URL, whatever
         a fetched page (an llms.txt, for example) asks for. Path text remains a small channel;
         the length cap bounds it and every requested URL is logged."""
-        code = url_refusal(url, self._hosts, requested=requested)
+        code = url_refusal(
+            url,
+            self._hosts,
+            contains_secret=lambda text: bool(find_secrets(text)),
+            requested=requested,
+            max_url_chars=self._max_url_chars,
+        )
         if code is not None:
             raise ReferenceRefusedError(code)
         parts = urlsplit(url)
@@ -191,7 +183,7 @@ class HttpReferenceFetcher:
             transport=self._transport,
             headers={"User-Agent": "ai-code-change-agent-reference-fetcher", "Accept": "*/*"},
         ) as client:
-            for _ in range(_MAX_REDIRECTS + 1):
+            for _ in range(self._max_redirects + 1):
                 try:
                     async with client.stream("GET", current) as response:
                         if response.is_redirect:

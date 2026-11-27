@@ -16,6 +16,7 @@ from ai_code_change_agent.composition import (
     build_github_auth,
     build_jira_reader,
     build_jira_reporter,
+    build_reference_tools,
     build_sandbox_manager,
     build_webhook_service,
     build_workspace_runtime,
@@ -25,6 +26,7 @@ from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.errors import ConfigurationError
 from ai_code_change_agent.integrations.github.publisher import GitHubAppPublisher
 from ai_code_change_agent.integrations.github.references import GitHubReferenceParser
+from ai_code_change_agent.integrations.web.fetcher import HttpReferenceFetcher
 from ai_code_change_agent.orchestration.intake import IntakeHandler, ResumeHandler
 from ai_code_change_agent.providers.llm.factory import build_chat_model
 from tests.support.changes import MemoryChanges, python_profile
@@ -213,3 +215,46 @@ def test_the_worker_settings_default_to_the_automated_pipeline() -> None:
         settings(dependency_index_url="http://insecure.example/simple")
     with pytest.raises(ValueError, match="DEPENDENCY_INDEX_URL"):
         settings(dependency_index_url="https://user:pw@index.example/simple")
+
+
+def test_composition_passes_the_reference_limits_and_ranking_hosts_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ai_code_change_agent.composition as composition
+
+    made: dict[str, dict[str, Any]] = {}
+    real_fetcher = HttpReferenceFetcher
+
+    def fetcher(**kw: Any) -> Any:
+        made["fetcher"] = kw
+        return real_fetcher(**kw)
+
+    class Searcher:
+        allowed_hosts = ("docs.python.org",)
+
+        def __init__(self, **kw: Any) -> None:
+            made["search"] = kw
+
+    monkeypatch.setattr(composition, "HttpReferenceFetcher", fetcher)
+    monkeypatch.setattr(composition, "AnthropicDocumentSearch", Searcher)
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(
+        "version: 1\nallowed_hosts: [docs.python.org, pypi.org]\nsecondary_hosts: [pypi.org]\n"
+    )
+    s = settings(
+        reference_sources_file=sources,
+        llm_provider="anthropic",
+        llm_model="claude-test",
+        anthropic_api_key="sk-test",
+        reference_max_url_chars=120,
+        reference_max_redirects=1,
+        reference_search_max_hits=4,
+    )
+    factory = build_reference_tools(s)
+    assert factory is not None
+    search_tool, fetch_tool = factory("t-1")
+    assert made["fetcher"]["max_url_chars"] == 120 and made["fetcher"]["max_redirects"] == 1
+    assert made["search"]["max_url_chars"] == 120 and made["search"]["max_hits"] == 4
+    assert made["search"]["secondary_hosts"] == ["pypi.org"]
+    assert search_tool.name == "search_docs" and fetch_tool.name == "fetch_reference"
+    assert "longer than 120 characters" in fetch_tool.description
