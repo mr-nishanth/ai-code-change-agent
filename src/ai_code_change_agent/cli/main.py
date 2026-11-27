@@ -2,7 +2,8 @@
 `ai-code-change worker`.
 
 Administration is CLI-only until operator SSO exists (ADR-P22). Actor attribution is the OS user
-and is therefore **unauthenticated**: anyone with database access can run this. The CLI never
+and is therefore **unauthenticated**: anyone with access to the application's DynamoDB table (and
+its job queue) can run this. The CLI never
 prints credentials and never executes profile commands. It contacts a Git host only to verify a
 repository's identity read-only while registering it (when a provider client is configured).
 """
@@ -20,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
+from ai_code_change_agent.application.multirepo.coordinator import MultiRepoBlockedError
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.application.repositories.service import RepositoryRegistryService
 from ai_code_change_agent.application.repositories.validation import (
@@ -39,6 +41,7 @@ from ai_code_change_agent.domain.repositories.errors import (
 from ai_code_change_agent.domain.repositories.models import NewRepository
 from ai_code_change_agent.domain.repositories.resolution import ResolutionRequest
 from ai_code_change_agent.domain.repositories.templates import standard_profile
+from ai_code_change_agent.domain.webhooks.models import PersistenceError
 
 Services = tuple[RepositoryRegistryService, RepositoryResolver]
 ServiceFactory = Callable[[], Services]
@@ -433,8 +436,11 @@ def main(
     if args.area in ("worker", "changes", "costs"):
         try:
             return operations.run(args, out)
-        except (ChangeError, ConfigurationError) as exc:
+        except (ChangeError, ConfigurationError, MultiRepoBlockedError) as exc:
             err_out.write(f"error: {exc}\n")
+            return 1
+        except PersistenceError as exc:  # the message is a fixed or AWS error code only
+            err_out.write(f"error: storage: {exc}\n")
             return 1
     try:
         if args.command == "validate-profile":
@@ -485,31 +491,26 @@ def main(
     except RegistryError as exc:
         err_out.write(f"error: {exc.code}: {exc}\n")
         return 1
-    except RuntimeError as exc:
+    except PersistenceError as exc:  # the message is a fixed or AWS error code only
+        err_out.write(f"error: storage: {exc}\n")
+        return 1
+    except (ConfigurationError, RuntimeError) as exc:
         err_out.write(f"error: {exc}\n")
         return 2
     return 0
 
 
 def _default_services() -> Services:
-    from ai_code_change_agent.composition import (
-        build_git_provider_clients,
-        build_github_auth,
-        build_registry_service,
-        build_repository_resolver,
-    )
+    """The registry service and resolver on DynamoDB (ACCA_AWS_* / ACCA_DYNAMODB_TABLE_NAME)."""
+    from ai_code_change_agent.cli.stores import CliStores
+    from ai_code_change_agent.composition import build_git_provider_clients, build_github_auth
     from ai_code_change_agent.core.config import get_settings
-    from ai_code_change_agent.persistence.session import create_engine, create_session_factory
 
     settings = get_settings()
-    url = settings.database_url
-    if url is None:
-        msg = "DATABASE_URL is required"
-        raise RuntimeError(msg)
-    factory = create_session_factory(create_engine(url.get_secret_value()))
+    stores = CliStores(settings)
     return (
-        build_registry_service(factory, build_git_provider_clients(build_github_auth(settings))),
-        build_repository_resolver(factory),
+        stores.registry_service(build_git_provider_clients(build_github_auth(settings))),
+        stores.resolver(),
     )
 
 

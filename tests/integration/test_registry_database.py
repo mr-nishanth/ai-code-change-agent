@@ -415,23 +415,6 @@ def test_fresh_history_roundtrip_and_head(database_url: str) -> None:
     assert uuid.uuid4()
 
 
-def test_default_cli_composition_reaches_the_real_database(
-    database_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import io
-
-    from ai_code_change_agent.core.config import get_settings
-
-    monkeypatch.setenv("DATABASE_URL", database_url)
-    get_settings.cache_clear()
-    try:
-        out = io.StringIO()
-        assert main(["repositories", "list"], out=out) == 0
-        assert out.getvalue().strip() == "no repositories"
-    finally:
-        get_settings.cache_clear()
-
-
 async def test_read_paths_and_lifecycle_operations_on_postgres(
     factory: async_sessionmaker[AsyncSession], database_url: str
 ) -> None:

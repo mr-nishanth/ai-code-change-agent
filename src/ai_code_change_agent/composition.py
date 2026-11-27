@@ -19,14 +19,16 @@ from ai_code_change_agent.agents.coding.tools import build_reference_tool, build
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.costs.pricing import PriceTable
-from ai_code_change_agent.application.costs.report import totals
+from ai_code_change_agent.application.costs.report import CostQuery, totals
 from ai_code_change_agent.application.costs.service import CostReporter
 from ai_code_change_agent.application.costs.usage import UsageTracker
 from ai_code_change_agent.application.git_providers.baseline import BaselineReaders
 from ai_code_change_agent.application.git_providers.delivery import DeliveryPublishers
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
+from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.jobs.worker import Worker
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
+from ai_code_change_agent.application.multirepo.models import MultiRepoStore
 from ai_code_change_agent.application.references.ports import SearchResult
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
 from ai_code_change_agent.application.repositories.profile_reader import ProfileReader
@@ -396,12 +398,14 @@ def build_price_table(settings: Settings) -> PriceTable:
 
 
 def build_cost_reporter(
-    sessions: async_sessionmaker[AsyncSession],
+    query: CostQuery,
     settings: Settings,
     changes: CodeChangeService,
     session_id: uuid.UUID,
     write: Callable[[str], Any] = sys.stdout.write,
 ) -> CostReporter:
+    """Cost reports from the usage ledger `query` (any `CostQuery` adapter)."""
+
     async def status_of(attempt_id: uuid.UUID) -> tuple[str, bool]:
         attempt = await changes.get_attempt(attempt_id)
         return attempt.status.value, attempt.terminal
@@ -412,7 +416,7 @@ def build_cost_reporter(
             sys.stdout.flush()
 
     return CostReporter(
-        PostgresUsageStore(sessions),
+        query,
         build_price_table(settings),
         provider=settings.llm_provider,
         primary_model=settings.llm_model or "-",
@@ -448,7 +452,7 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
     registry = registry_uow_factory(sessions)
     changes = build_change_service(sessions, settings)
     runtime = build_workspace_runtime(settings)
-    costs = build_cost_reporter(sessions, settings, changes, uuid.uuid4())
+    costs = build_cost_reporter(PostgresUsageStore(sessions), settings, changes, uuid.uuid4())
     prices = build_price_table(settings)
     if settings.llm_model and not prices.knows(settings.llm_model):
         _log.warning(
@@ -469,7 +473,16 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
         artifacts = build_artifact_service(settings)
         reporter = build_jira_reporter(settings)
         resolver = build_repository_resolver(sessions)
-        coordinator = build_coordinator(sessions, settings, changes, artifacts, resolver, reporter)
+        coordinator = build_coordinator(
+            settings,
+            store=PostgresMultiRepoStore(sessions),
+            queue=PostgresJobQueue(sessions),
+            usage=PostgresUsageStore(sessions),
+            changes=changes,
+            artifacts=artifacts,
+            resolver=resolver,
+            reporter=reporter,
+        )
         deps = StepDependencies(
             changes=changes,
             registry_uow=registry,
@@ -539,22 +552,25 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
 
 
 def build_coordinator(
-    sessions: async_sessionmaker[AsyncSession],
     settings: Settings,
+    *,
+    store: MultiRepoStore,
+    queue: JobQueue,
+    usage: CostQuery,
     changes: CodeChangeService,
     artifacts: Any,
     resolver: RepositoryResolver,
     reporter: Any,
 ) -> Coordinator:
-    usage = PostgresUsageStore(sessions)
+    """The multi-repository coordinator over the given store, job queue and usage ledger."""
 
     async def cost_of_issue(issue_key: str) -> str:
         return totals(r.record for r in await usage.rows(issue_keys=[issue_key])).money()
 
     return Coordinator(
-        store=PostgresMultiRepoStore(sessions),
+        store=store,
         changes=changes,
-        queue=PostgresJobQueue(sessions),
+        queue=queue,
         artifacts=artifacts,
         resolver=resolver,
         reporter=reporter,
