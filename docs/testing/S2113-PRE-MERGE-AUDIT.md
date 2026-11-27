@@ -98,7 +98,7 @@ Evidence:
 
 Fix:
 - after `load_verified`, require `doc.parent_id == child.parent_id`, `doc.repository_key == key` and `doc.attempt_id == up.attempt_id`. Otherwise raise `ArtifactIntegrityError("artifact_provenance_mismatch")` (`application/errors.py:19`). The dependent fails at planning, before any workspace or agent run;
-- in the report, `artifact_*` codes print `Retryable: no (contract integrity failure: needs operator investigation before retry-child <id>)`. Child state and the retry command are unchanged.
+- in the report, `artifact_*` codes print `Retryable: no (artifact integrity failure: an operator must investigate the artifact store before retry-child <id>)`. Child state and the retry command are unchanged.
 
 ## 3. Warnings: root cause
 

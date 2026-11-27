@@ -12,9 +12,10 @@ from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.jira.errors import (
     JiraIntegrationError,
     JiraIssueNotFoundError,
+    JiraResponseError,
 )
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
-from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError, JobRetryableError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
     REPORT_JOB,
@@ -35,6 +36,16 @@ CHILD = CHILD_JOB
 PARENT_REPORT = REPORT_JOB
 REPOSITORY_FIELD = "repository"  # logical name of the configured Jira custom field
 Launch = Callable[[uuid.UUID], Awaitable[Any]]
+# Responses the client treats as unusable that are usually transient (a proxy or maintenance page,
+# a truncated body, 408 Request Timeout, 425 Too Early): retried within the job's attempts.
+_TRANSIENT_RESPONSES = frozenset({"unexpected_content_type", "malformed_json"})
+_TRANSIENT_STATUSES = frozenset({408, 425})
+
+
+def _transient(exc: JiraIntegrationError) -> bool:
+    return isinstance(exc, JiraResponseError) and (
+        str(exc) in _TRANSIENT_RESPONSES or exc.status_code in _TRANSIENT_STATUSES
+    )
 
 
 class IntakeHandler:
@@ -71,6 +82,8 @@ class IntakeHandler:
             # Authentication, permission, a bad request or an unusable response will not fix
             # itself on a retry: dead at once, with the fixed code. Transient errors (429, 5xx
             # outages, timeouts) propagate unchanged, so the queue backs off and retries them.
+            if _transient(exc):
+                raise JobRetryableError(exc.code) from None
             if not exc.retryable:
                 raise JobFailedError(exc.code) from None
             raise

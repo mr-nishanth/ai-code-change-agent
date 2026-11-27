@@ -120,6 +120,8 @@ On KAN-9 the model kept sending one field in the wrong shape, and the SDK retrie
 | `DEEP_AGENT_MAX_MODEL_CALLS` (80) | LangChain `ModelCallLimitMiddleware` per phase run → `agent_model_call_limit` |
 | `LLM_MAX_COST_PER_PHASE_USD` (2.0) | Stops before the next model call once the phase run has spent its budget → `agent_cost_budget_exceeded` |
 
+- **Handler order:** `UsageTracker.handlers()` must keep `BudgetGuard` last. LangChain creates every handler's `on_chat_model_start` coroutine before awaiting them in order, so a handler placed after a guard that raises is never awaited (`RuntimeWarning: coroutine ... was never awaited`). `tests/unit/agents/test_coding_agent.py::test_a_tripped_cost_guard_leaves_no_unawaited_callback` pins this. It is last only among our own handlers: a handler the runtime appends after them (for example a LangSmith tracer when tracing is on) can still be skipped, which costs a warning and a missing trace start for a call that never ran, nothing more.
+
 - **Worst case per attempt:** an attempt has at most planning, implementation and `MAX_REPAIR_ATTEMPTS` correction phases, so it costs at most (2 + MAX_REPAIR_ATTEMPTS) × the phase budget.
 - **Worst case per Story:** a multi-repository Story costs at most that amount per child.
 - **No automatic retry:** a guard-stopped attempt is FAILED, never re-run automatically.

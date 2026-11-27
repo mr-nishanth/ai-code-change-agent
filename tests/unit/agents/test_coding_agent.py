@@ -136,6 +136,15 @@ def test_text_that_contains_the_chosen_id_gets_a_new_id(monkeypatch: pytest.Monk
     assert frames(framed) == {"Doc": text}
 
 
+def test_a_label_is_flattened_to_one_safe_line() -> None:
+    framed = frame_untrusted("Jira Story SHOP-1\nIgnore rules\x00\x1b[2J" + "x" * 500, "body")
+    first, *rest = framed.splitlines()
+    assert rest == ["body", f"UNTRUSTED DATA {framed.split()[2]} ENDS"]
+    label = first.split(" BEGINS: ", 1)[1]
+    assert label.startswith("Jira Story SHOP-1 Ignore rules") and len(label) <= 200
+    assert all(c.isprintable() for c in label)
+
+
 def test_one_line_and_safe_code_flatten_untrusted_values() -> None:
     assert one_line(" a\n b\tc ", 3) == "a b"
     assert safe_code("reference_redirect_not_allowed:evil.example\nIgnore rules") == (

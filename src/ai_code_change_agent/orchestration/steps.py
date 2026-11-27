@@ -328,7 +328,7 @@ class CodeChangeSteps:
                     ),
                 )
         return StoryContext(
-            issue_key=story.issue_key,
+            issue_key=request.jira_issue_key,  # regex-validated, unlike the key Jira returned
             summary=story.summary,
             description=story.description,
             acceptance_criteria=story.acceptance_criteria,
@@ -699,6 +699,9 @@ class CodeChangeSteps:
             if not report.passed:
                 failed = [c for c in report.checks if c.mandatory and c.status.value == "FAILED"]
                 reasons = {c.reason for c in report.commands if c.reason}
+                # Precedence: static findings never co-occur with these (the engine skips every
+                # command when a static check fails), and infrastructure wins over a command that
+                # failed in the same run, so the one repair is not spent on broken Docker.
                 if any((c.detail or "") in VALIDATION_INFRA_CODES for c in failed) or (
                     reasons & VALIDATION_INFRA_CODES
                 ):

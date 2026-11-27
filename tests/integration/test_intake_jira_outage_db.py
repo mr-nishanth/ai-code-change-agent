@@ -124,10 +124,17 @@ ERRORS = [
     JiraServiceUnavailableError("connection_error", operation="get_issue"),
     JiraServiceUnavailableError("server_error", operation="get_issue", status_code=503),
     JiraRateLimitError(operation="get_issue", status_code=429),
+    JiraResponseError("unexpected_status", operation="get_issue", status_code=408),
+    JiraResponseError("unexpected_content_type", operation="get_issue"),
+    JiraResponseError("malformed_json", operation="get_issue"),
 ]
 
 
-@pytest.mark.parametrize("error", ERRORS, ids=["timeout", "connection", "http_503", "http_429"])
+@pytest.mark.parametrize(
+    "error",
+    ERRORS,
+    ids=["timeout", "connection", "http_503", "http_429", "http_408", "html_page", "malformed"],
+)
 async def test_jira_unavailable_during_intake_is_retried_and_then_starts_exactly_one_attempt(
     sessions: async_sessionmaker[AsyncSession], database_url: str, error: JiraIntegrationError
 ) -> None:
@@ -136,7 +143,8 @@ async def test_jira_unavailable_during_intake_is_retried_and_then_starts_exactly
     worker = intake_worker(sessions, jira, started)
 
     assert await worker.run_once() is not None
-    code = type(error).__name__  # fixed class name only: never Jira text or connection details
+    # fixed code or class name only: never Jira text or connection details
+    code = error.code if isinstance(error, JiraResponseError) else type(error).__name__
     assert state(database_url) == ([("QUEUED", 1, code)], [("RECEIVED", True)], 0)
     assert started == []  # no half-created assignment or attempt
     assert await worker.run_once() is None  # backed off, not retried at once
@@ -168,11 +176,11 @@ async def test_jira_unavailable_for_every_attempt_ends_dead_with_the_request_unt
 PERMANENT = [
     (JiraAuthenticationError(operation="get_issue", status_code=401), "jira_authentication_failed"),
     (JiraPermissionError(operation="get_issue", status_code=403), "jira_permission_denied"),
-    (JiraResponseError("malformed_json", operation="get_issue"), "jira_response_invalid"),
+    (JiraResponseError("unexpected_json_shape", operation="get_issue"), "jira_response_invalid"),
 ]
 
 
-@pytest.mark.parametrize(("error", "code"), PERMANENT, ids=["http_401", "http_403", "malformed"])
+@pytest.mark.parametrize(("error", "code"), PERMANENT, ids=["http_401", "http_403", "bad_shape"])
 async def test_a_permanent_jira_error_during_intake_is_dead_after_one_attempt(
     sessions: async_sessionmaker[AsyncSession],
     database_url: str,

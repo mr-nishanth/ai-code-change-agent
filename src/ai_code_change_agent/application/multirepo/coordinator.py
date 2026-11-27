@@ -59,8 +59,8 @@ def report_marker(parent_id: uuid.UUID, report_round: int) -> str:
 
 _DONE = frozenset({ChildStatus.COMPLETED})
 _FAILED = frozenset({ChildStatus.FAILED, ChildStatus.REJECTED, ChildStatus.BLOCKED})
-# Artifact checks that failed on content, not on storage (artifact_too_large or
-# artifact_storage_error stay retryable): a retry would read the same artifact.
+# A stored artifact failed its hash, schema or origin check: possible corruption or tampering
+# in the artifact store (artifact_too_large and artifact_storage_error stay retryable).
 _INTEGRITY_FAILURES = frozenset(
     {
         "artifact_hash_mismatch",
@@ -372,12 +372,11 @@ class Coordinator:
             else:
                 retry = "yes (ai-code-change changes retry-child " + str(c.id) + ")"
                 if c.failure_code in _INTEGRITY_FAILURES:
-                    # A contract that failed its hash, schema or origin check may have been
-                    # tampered with: a blind retry reads the same artifact, so an operator
-                    # investigates first.
+                    # Possible corruption or tampering in the artifact store: an operator
+                    # investigates before anyone retries the child.
                     retry = (
-                        "no (contract integrity failure: needs operator investigation before "
-                        f"retry-child {c.id})"
+                        "no (artifact integrity failure: an operator must investigate the "
+                        f"artifact store before retry-child {c.id})"
                     )
                 lines += [f"   Reason: {c.failure_code or '-'}", f"   Retryable: {retry}"]
             if c.contract_sha256:

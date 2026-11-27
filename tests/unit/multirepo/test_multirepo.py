@@ -750,7 +750,8 @@ async def test_a_tampered_contract_fails_the_dependent_before_any_agent_or_works
     assert "Execution: PARTIALLY_COMPLETED" in text
     assert "Reason: artifact_hash_mismatch" in text
     assert (
-        "Retryable: no (contract integrity failure: needs operator investigation before "
+        "Retryable: no (artifact integrity failure: an operator must investigate the artifact store "
+        "before "
         f"retry-child {web.id})" in text
     )
     assert "Retryable: yes" not in text
@@ -792,7 +793,7 @@ async def test_a_contract_with_a_foreign_origin_is_refused_before_any_agent_or_w
     assert web.status is ChildStatus.FAILED and web.failure_code == "artifact_provenance_mismatch"
     (text,) = [t for _, t in reporter.texts]
     assert "Reason: artifact_provenance_mismatch" in text
-    assert "Retryable: no (contract integrity failure" in text
+    assert "Retryable: no (artifact integrity failure" in text
 
 
 @pytest.mark.parametrize(
@@ -818,7 +819,8 @@ async def test_only_contract_integrity_failures_withhold_the_retry_invitation(
     assert f"Reason: {code}" in text
     assert ("Retryable: yes" in text) is retryable
     assert (
-        f"Retryable: no (contract integrity failure: needs operator investigation before "
+        f"Retryable: no (artifact integrity failure: an operator must investigate the artifact store "
+        "before "
         f"retry-child {backend.id})" in text
     ) is not retryable
 

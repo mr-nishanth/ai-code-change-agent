@@ -14,7 +14,7 @@ from ai_code_change_agent.application.jira.errors import (
     JiraServiceUnavailableError,
     JiraTimeoutError,
 )
-from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError, JobRetryableError
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.composition import (
     build_baseline_provider,
@@ -154,10 +154,8 @@ def _never_started() -> Any:
     [(lambda: httpx.Response(400, text="bad"), "jira_response_invalid"),
      (lambda: httpx.Response(401, text="no"), "jira_authentication_failed"),
      (lambda: httpx.Response(403, text="no"), "jira_permission_denied"),
-     (lambda: httpx.Response(501, text="no"), "jira_service_unavailable"),
-     (lambda: httpx.Response(200, text="{not json", headers={"content-type": "application/json"}),
-      "jira_response_invalid")],
-    ids=["http_400", "http_401", "http_403", "http_501", "malformed_json"],
+     (lambda: httpx.Response(501, text="no"), "jira_service_unavailable")],
+    ids=["http_400", "http_401", "http_403", "http_501"],
 )  # fmt: skip
 async def test_a_permanent_jira_error_fails_intake_at_once_with_its_fixed_code(
     response: Callable[[], httpx.Response], code: str
@@ -207,6 +205,36 @@ async def test_a_transient_jira_error_propagates_unchanged_so_the_queue_retries_
     with pytest.raises(error) as raised:
         await handler(job({"code_change_request_id": str(req.id)}))
     assert not isinstance(raised.value, JobFailedError) and raised.value.retryable  # type: ignore[attr-defined]
+    untouched = await changes.service().get_request(req.id)
+    assert untouched.repository_id is None and changes.state.attempts == {}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [lambda: httpx.Response(408, text="timeout"),
+     lambda: httpx.Response(425, text="too early"),
+     lambda: httpx.Response(200, text="<html>maintenance</html>",
+                            headers={"content-type": "text/html"}),
+     lambda: httpx.Response(200, text="{not json", headers={"content-type": "application/json"})],
+    ids=["http_408", "http_425", "html_page", "malformed_json"],
+)  # fmt: skip
+async def test_a_usually_transient_jira_response_is_retried_by_the_queue(
+    response: Callable[[], httpx.Response],
+) -> None:
+    reg, changes = await registry(), MemoryChanges()
+    req = changes.add_request()
+    jira, _ = _jira_answering(response)
+    handler = IntakeHandler(
+        changes=changes.service(),
+        jira=jira,
+        resolver=RepositoryResolver(reg.uow),
+        start=_never_started(),
+        repository_field_configured=False,
+    )
+    with pytest.raises(JobRetryableError) as raised:
+        await handler(job({"code_change_request_id": str(req.id)}))
+    assert raised.value.code == "jira_response_invalid"
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
     untouched = await changes.service().get_request(req.id)
     assert untouched.repository_id is None and changes.state.attempts == {}
 

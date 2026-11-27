@@ -147,10 +147,10 @@ class _RetryAfter(Exception):  # noqa: N818 - mirrors JiraRateLimitError's attri
 
 @pytest.mark.parametrize(
     ("exc", "retry"),
-    [(JobRetryableError("jira_rate_limited", retry_after_seconds=120), 120),
-     (JobRetryableError("jira_rate_limited", retry_after_seconds=5000), 900),
-     (JobRetryableError("jira_rate_limited", retry_after_seconds=10), 30),
-     (JobRetryableError("jira_rate_limited", retry_after_seconds=None), 30),
+    [(_RetryAfter(120), 120),
+     (_RetryAfter(5000), 900),  # capped: a longer Retry-After may exhaust the job's attempts
+     (_RetryAfter(10), 30),
+     (JobRetryableError("jira_rate_limited"), 30),
      (_RetryAfter(120.2), 121),
      (_RetryAfter(0), 30),
      (_RetryAfter(-5), 30),
