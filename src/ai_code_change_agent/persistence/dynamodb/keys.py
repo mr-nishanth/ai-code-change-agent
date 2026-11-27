@@ -36,7 +36,8 @@ GSI_LIST_ATTEMPT = "LIST#ATTEMPT"
 GSI_LIST_REPOSITORY = "LIST#REPOSITORY"
 GSI_LIST_MAPPING = "LIST#MAPPING"
 GSI_LIST_AUDIT = "LIST#AUDIT"
-GSI_DISPATCH = "DISPATCH"
+GSI_DISPATCH = "DISPATCH"  # GSI3: outbox, the job's message was never sent
+GSI_SWEEP = "SWEEP"  # GSI3: non-terminal job whose message was sent; watched by the sweep
 
 
 @dataclass(frozen=True, order=True)

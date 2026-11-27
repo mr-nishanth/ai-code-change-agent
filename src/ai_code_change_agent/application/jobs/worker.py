@@ -3,6 +3,12 @@
 It is a trusted control-plane process (it controls the Docker daemon for sandboxes). Handlers are
 registered by job kind; there is no default handler. A lost lease cancels the running handler so
 two workers never act on the same job.
+
+`run` starts one claim loop per concurrency slot (with SQS each claim is one long-poll receive) and
+the dispatcher role: the queue's outbox relay (`dispatch_pending`) every `poll_seconds` and its
+sweep for lost messages every `sweep_seconds`, inside this process (DYNAMODB-DATA-MODEL.md 8.2).
+A failing claim or dispatcher tick is logged and retried after `poll_seconds`; it never stops
+the worker.
 """
 
 import asyncio
@@ -41,6 +47,12 @@ def retry_delay_seconds(exc: BaseException, attempts: int) -> int:
     return min(delay, MAX_BACKOFF_SECONDS)
 
 
+def _code(exc: BaseException) -> str:
+    """A log-safe code: the error's string `code` attribute, else its class name; never raw text."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) and code else type(exc).__name__
+
+
 class _LeaseLost(Exception):  # noqa: N818
     pass
 
@@ -55,39 +67,70 @@ class Worker:
         heartbeat_seconds: float,
         concurrency: int = 1,
         poll_seconds: float = 2.0,
+        sweep_seconds: float = 60.0,
         owner: str | None = None,
     ) -> None:
         self._queue = queue
         self._handlers = dict(handlers)
         self._lease = lease_seconds
         self._beat = heartbeat_seconds
-        self._slots = asyncio.Semaphore(concurrency)
+        self._concurrency = concurrency
         self._poll = poll_seconds
+        self._sweep = sweep_seconds
         self.owner = owner or f"{socket.gethostname()[:64]}:{uuid.uuid4().hex[:12]}"
 
     async def run(self, stop: asyncio.Event) -> None:
-        tasks: set[asyncio.Task[None]] = set()
+        slots = [asyncio.create_task(self._slot(stop)) for _ in range(self._concurrency)]
+        dispatcher = asyncio.create_task(self._dispatcher(stop))
         try:
-            while not stop.is_set():
-                await self._slots.acquire()
-                job = await self._queue.claim(self.owner, self._lease)
-                if job is None:
-                    self._slots.release()
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(stop.wait(), self._poll)
-                    continue
-                task = asyncio.create_task(self._guarded(job))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+            await asyncio.gather(*slots)
         finally:
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            for slot in slots:
+                slot.cancel()
+            dispatcher.cancel()
+            await asyncio.gather(*slots, dispatcher, return_exceptions=True)
 
-    async def _guarded(self, job: Job) -> None:
+    async def _slot(self, stop: asyncio.Event) -> None:
+        """One free slot: claim (a long-poll receive with SQS), process, repeat until stopped. A
+        job already claimed is processed to the end even when stop is set meanwhile."""
+        while not stop.is_set():
+            try:
+                job = await self._queue.claim(self.owner, self._lease)
+            except Exception as exc:  # a store outage must not stop the worker
+                _log.warning("job_claim_failed", code=_code(exc))
+                job = None
+            if job is None:
+                await self._wait(stop, self._poll)
+                continue
+            try:
+                await self.process(job)
+            except Exception as exc:  # recording the result failed; the lease expires and decides
+                _log.warning("job_process_failed", job_id=str(job.id), code=_code(exc))
+
+    async def _dispatcher(self, stop: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        next_sweep = loop.time()
+        while not stop.is_set():
+            await self._tick("dispatch_pending", self._queue.dispatch_pending)
+            if loop.time() >= next_sweep:
+                await self._tick("sweep", self._queue.sweep)
+                next_sweep = loop.time() + self._sweep
+            await self._wait(stop, self._poll)
+
+    @staticmethod
+    async def _tick(name: str, step: Callable[[], Coroutine[Any, Any, int]]) -> None:
         try:
-            await self.process(job)
-        finally:
-            self._slots.release()
+            sent = await step()
+        except Exception as exc:
+            _log.warning("job_dispatcher_failed", step=name, code=_code(exc))
+            return
+        if sent:
+            _log.info("job_dispatcher_sent", step=name, count=sent)
+
+    @staticmethod
+    async def _wait(stop: asyncio.Event, seconds: float) -> None:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), seconds)
 
     async def run_once(self) -> Job | None:
         """Claim and process at most one job (tests and the CLI's one-shot mode)."""

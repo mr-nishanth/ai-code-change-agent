@@ -7,6 +7,7 @@ fixture also sets `AWS_PROFILE` and `AWS_ENDPOINT_URL` to unusable values, provi
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -58,3 +59,46 @@ def app_table(floci: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[Table]:
         yield Table(aws.dynamodb, name)
     finally:
         aws.dynamodb.delete_table(TableName=name)
+
+
+@dataclass(frozen=True)
+class JobQueues:
+    """A per-test SQS job queue and its DLQ (`s2116-<uuid>` names), with the client that made them."""
+
+    sqs: Any
+    url: str
+    dlq_url: str
+
+
+def create_job_queues(sqs: Any, *, max_receive_count: int = 20) -> JobQueues:
+    """The bootstrap's job queue shape (VisibilityTimeout 300, long polling 20 s, redrive to a DLQ)
+    under unique names; `max_receive_count` lowered by the poison-message test."""
+    dlq_url = sqs.create_queue(QueueName=unique_name("s2116-dlq"))["QueueUrl"]
+    arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])["Attributes"][
+        "QueueArn"
+    ]
+    redrive = json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": str(max_receive_count)})
+    url = sqs.create_queue(
+        QueueName=unique_name("s2116-jobs"),
+        Attributes={
+            "VisibilityTimeout": "300",
+            "ReceiveMessageWaitTimeSeconds": "20",
+            "RedrivePolicy": redrive,
+        },
+    )["QueueUrl"]
+    return JobQueues(sqs, url, dlq_url)
+
+
+def delete_job_queues(queues: JobQueues) -> None:
+    for url in (queues.url, queues.dlq_url):
+        queues.sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.fixture
+def job_queues(floci: str) -> Iterator[JobQueues]:
+    """A fresh job queue + DLQ on Floci, deleted after the test."""
+    queues = create_job_queues(local_clients(floci).sqs)
+    try:
+        yield queues
+    finally:
+        delete_job_queues(queues)

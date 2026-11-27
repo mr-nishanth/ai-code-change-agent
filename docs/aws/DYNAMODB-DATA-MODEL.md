@@ -93,7 +93,7 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 | Usage, session copy | `USAGE#SES#<session_id>` | `<created_at>#<call_id>` | - | Second immutable copy (both written in one transaction) |
 | LLM call guard | `LLMCALL#<call_id>` | `GUARD` | - | Uniqueness of the call (run) id |
 | Provider message guard | `LLMMSG#<provider_message_id>` | `GUARD` | - | Only when the provider reports an id |
-| Job | `JOB#<jid>` | `JOB` | GSI3 `DISPATCH` / `<due_at>#<jid>` while non-terminal | State, attempts, lease, `payload_json`, `last_error` |
+| Job | `JOB#<jid>` | `JOB` | GSI3 `DISPATCH` (message not sent yet) or `SWEEP` (sent) / `<due_at>#<jid>` while non-terminal | State, attempts, lease, `payload_json`, `last_error` |
 | Job dedupe guard | `JOBKEY#<dedupe_key>` | `GUARD` | - | `JOBKEY#code_change.child:<cid>:2` -> `job_id`. Permanent |
 
 The change aggregate of one Story is a single item collection: `Query PK=REQ#<rid>` returns the request,
@@ -140,7 +140,7 @@ optimistic race. `CodeChangeService` and `RepositoryRegistryService` retry the w
 |---|---|---|---|---|---|
 | GSI1 | `GSI1PK`, `GSI1SK` | ALL | Request (`ISSUEKEY#`), mapping (`REPOMAPS#`) | U3 issue -> requests; R17 by repository (display) | Eventual. Requests exist long before a cost query; display only for mappings. Authorisation never uses a GSI |
 | GSI2 | `GSI2PK`, `GSI2SK` | ALL | `LIST#REPOSITORY`, `LIST#MAPPING`, `LIST#AUDIT`, `LIST#ATTEMPT` | R5, R17 (no filter), R19 (no filter), studio S1 | Eventual; operator and studio listings |
-| GSI3 | `GSI3PK`, `GSI3SK` | KEYS_ONLY | Non-terminal jobs (`DISPATCH` / `<due_at>#<jid>`) | Relay and sweep (J8) | Eventual; each hit is re-checked with a consistent `GetItem` |
+| GSI3 | `GSI3PK`, `GSI3SK` | KEYS_ONLY | Non-terminal jobs: `DISPATCH` (outbox, not sent) or `SWEEP` (sent) / `<due_at>#<jid>` | Relay (`DISPATCH`) and sweep (`SWEEP`) (J8) | Eventual; each hit is re-checked with a consistent `GetItem` |
 
 No LSIs (they would cap item collections at 10 GB and must be created with the table).
 
@@ -184,8 +184,8 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 
 | Step | DynamoDB (authoritative) | SQS (delivery) |
 |---|---|---|
-| Enqueue (J1, W6) | `TransactWriteItems`: `JOBKEY#` guard + `JOB#` item (QUEUED, `GSI3` set = outbox row) | Worker-side producers send `{"job_id"}` right after commit and then `REMOVE` the GSI3 keys. The API never sends (no SQS permission); the relay picks its jobs up |
-| Relay (J8) | `Query GSI3 DISPATCH` for due rows, consistent re-read | `SendMessage`, then clear GSI3 keys on QUEUED jobs. Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
+| Enqueue (J1, W6) | `TransactWriteItems`: `JOBKEY#` guard + `JOB#` item (QUEUED, `GSI3` set = outbox row) | Worker-side producers send `{"job_id"}` right after commit and then move the GSI3 entry from `DISPATCH` to `SWEEP` (`dispatched_at` set; conditional on still being in `DISPATCH`). The API never sends (no SQS permission); the relay picks its jobs up |
+| Relay (J8) | `Query GSI3 DISPATCH` for due rows, consistent re-read | `SendMessage`, then move the job from `DISPATCH` to `SWEEP` (the outbox entry is cleared). Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
 process) every 2 s, the poll interval today |
 | Claim (J2) | Conditional `UpdateItem` (same predicate as `_CLAIM`), `ALL_NEW` | `ReceiveMessage` (`WaitTimeSeconds` 20, `VisibilityTimeout` = lease, `MaxNumberOfMessages` 1 per free slot) |
 | Not claimable | Read the item | Terminal -> `DeleteMessage`; not due -> `ChangeMessageVisibility(available_at - now)`; leased elsewhere -> visibility = remaining lease; exhausted and expired -> mark DEAD, `DeleteMessage` |
@@ -194,7 +194,7 @@ process) every 2 s, the poll interval today |
 | Fail, retry (J6) | Conditional QUEUED, `available_at = now + retry` (le 900 s) | `ChangeMessageVisibility(retry)` on the same message: no new message, no outbox row |
 | Fail, dead | Conditional DEAD | `DeleteMessage` |
 | Worker crash | Lease expires | Visibility expires with the lease; the next receiver's conditional claim succeeds (`attempts + 1`), as today |
-| Lost or dead-lettered message for a live job | Sweep (every 60 s) finds non-terminal jobs whose `due_at` or lease passed by more than a grace period | Re-send |
+| Lost or dead-lettered message for a live job | Sweep (every 60 s) queries GSI3 `SWEEP` (non-terminal, sent) and, after a consistent re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. Terminal transitions `REMOVE` the GSI3 keys |
 
 ### 8.3 Outbox evaluated
 

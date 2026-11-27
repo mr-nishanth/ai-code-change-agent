@@ -108,3 +108,9 @@ class PostgresJobQueue:
                 )
             ).first()
         return JobStatus(row.status) if row else JobStatus.RUNNING  # RUNNING: lease was lost
+
+    async def dispatch_pending(self) -> int:
+        return 0  # claims read the table directly: there is no outbox to relay
+
+    async def sweep(self) -> int:
+        return 0  # no separate delivery channel, so nothing can be lost

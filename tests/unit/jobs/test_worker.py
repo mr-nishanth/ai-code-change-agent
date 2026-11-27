@@ -23,6 +23,8 @@ class MemoryQueue:
         self.completed: list[uuid.UUID] = []
         self.failed: list[tuple[uuid.UUID, str, int | None]] = []
         self.beats = 0
+        self.relays = 0
+        self.sweeps = 0
 
     async def enqueue(
         self, kind: str, payload: dict[str, Any], *, dedupe_key: str, max_attempts: int
@@ -46,6 +48,14 @@ class MemoryQueue:
     ) -> JobStatus:
         self.failed.append((job_id, code, retry_in_seconds))
         return JobStatus.QUEUED if retry_in_seconds is not None else JobStatus.DEAD
+
+    async def dispatch_pending(self) -> int:
+        self.relays += 1
+        return 0
+
+    async def sweep(self) -> int:
+        self.sweeps += 1
+        return 0
 
 
 def job(kind: str = "k.one", attempts: int = 1) -> Job:
@@ -179,3 +189,59 @@ async def test_a_jira_rate_limit_carries_its_retry_after_into_the_queue() -> Non
 def test_backoff_is_exponential_and_capped() -> None:
     assert [backoff_seconds(n) for n in (1, 2, 3)] == [30, 60, 120]
     assert backoff_seconds(30) == 900
+
+
+class FlakyQueue(MemoryQueue):
+    """Claims and dispatcher steps fail first; the worker keeps going."""
+
+    def __init__(self, jobs: list[Job]) -> None:
+        super().__init__(jobs)
+        self.claims = 0
+
+    async def claim(self, owner: str, lease_seconds: int) -> Job | None:
+        self.claims += 1
+        if self.claims == 1:
+            raise JobRetryableError("store_unavailable")
+        return await super().claim(owner, lease_seconds)
+
+    async def dispatch_pending(self) -> int:
+        self.relays += 1
+        if self.relays == 1:
+            raise RuntimeError("raw text never logged")
+        return 2
+
+    async def sweep(self) -> int:
+        self.sweeps += 1
+        raise RuntimeError("raw text never logged")
+
+    async def complete(self, job_id: uuid.UUID, owner: str) -> bool:
+        if not self.completed:
+            self.completed.append(job_id)
+            raise RuntimeError("recording failed")
+        return await super().complete(job_id, owner)
+
+
+async def test_the_dispatcher_relays_every_poll_and_sweeps_on_its_own_interval() -> None:
+    q = MemoryQueue()
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01, sweep_seconds=0.05)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.2)
+    stop.set()
+    await task
+    assert q.relays >= 5 and 2 <= q.sweeps < q.relays
+
+
+async def test_claim_dispatcher_and_recording_failures_never_stop_the_worker() -> None:
+    async def ok(j: Job) -> None:
+        return None
+
+    q = FlakyQueue([job(), job()])
+    w = Worker(q, {"k.one": ok}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    while len(q.completed) < 2 or q.relays < 3:  # noqa: ASYNC110 - polling a test double
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+    assert q.claims >= 3 and q.sweeps >= 1

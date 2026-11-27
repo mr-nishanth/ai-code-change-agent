@@ -6,8 +6,9 @@ intake, J1 for `JobQueue.enqueue`), each with `attribute_not_exists(PK)`:
 - `JOBKEY#<dedupe_key>/GUARD` -> `job_id`: permanent (no TTL): one job per dedupe key, ever.
 - `JOB#<jid>/JOB`: the job state (QUEUED, `attempts` 0) and, while it carries the sparse GSI3 keys
   `DISPATCH` / `<available_at>#<jid>`, its transactional-outbox entry. A worker-side producer sends
-  `{"job_id"}` after commit and removes the GSI3 keys; the relay sends whatever is still there. The
-  API never sends. The payload is stored as a compact JSON string (`payload_json`).
+  `{"job_id"}` after commit and moves the entry to `SWEEP`; the relay sends whatever is still in
+  `DISPATCH` (`job_queue.DynamoSqsJobQueue`). The API never sends. The payload is stored as a
+  compact JSON string (`payload_json`).
 
 No I/O here: the webhook repository (Task 6) and the job queue (Task 12) share these builders."""
 

@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from tests.support.dynamo import app_table, floci  # noqa: F401 - fixtures
+from tests.support.dynamo import app_table, floci, job_queues  # noqa: F401 - fixtures
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

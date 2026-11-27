@@ -1,4 +1,5 @@
-"""Durable job queue port. The PostgreSQL adapter is the production implementation."""
+"""Durable job queue port. Adapters: `DynamoSqsJobQueue` (DynamoDB state, SQS delivery, outbox
+relayed by the worker's dispatcher role) and `PostgresJobQueue` (until the composition switch)."""
 
 import uuid
 from dataclasses import dataclass
@@ -65,4 +66,14 @@ class JobQueue(Protocol):
     ) -> JobStatus:
         """Record a failure. With retry_in_seconds and attempts left the job is re-queued;
         otherwise it becomes DEAD. Returns the new status."""
+        ...
+
+    async def dispatch_pending(self) -> int:
+        """Relay: deliver jobs whose creation committed but whose message was never sent (the
+        transactional outbox). Returns how many were sent; a queue without an outbox returns 0."""
+        ...
+
+    async def sweep(self) -> int:
+        """Re-deliver non-terminal jobs whose message was lost (overdue by more than a grace
+        period). Returns how many were re-sent; a queue that cannot lose messages returns 0."""
         ...
