@@ -13,6 +13,7 @@ allowed_hosts:
   - docs.python.org
   - fastapi.tiangolo.com
   - docs.pydantic.dev
+  - pydantic.dev
   - pypi.org
   - raw.githubusercontent.com
 
