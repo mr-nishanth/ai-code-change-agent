@@ -3,6 +3,7 @@
 import json
 import os
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from ai_code_change_agent.application.multirepo.coordinator import (
 from ai_code_change_agent.application.multirepo.models import (
     Child,
     ChildStatus,
+    ContractDoc,
     Parent,
     ParentStatus,
     ReportClaim,
@@ -695,11 +697,11 @@ async def test_a_contract_whose_content_no_longer_matches_its_hash_is_refused(
     assert err.value.code == "artifact_hash_mismatch"
 
 
-async def test_a_tampered_contract_fails_the_dependent_before_any_agent_or_workspace(
-    tmp_path: Path,
-) -> None:
-    """Real workflow steps: the dependent's planning step refuses the contract, so no sandbox
-    starts and no agent runs; the child fails and the parent reports it."""
+async def run_dependent_with(
+    tmp_path: Path, tamper: Callable[[Coordinator, MemStore, Child], Awaitable[None]]
+) -> tuple[CodeChangeAttempt, Child, Reporter, Any]:
+    """Real workflow steps for the dependent after `tamper` changed the upstream's recorded
+    contract. Any call to the planning agent fails the test."""
     rig = await make_rig(tmp_path)
     coordinator, store, _, reporter, changes = make_real(rig.artifacts)
     await coordinator.start(
@@ -710,24 +712,122 @@ async def test_a_tampered_contract_fails_the_dependent_before_any_agent_or_works
     await complete_with_report(
         coordinator, store, changes, rig.artifacts, "backend-api", {"published_contract": CONTRACT}
     )
-    backend = by_key(store, "backend-api")
-    store.children[backend.id] = replace(backend, contract_sha256="f" * 64)
+    await tamper(coordinator, store, by_key(store, "backend-api"))
     await begin(store, changes, "web-app", attempt_id=rig.attempt_id)
+
+    async def no_agent(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the planning agent must not run")
+
+    rig.agent.plan = no_agent  # type: ignore[method-assign]
     runner = WorkflowRunner(
         build_graph(CodeChangeSteps(replace(rig.deps, multirepo=coordinator)), MemorySaver())
     )
     await runner.start(rig.attempt_id)
     attempt = await rig.deps.changes.get_attempt(rig.attempt_id)
-    assert attempt.status is AttemptStatus.FAILED
-    assert attempt.failure_code == "artifact_hash_mismatch"
     assert rig.sandboxes.started == []  # no workspace, so the planning agent never ran
+    assert rig.agent.feedback == []  # nor the implementation agent
     assert rig.reporter.reports == []  # a child never posts its own Jira comment
     await coordinator.child_finished(by_key(store, "web-app").id, attempt)
-    web = by_key(store, "web-app")
+    return attempt, by_key(store, "web-app"), reporter, rig
+
+
+async def test_a_tampered_contract_fails_the_dependent_before_any_agent_or_workspace(
+    tmp_path: Path,
+) -> None:
+    """Real workflow steps: the dependent's planning step refuses the contract, so no sandbox
+    starts and no agent runs; the child fails and the parent reports it, without inviting a
+    blind retry."""
+
+    async def wrong_hash(_: Coordinator, store: MemStore, backend: Child) -> None:
+        store.children[backend.id] = replace(backend, contract_sha256="f" * 64)
+
+    attempt, web, reporter, _ = await run_dependent_with(tmp_path, wrong_hash)
+    assert attempt.status is AttemptStatus.FAILED
+    assert attempt.failure_code == "artifact_hash_mismatch"
     assert web.status is ChildStatus.FAILED and web.failure_code == "artifact_hash_mismatch"
     assert len(reporter.texts) == 1
-    assert "Execution: PARTIALLY_COMPLETED" in reporter.texts[0][1]
-    assert "Reason: artifact_hash_mismatch" in reporter.texts[0][1]
+    text = reporter.texts[0][1]
+    assert "Execution: PARTIALLY_COMPLETED" in text
+    assert "Reason: artifact_hash_mismatch" in text
+    assert (
+        "Retryable: no (contract integrity failure: needs operator investigation before "
+        f"retry-child {web.id})" in text
+    )
+    assert "Retryable: yes" not in text
+
+
+@pytest.mark.parametrize("field", ["parent_id", "repository_key", "attempt_id"])
+async def test_a_contract_with_a_foreign_origin_is_refused_before_any_agent_or_workspace(
+    tmp_path: Path, field: str
+) -> None:
+    """A well-formed contract whose recorded hash matches, but whose provenance names another
+    parent, repository or attempt, is never handed to the dependent."""
+
+    async def foreign_origin(coordinator: Coordinator, store: MemStore, backend: Child) -> None:
+        assert backend.attempt_id is not None
+        foreign = {
+            "parent_id": str(uuid.uuid4()),
+            "repository_key": "web-app",
+            "attempt_id": str(uuid.uuid4()),
+        }
+        doc = ContractDoc(
+            parent_id=str(backend.parent_id),
+            repository_key=backend.repository_key,
+            role=backend.role,
+            attempt_id=str(backend.attempt_id),
+            implementation_report_sha256="a" * 64,
+            contract=CONTRACT,
+        ).model_copy(update={field: foreign[field]})
+        scope = ArtifactScope(store.parents[backend.parent_id].request_id, backend.attempt_id)
+        meta = await coordinator._artifacts.put(
+            scope, ArtifactKind.CROSS_REPO_CONTRACT, doc.model_dump_json().encode()
+        )
+        store.children[backend.id] = replace(
+            backend, contract_ref=meta.id, contract_sha256=meta.sha256
+        )
+
+    attempt, web, reporter, _ = await run_dependent_with(tmp_path, foreign_origin)
+    assert attempt.status is AttemptStatus.FAILED
+    assert attempt.failure_code == "artifact_provenance_mismatch"
+    assert web.status is ChildStatus.FAILED and web.failure_code == "artifact_provenance_mismatch"
+    (text,) = [t for _, t in reporter.texts]
+    assert "Reason: artifact_provenance_mismatch" in text
+    assert "Retryable: no (contract integrity failure" in text
+
+
+@pytest.mark.parametrize(
+    ("code", "retryable"),
+    [
+        ("artifact_schema_invalid", False),
+        ("artifact_missing", False),
+        ("artifact_too_large", True),  # storage limits, not tampering
+        ("artifact_storage_error", True),
+        ("validation_failed", True),
+    ],
+)
+async def test_only_contract_integrity_failures_withhold_the_retry_invitation(
+    code: str, retryable: bool
+) -> None:
+    coordinator, store, _, reporter = make()
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(STORY))
+    await finish(store, coordinator, "backend-api", ChildStatus.FAILED, failure_code=code)
+    report = reporter.texts[-1][1]
+    text = report[report.index("backend-api") : report.index("\n2. ")]  # its own entry only
+    backend = by_key(store, "backend-api")
+    assert backend.status is ChildStatus.FAILED  # no state change: retry-child stays available
+    assert f"Reason: {code}" in text
+    assert ("Retryable: yes" in text) is retryable
+    assert (
+        f"Retryable: no (contract integrity failure: needs operator investigation before "
+        f"retry-child {backend.id})" in text
+    ) is not retryable
+
+
+async def test_a_contract_with_matching_provenance_is_accepted(tmp_path: Path) -> None:
+    coordinator, store, _, _, changes, _ = await published_backend(tmp_path)
+    web = await begin(store, changes, "web-app")
+    ctx = await coordinator.context_for(web.id)
+    assert ctx is not None and ctx.upstream_contracts[0].text == CONTRACT
 
 
 @pytest.mark.parametrize(

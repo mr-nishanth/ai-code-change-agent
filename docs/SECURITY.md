@@ -30,7 +30,7 @@ Known residual risks:
 ## Multi-repository, research and cost guards
 
 - **Multi-repository authorisation:** every declared repository is resolved through the registry before any work. One failure blocks the whole Story: no clone, token or model call. A child's GitHub token is scoped to its own repository and never reaches an agent. Workspaces are never shared.
-- **Contracts:** they are read-only context for dependents. They are stored immutably, hash-checked on every use and refused if they contain a secret.
+- **Contracts:** they are read-only context for dependents. They are stored immutably and refused if they contain a secret. On every use the hash, the schema and the origin (parent id, upstream repository key and the upstream's recorded attempt id) are checked; a mismatch fails the dependent (`artifact_provenance_mismatch` for the origin) before any workspace or agent run, and the Jira report marks it `Retryable: no` until an operator investigates.
 - **Web research:**
   - it runs in the worker only;
   - a URL the agent asks `fetch_reference` for may not carry a query string, exceed `REFERENCE_MAX_URL_CHARS` (default 300) characters or contain a secret (enforced in code, whatever fetched documentation asks for);

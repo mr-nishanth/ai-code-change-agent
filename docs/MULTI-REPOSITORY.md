@@ -50,7 +50,8 @@ parent: when every child is final -> COMPLETED | PARTIALLY_COMPLETED | FAILED
 
 - **Publishing:** an upstream child whose repository has dependents is told to fill `published_contract` in its implementation report (endpoints, schemas, status codes and so on).
 - **Storage:** after the child completes, the worker stores that text as an immutable `cross_repo_contract` artifact. The artifact is refused, never redacted, if it contains a secret. Its sha256 is recorded on the child.
-- **Delivery to dependents:** dependent children receive the contract as **read-only context**. It is re-loaded and hash-checked for every phase run.
+- **Delivery to dependents:** dependent children receive the contract as **read-only context**. It is re-loaded for every phase run and used only when its hash, its schema **and** its origin match: the stored document must name this parent, the declared upstream repository and the upstream child's recorded attempt. Otherwise the dependent fails before any workspace or agent run with `artifact_hash_mismatch`, `artifact_schema_invalid`, `artifact_missing` or `artifact_provenance_mismatch`.
+- **Integrity failures are not invited to retry:** for those codes the parent report says `Retryable: no (contract integrity failure: needs operator investigation before retry-child <id>)` instead of `yes`, because a blind retry would read the same artifact. The child stays FAILED and `retry-child` remains available once an operator has investigated. Storage errors (`artifact_too_large`, `artifact_storage_error`) and every other failure keep `Retryable: yes`.
 - **No contract:** dependents are **BLOCKED** (`upstream_contract_missing:<repository>`) instead of guessing an API.
 
 ## Failures, retries and idempotency

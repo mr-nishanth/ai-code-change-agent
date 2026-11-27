@@ -19,6 +19,7 @@ from ai_code_change_agent.application.artifacts.hashing import load_verified, st
 from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.delivery.manifest import DeliveryManifest
+from ai_code_change_agent.application.errors import ArtifactIntegrityError
 from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.multirepo.models import (
     Child,
@@ -58,6 +59,17 @@ def report_marker(parent_id: uuid.UUID, report_round: int) -> str:
 
 _DONE = frozenset({ChildStatus.COMPLETED})
 _FAILED = frozenset({ChildStatus.FAILED, ChildStatus.REJECTED, ChildStatus.BLOCKED})
+# Artifact checks that failed on content, not on storage (artifact_too_large or
+# artifact_storage_error stay retryable): a retry would read the same artifact.
+_INTEGRITY_FAILURES = frozenset(
+    {
+        "artifact_hash_mismatch",
+        "artifact_schema_invalid",
+        "artifact_missing",
+        "artifact_provenance_mismatch",
+        "artifact_integrity_failed",
+    }
+)
 _RESULT_TEXT = {
     ParentStatus.COMPLETED: "all repository executions and required contracts completed.",
     ParentStatus.PARTIALLY_COMPLETED: "partially completed; successful PRs are kept.",
@@ -359,6 +371,14 @@ class Coordinator:
                 ]
             else:
                 retry = "yes (ai-code-change changes retry-child " + str(c.id) + ")"
+                if c.failure_code in _INTEGRITY_FAILURES:
+                    # A contract that failed its hash, schema or origin check may have been
+                    # tampered with: a blind retry reads the same artifact, so an operator
+                    # investigates first.
+                    retry = (
+                        "no (contract integrity failure: needs operator investigation before "
+                        f"retry-child {c.id})"
+                    )
                 lines += [f"   Reason: {c.failure_code or '-'}", f"   Retryable: {retry}"]
             if c.contract_sha256:
                 lines.append(f"   Published contract: sha256 {c.contract_sha256[:12]}")
@@ -475,6 +495,14 @@ class Coordinator:
                 up.contract_sha256,
                 ContractDoc,
             )
+            # The hash proves the bytes are unchanged, not that they came from this upstream:
+            # the contract must name this parent, this repository and the recorded attempt.
+            if (doc.parent_id, doc.repository_key, doc.attempt_id) != (
+                str(child.parent_id),
+                key,
+                str(up.attempt_id),
+            ):
+                raise ArtifactIntegrityError("artifact_provenance_mismatch")
             contracts.append(UpstreamContract(key, up.role, up.contract_sha256, doc.contract))
         return ChildContext(
             repository_key=child.repository_key,
