@@ -3,8 +3,9 @@
 Makes REAL model calls (cost: a few cents with claude-haiku-5-5) and needs Docker, PostgreSQL and
 the execution image. It never writes to Jira or GitHub. Usage:
 
-    REFERENCE_ALLOWED_DOMAINS=fastapi.tiangolo.com,docs.python.org \
-        uv run python scripts/verify_research_agent.py <path-to-a-python-repo-checkout>
+    uv run python scripts/verify_research_agent.py <path-to-a-python-repo-checkout>
+
+(trusted hosts come from config/reference_sources.yaml)
 
 Prints the registered tools, the plan, and the session's cost-ledger rows; the worker log events
 `agent_tool_call` show each tool invocation with its outcome, URLs and retrieval time.
@@ -54,7 +55,7 @@ async def main(work: str) -> None:
             {
                 "event": "registered_tools",
                 "tools": probe,
-                "domains": sorted(s.reference_allowed_domains),
+                "domains": sorted(s.reference_allowed_hosts),
             }
         ),
         flush=True,

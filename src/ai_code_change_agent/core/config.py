@@ -10,8 +10,10 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_allowed_hosts
 
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -146,10 +148,12 @@ class Settings(BaseSettings):
     )
 
     # ---- reference fetching (ADR-011): the agent's harness-side web fetch ---------------------
-    # Empty list = the tool is not offered. Domains match exactly or as a parent of subdomains.
-    reference_allowed_domains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # Trusted hosts live in a version-controlled file of exact host names (no subdomains, no
+    # wildcards); a missing file means the tools are not offered, an invalid one fails startup.
+    reference_sources_file: Path = DEFAULT_SOURCES_FILE
+    _reference_hosts: frozenset[str] = PrivateAttr(default=frozenset())
     reference_max_fetches: int = Field(default=20, ge=1, le=200)  # per agent phase
-    # Web search (Anthropic server-side tool, worker side) restricted to the same domains.
+    # Web search (Anthropic server-side tool, worker side) restricted to the same exact hosts.
     reference_search_enabled: bool = True
     reference_max_searches: int = Field(default=5, ge=1, le=50)  # per agent phase
     reference_max_bytes: int = Field(default=1_048_576, ge=1024, le=16 * 1024 * 1024)
@@ -186,9 +190,7 @@ class Settings(BaseSettings):
     def _empty_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
 
-    @field_validator(
-        "jira_project_keys", "jira_story_issue_types", "reference_allowed_domains", mode="before"
-    )
+    @field_validator("jira_project_keys", "jira_story_issue_types", mode="before")
     @classmethod
     def _comma_separated(cls, value: object) -> object:
         return _split_set(value)
@@ -247,16 +249,6 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
-    @field_validator("reference_allowed_domains")
-    @classmethod
-    def _domains(cls, value: frozenset[str]) -> frozenset[str]:
-        domain = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
-        cleaned = frozenset(v.lower().strip(".") for v in value)
-        if any(not domain.fullmatch(v) for v in cleaned):
-            msg = "REFERENCE_ALLOWED_DOMAINS entries must be plain domain names (docs.python.org)"
-            raise ValueError(msg)
-        return cleaned
-
     @field_validator("dependency_index_url")
     @classmethod
     def _index(cls, value: str) -> str:
@@ -275,6 +267,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _coherent(self) -> "Settings":
+        self._reference_hosts = load_allowed_hosts(self.reference_sources_file)
         app = [
             self.github_app_id,
             self.github_app_installation_id,
@@ -330,6 +323,11 @@ class Settings(BaseSettings):
     @property
     def jira_webhook_configured(self) -> bool:
         return self.jira_webhook_secret is not None and bool(self.jira_project_keys)
+
+    @property
+    def reference_allowed_hosts(self) -> frozenset[str]:
+        """The exact trusted documentation hosts loaded from reference_sources_file."""
+        return self._reference_hosts
 
     @property
     def jira_rest_configured(self) -> bool:

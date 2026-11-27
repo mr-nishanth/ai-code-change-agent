@@ -2,10 +2,12 @@
 
 Permission rules, all enforced here and none by the model:
 - https only, default port, no credentials in the URL;
-- the host must equal or be a subdomain of an allow-listed domain (REFERENCE_ALLOWED_DOMAINS);
+- the host must exactly equal a trusted host (config/reference_sources.yaml, see
+  core.reference_hosts); any path on it is allowed, subdomains are not implied;
 - every address the host resolves to must be public (no private, loopback, link-local,
   multicast or reserved ranges: no SSRF into the host or internal network);
-- redirects are followed manually, at most three, and each hop is checked again;
+- redirects are followed manually, at most three, and each hop is checked again (scheme, port,
+  exact host, public addresses), so a redirect to another host needs that host listed too;
 - GET only, no cookies, no authorization headers, no proxy settings from the environment;
 - text-like content types only, a byte cap while streaming, HTML reduced to text.
 A small DNS-rebinding window remains between the check and the connection; the allow-list keeps
@@ -28,6 +30,7 @@ from ai_code_change_agent.application.references.ports import (
     ReferenceRefusedError,
 )
 from ai_code_change_agent.core.logging import get_logger
+from ai_code_change_agent.core.reference_hosts import host_allowed, normalize_host
 
 Resolver = Callable[[str], Awaitable[list[str]]]
 _TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
@@ -79,14 +82,14 @@ class HttpReferenceFetcher:
     def __init__(
         self,
         *,
-        allowed_domains: Sequence[str],
+        allowed_hosts: Sequence[str],
         max_bytes: int = 1_048_576,
         max_chars: int = 40_000,
         timeout_seconds: float = 20.0,
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver = _resolve,
     ) -> None:
-        self._domains = tuple(sorted({d.lower().strip(".") for d in allowed_domains if d}))
+        self._hosts = tuple(sorted({normalize_host(d) for d in allowed_hosts if d}))
         self._max_bytes = max_bytes
         self._max_chars = max_chars
         self._timeout = timeout_seconds
@@ -94,14 +97,11 @@ class HttpReferenceFetcher:
         self._resolve = resolver
 
     def __repr__(self) -> str:
-        return f"HttpReferenceFetcher(domains={self._domains!r})"
+        return f"HttpReferenceFetcher(domains={self._hosts!r})"
 
     @property
-    def allowed_domains(self) -> tuple[str, ...]:
-        return self._domains
-
-    def _allowed_host(self, host: str) -> bool:
-        return any(host == d or host.endswith("." + d) for d in self._domains)
+    def allowed_hosts(self) -> tuple[str, ...]:
+        return self._hosts
 
     async def _check(self, url: str) -> str:
         parts = urlsplit(url)
@@ -110,7 +110,7 @@ class HttpReferenceFetcher:
             raise ReferenceRefusedError("reference_url_not_allowed")
         if parts.port not in (None, 443):
             raise ReferenceRefusedError("reference_url_not_allowed")
-        if not self._allowed_host(host):
+        if not host_allowed(host, self._hosts):
             raise ReferenceRefusedError("reference_domain_not_allowed")
         try:
             addresses = await self._resolve(host)

@@ -32,7 +32,7 @@ These are OS-level guarantees and stronger than tool-level rules. Real-Docker te
 
 | Decision | Amendment |
 |---|---|
-| C2 | Dependencies: trusted, hash-locked wheel bundles prepared outside the sandbox and mounted read-only ([ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md)). One harness-side tool, `fetch_reference`, for allow-listed documentation ([ADR-011](decisions/ADR-011-harness-side-reference-fetching.md)). Sandbox and validation containers remain without network. |
+| C2 | Dependencies: trusted, hash-locked wheel bundles prepared outside the sandbox and mounted read-only ([ADR-010](decisions/ADR-010-dynamic-dependency-provisioning.md)). Two harness-side tools, `search_docs` and `fetch_reference`, for documentation on the exact hosts listed in `config/reference_sources.yaml` ([ADR-011](decisions/ADR-011-harness-side-reference-fetching.md)). Sandbox and validation containers remain without network. |
 | C3 | The two gates remain and still bind exact hashes, but by default they are decided by deterministic policy (`WORKFLOW_APPROVAL_MODE=automatic`, actor `policy:automatic`, reasons stored). Operator approval is the `manual` mode. See [AUTOMATED-PIPELINE.md](AUTOMATED-PIPELINE.md). |
 | C4 | Reporting covers failures too: one comment per attempt outcome (success with branch and draft PR; failure with stage, reason and retryability), plus one when no attempt can start (unresolvable repository). |
 

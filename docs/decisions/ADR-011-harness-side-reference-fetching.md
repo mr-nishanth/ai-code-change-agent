@@ -15,7 +15,7 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
 - **Runs in the worker** (`integrations/web/fetcher.py` behind `application/references/ports.py`), never in the sandbox. The agent module imports no HTTP client; composition injects the tool per phase (`CodingAgent(tools=factory)`).
 - **Permission rules, enforced in code:**
   - https only, default port, no credentials in the URL;
-  - the host must match `REFERENCE_ALLOWED_DOMAINS` (exact domain or subdomain);
+  - the host must exactly equal a host listed in `config/reference_sources.yaml` (case-insensitive, trailing dot ignored, IDNA compared in punycode). Every path on a listed host is allowed; subdomains are never implied (amended 2026-11-27: the earlier rule also trusted subdomains);
   - every resolved address must be public (no private, loopback, link-local, metadata or multicast ranges);
   - at most 3 redirects, each re-checked;
   - GET only, no cookies or authorization headers, `trust_env=False`.
@@ -26,7 +26,7 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
   - `REFERENCE_MAX_FETCHES` per agent phase;
   - every fetch is logged (host, status, size, truncation);
   - refusals return a fixed `REFUSED: <code>` string to the agent.
-- An empty allow-list disables the tool.
+- A missing `config/reference_sources.yaml` (or an empty `allowed_hosts`) disables the tools; an invalid file fails startup.
 
 ## Security implications
 
@@ -53,5 +53,5 @@ The Deep Agent gets exactly one custom tool, `fetch_reference(url)`:
 - A search the provider ran but answered with an error is now recorded (billed) and refused to the agent; before, it was not recorded.
 - Every tool invocation (allowed or refused) is logged as `agent_tool_call`; fetched documents carry `retrieved_at`.
 
-**Limits.** `search_docs` exists only with the Anthropic provider (server-side web search); with Bedrock the agent has `fetch_reference` only. The configured `REFERENCE_ALLOWED_DOMAINS` in an environment decides which sources are available; the verified official set is listed in `.env.example`.
+**Limits.** `search_docs` exists only with the Anthropic provider (server-side web search); with Bedrock the agent has `fetch_reference` only. The version-controlled `config/reference_sources.yaml` decides which hosts are available; a redirect is followed only when its target host is listed too (for example `docs.pydantic.dev` → `pydantic.dev` needs both).
 '

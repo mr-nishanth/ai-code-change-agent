@@ -15,6 +15,7 @@ dependencies = [
     "structlog>=24.4",
     "httpx>=0.28.1",
     "packaging>=24.0",
+    "pyyaml>=6.0",
     "pyjwt[crypto]>=2.10",
     "langgraph>=1.2.24",
     "langgraph-checkpoint-postgres>=3.0",
@@ -33,6 +34,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    "types-pyyaml>=6.0",
 ]
 studio = [
     "langgraph-cli[inmem]>=0.4.44",

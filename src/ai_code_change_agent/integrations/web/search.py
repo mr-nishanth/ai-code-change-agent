@@ -1,9 +1,10 @@
 """Documentation search through Anthropic's server-side web search tool (harness side).
 
-The worker asks the Messages API to run one web search restricted to the allow-listed official
-documentation domains and returns only the result list (title, URL, page age). Nothing from the
-sandbox is sent: the query comes from the agent's tool call and is refused when it looks like it
-contains a secret. Results are filtered again against the allow-list (defence in depth) and are
+The worker asks the Messages API to run one web search restricted to the trusted official
+documentation hosts (config/reference_sources.yaml) and returns only the result list (title, URL,
+page age). Nothing from the sandbox is sent: the query comes from the agent's tool call and is
+refused when it looks like it contains a secret. Results are filtered again by exact host (defence
+in depth) and are
 untrusted data; pages are read with fetch_reference, whose own SSRF checks apply.
 
 Verified 2026-11-26 against claude-haiku-5-5 with tool type web_search_20250305 (anthropic SDK
@@ -20,6 +21,7 @@ from ai_code_change_agent.application.references.ports import (
     SearchHit,
     SearchResult,
 )
+from ai_code_change_agent.core.reference_hosts import host_allowed, normalize_host
 
 TOOL_TYPE = "web_search_20250305"
 MAX_QUERY = 300
@@ -29,14 +31,10 @@ MAX_HITS = 8
 SECONDARY_HOSTS = ("pypi.org", "npmjs.com", "raw.githubusercontent.com", "github.com")
 
 
-def host_allowed(host: str, domains: Sequence[str]) -> bool:
-    host = host.lower().rstrip(".")
-    return any(host == d or host.endswith("." + d) for d in domains)
-
-
 def _secondary(url: str) -> bool:
-    host = url.split("://", 1)[-1].split("/", 1)[0].lower()
-    return host_allowed(host, SECONDARY_HOSTS)
+    """Ranking only (not authorisation): registries and raw source hosts sort after docs."""
+    host = url.split("://", 1)[-1].split("/", 1)[0].lower().rstrip(".")
+    return any(host == d or host.endswith("." + d) for d in SECONDARY_HOSTS)
 
 
 class AnthropicDocumentSearch:
@@ -45,24 +43,24 @@ class AnthropicDocumentSearch:
         *,
         api_key: str,
         model: str,
-        allowed_domains: Sequence[str],
+        allowed_hosts: Sequence[str],
         timeout_seconds: float = 60,
         client: Any = None,
     ) -> None:
-        if not allowed_domains:
-            raise ValueError("allowed_domains is required")
-        self._domains = tuple(sorted({d.lower() for d in allowed_domains}))
+        if not allowed_hosts:
+            raise ValueError("allowed_hosts is required")
+        self._hosts = tuple(sorted({normalize_host(d) for d in allowed_hosts}))
         self._model = model
         self._client = client or anthropic.AsyncAnthropic(
             api_key=api_key, timeout=timeout_seconds, max_retries=2
         )
 
     def __repr__(self) -> str:  # never shows the key
-        return f"AnthropicDocumentSearch(model={self._model!r}, domains={len(self._domains)})"
+        return f"AnthropicDocumentSearch(model={self._model!r}, domains={len(self._hosts)})"
 
     @property
-    def allowed_domains(self) -> tuple[str, ...]:
-        return self._domains
+    def allowed_hosts(self) -> tuple[str, ...]:
+        return self._hosts
 
     async def search(self, query: str) -> SearchResult:
         query = " ".join(query.split())[:MAX_QUERY]
@@ -72,7 +70,7 @@ class AnthropicDocumentSearch:
             "type": TOOL_TYPE,
             "name": "web_search",
             "max_uses": 1,
-            "allowed_domains": list(self._domains),
+            "allowed_domains": list(self._hosts),
         }
         try:
             response = await self._client.messages.create(
@@ -107,7 +105,7 @@ class AnthropicDocumentSearch:
                 url = str(getattr(item, "url", ""))
                 host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
                 fresh = url not in {h.url for h in hits}
-                if url.startswith("https://") and host_allowed(host, self._domains) and fresh:
+                if url.startswith("https://") and host_allowed(host, self._hosts) and fresh:
                     hits.append(
                         SearchHit(
                             str(getattr(item, "title", ""))[:200],

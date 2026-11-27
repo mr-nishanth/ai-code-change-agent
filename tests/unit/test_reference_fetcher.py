@@ -25,7 +25,7 @@ def fetcher(
         return table.get(host, PUBLIC)
 
     return HttpReferenceFetcher(
-        allowed_domains=["docs.langchain.com", "python.org"],
+        allowed_hosts=["docs.langchain.com", "docs.python.org"],
         transport=httpx.MockTransport(handler),
         resolver=resolver,
         max_bytes=max_bytes,
@@ -136,7 +136,7 @@ async def test_unresolvable_hosts_are_refused() -> None:
     async def fail(host: str) -> list[str]:
         raise OSError
 
-    f = HttpReferenceFetcher(allowed_domains=["python.org"], resolver=fail)
+    f = HttpReferenceFetcher(allowed_hosts=["docs.python.org"], resolver=fail)
     with pytest.raises(ReferenceRefusedError, match="reference_unresolvable"):
         await f.fetch("https://docs.python.org/")
     assert "python.org" in repr(f)
@@ -176,7 +176,7 @@ async def test_html_with_megabytes_of_head_scripts_still_yields_its_body_text() 
         return ["93.184.216.34"]
 
     f = HttpReferenceFetcher(
-        allowed_domains=["docs.example.com"], max_bytes=1_048_576,
+        allowed_hosts=["docs.example.com"], max_bytes=1_048_576,
         transport=httpx.MockTransport(handler), resolver=public,
     )  # fmt: skip
     doc = await f.fetch("https://docs.example.com/page")
@@ -219,7 +219,7 @@ async def test_every_redirect_hop_is_checked_against_the_allow_list(
         return ["127.0.0.1"] if host in ("localhost",) else ["104.16.0.1"]
 
     f = HttpReferenceFetcher(
-        allowed_domains=allowed, transport=httpx.MockTransport(handler), resolver=public
+        allowed_hosts=allowed, transport=httpx.MockTransport(handler), resolver=public
     )
     if outcome == "ok":
         doc = await f.fetch("https://docs.pydantic.dev/latest/concepts/validators/")

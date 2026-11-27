@@ -28,7 +28,7 @@ Rules for any coding agent working in this repository. Product: **AI Code Change
   - no network, non-root user, read-only root filesystem, all capabilities dropped, `no-new-privileges`, default seccomp;
   - resource limits; no Docker socket, host paths or credentials.
 
-  Dependencies come only from a trusted, hash-locked wheel bundle prepared by the worker and mounted read-only (ADR-010); anything else fails closed. Never enable networking in the sandbox. The agent's only custom tools are the harness-side `search_docs` and `fetch_reference` (allow-listed official docs, run in the worker; ADR-011, docs/PYTHON-EXECUTION-AND-RESEARCH.md).
+  Dependencies come only from a trusted, hash-locked wheel bundle prepared by the worker and mounted read-only (ADR-010); anything else fails closed. Never enable networking in the sandbox. The agent's only custom tools are the harness-side `search_docs` and `fetch_reference` (exact trusted hosts from `config/reference_sources.yaml`, any path on them, no implied subdomains; run in the worker; ADR-011, docs/PYTHON-EXECUTION-AND-RESEARCH.md).
 - **Credentials:**
   - The worker holds GitHub, Jira and LLM credentials. The API holds only the webhook secret.
   - The agent and its sandboxes hold none.

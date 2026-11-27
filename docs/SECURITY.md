@@ -8,7 +8,7 @@
 | GitHub credentials | Private key file (0600, owner, RSA >= 2048) read only by the worker; read-only token for baseline, write token only in the publisher, metadata token for registration; never in logs, artifacts, URLs, sandboxes or prompts |
 | Baseline | Pinned commit; full tree recomputed; tarball verified file by file (size, mode, Git blob SHA, commit id); symlinks, submodules, unsafe or case-colliding paths and oversize snapshots refused |
 | Deep Agent sandbox | `--network none`, non-root `--user`, `--read-only`, `--cap-drop ALL`, `no-new-privileges`, Docker default seccomp, CPU/memory/PID/nofile limits, size-limited `/tmp` tmpfs, per-command `timeout -s KILL`, output cap, workspace disk check, no environment from the application, no Docker socket, no host paths; planning mounts the workspace read-only |
-| Agent tools | The SDK's sandbox-backed tools plus one harness-side `fetch_reference` (ADR-011): runs in the worker, https only, `REFERENCE_ALLOWED_DOMAINS`, public addresses only, re-checked redirects, size/count limits, untrusted-data markers. No Git/GitHub/Jira tools |
+| Agent tools | The SDK's sandbox-backed tools plus one harness-side `fetch_reference` (ADR-011): runs in the worker, https only, exact hosts from `config/reference_sources.yaml` (no implied subdomains), public addresses only, re-checked redirects, size/count limits, untrusted-data markers. No Git/GitHub/Jira tools |
 | Dependencies | ADR-010: repository manifests (uv.lock > pyproject.toml > requirements files) parsed as data, never executed; validated requests; wheels-only resolver container on an `--internal` network whose only exit is an allow-list CONNECT proxy (index hosts, port 443, public addresses only); every wheel cross-checked against the index's published sha256; hash lock; offline `--require-hashes` install; immutable, digest-verified bundles mounted read-only into the `--network none` sandbox |
 | Validation | Independent of any model; platform-extracted changeset; protected paths, plan scope, limits, secrets; fresh workspace; only profile commands re-checked against the command policy; network commands never run |
 | Approvals | Bound to the exact plan or manifest SHA-256; a changed artifact invalidates them; append-only. Automatic mode records `policy:automatic` decisions with stored reasons (PLAN: dependency, path, limit and test-command policy; FINAL: validation passed and tests ran). Operator actor unverified until SSO |
@@ -31,7 +31,7 @@ Known residual risks:
 - **Contracts:** they are read-only context for dependents. They are stored immutably, hash-checked on every use and refused if they contain a secret.
 - **Web research:**
   - it runs in the worker only;
-  - search is restricted to the allow-listed domains, and the results are filtered again by host;
+  - search is restricted to the trusted hosts in `config/reference_sources.yaml`, and the results are filtered again by exact host (unlisted subdomains are dropped);
   - queries that look like they contain secrets are refused;
   - fetches are https-only, with DNS, private-IP, redirect, size and type checks;
   - all fetched content is marked untrusted;

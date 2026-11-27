@@ -7,7 +7,7 @@
 | Anthropic Claude API | LLM for local development and tests; worker-side documentation search | `LLM_PROVIDER=anthropic`, `LLM_MODEL`, `ANTHROPIC_API_KEY` [secret] | Live with claude-haiku-5-5 |
 | AWS Bedrock | LLM for staging and production (required there) | `LLM_PROVIDER=bedrock`, `LLM_MODEL`, `BEDROCK_REGION`, AWS credential chain | Unit-tested |
 | PyPI (`DEPENDENCY_INDEX_URL`) | Hash-locked wheels for dependency bundles (resolver container only) | `DEPENDENCY_*` | Live: one bundle |
-| Documentation sites | `search_docs` / `fetch_reference`, run in the worker | `REFERENCE_ALLOWED_DOMAINS`, `REFERENCE_*` | Search live; fetch mock-tested |
+| Documentation sites | `search_docs` / `fetch_reference`, run in the worker | `config/reference_sources.yaml`, `REFERENCE_*` | Search live; fetch mock-tested |
 | Docker | Sandboxes and validation containers (offline, hardened) | `WORKSPACE_*` | Docker integration tests |
 | PostgreSQL | All state, job queue, checkpoints, cost ledger | `DATABASE_URL` | Integration tests |
 | LangSmith (optional) | Tracing (off by default) | `LANGSMITH_*` | Configuration tests |

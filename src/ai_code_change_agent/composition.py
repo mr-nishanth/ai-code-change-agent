@@ -300,11 +300,11 @@ def build_reference_tools(
     """The agent's harness-side research tools (search_docs when the Anthropic provider and
     REFERENCE_SEARCH_ENABLED allow it, and fetch_reference), or None when no domain is
     allow-listed. Built afresh per phase run (per-phase budgets); searches are costed."""
-    if not settings.reference_allowed_domains:
+    if not settings.reference_allowed_hosts:
         return None
-    domains = sorted(settings.reference_allowed_domains)
+    hosts = sorted(settings.reference_allowed_hosts)
     fetcher = HttpReferenceFetcher(
-        allowed_domains=domains,
+        allowed_hosts=hosts,
         max_bytes=settings.reference_max_bytes,
         timeout_seconds=settings.reference_timeout_seconds,
     )
@@ -318,7 +318,7 @@ def build_reference_tools(
         searcher = AnthropicDocumentSearch(
             api_key=settings.anthropic_api_key.get_secret_value(),
             model=settings.llm_model,
-            allowed_domains=domains,
+            allowed_hosts=hosts,
         )
 
     def tools(thread_id: str) -> list[BaseTool]:

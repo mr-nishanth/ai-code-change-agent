@@ -1,7 +1,8 @@
 """Port for reading reference documentation from the web on the agent's behalf.
 
 Like a harness-side web fetch: the request is made by trusted infrastructure under permission
-rules (allow-listed domains, public addresses only); the coding sandbox never gets network."""
+rules (exact trusted hosts from config/reference_sources.yaml, public addresses only); the coding
+sandbox never gets network."""
 
 from dataclasses import dataclass
 from typing import Protocol
@@ -50,13 +51,13 @@ class ReferenceSearcher(Protocol):
     """Provider-independent documentation search; results are untrusted reference data."""
 
     @property
-    def allowed_domains(self) -> tuple[str, ...]: ...
+    def allowed_hosts(self) -> tuple[str, ...]: ...
 
     async def search(self, query: str) -> SearchResult: ...
 
 
 class ReferenceFetcher(Protocol):
     @property
-    def allowed_domains(self) -> tuple[str, ...]: ...
+    def allowed_hosts(self) -> tuple[str, ...]: ...
 
     async def fetch(self, url: str) -> ReferenceDocument: ...

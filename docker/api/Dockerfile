@@ -10,6 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
+COPY config ./config
 RUN uv sync --locked --no-dev
 
 RUN useradd --system --uid 10001 --no-create-home app

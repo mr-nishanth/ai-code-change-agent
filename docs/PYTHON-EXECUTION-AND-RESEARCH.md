@@ -39,14 +39,14 @@ The sandbox never gets network. The agent may only *request* Python packages in 
 
 The coding sandbox stays offline. Two research tools run in the worker:
 - **`search_docs(query)`:**
-  - one Anthropic web search (`web_search_20250305`, verified with claude-haiku-5-5) restricted to `REFERENCE_ALLOWED_DOMAINS`;
-  - results are filtered again by host, with official documentation ranked before package registries and raw source hosts;
+  - one Anthropic web search (`web_search_20250305`, verified with claude-haiku-5-5) restricted to the hosts in `config/reference_sources.yaml`;
+  - results are filtered again by exact host (a hit on an unlisted subdomain is dropped), with official documentation ranked before package registries and raw source hosts;
   - it returns titles, URLs and a retrieval timestamp;
   - a query that looks like it contains a secret is refused;
   - limited to `REFERENCE_MAX_SEARCHES` per phase;
   - each search is recorded in the cost ledger as stage `research` (tokens plus $0.01 per search).
 - **`fetch_reference(url)`:**
-  - https only on the default port, no credentials in the URL, allow-listed domains (`REFERENCE_ALLOWED_DOMAINS`; empty means no fetch tool), at most `REFERENCE_MAX_FETCHES` per phase;
+  - https only on the default port, no credentials in the URL, exact hosts from `config/reference_sources.yaml` (any path on a listed host, including `.md`, `.txt` and `llms.txt`; subdomains are not implied; a missing file means no research tools), at most `REFERENCE_MAX_FETCHES` per phase;
   - GET only, no cookies, authorization headers or environment proxies;
   - DNS is resolved and private, loopback and link-local addresses are refused;
   - redirects are followed manually, at most three, and every hop is re-checked;

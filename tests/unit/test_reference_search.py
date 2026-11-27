@@ -8,7 +8,7 @@ from ai_code_change_agent.application.references.ports import (
     SearchHit,
     SearchResult,
 )
-from ai_code_change_agent.integrations.web.search import AnthropicDocumentSearch, host_allowed
+from ai_code_change_agent.integrations.web.search import AnthropicDocumentSearch
 
 
 class FakeMessages:
@@ -36,12 +36,12 @@ def provider(content: list[Any]) -> tuple[AnthropicDocumentSearch, FakeMessages]
     client = SimpleNamespace(messages=messages)
     s = AnthropicDocumentSearch(
         api_key="sk-test", model="claude-haiku-5-5",
-        allowed_domains=["docs.python.org", "fastapi.tiangolo.com"], client=client,
+        allowed_hosts=["docs.python.org", "fastapi.tiangolo.com"], client=client,
     )  # fmt: skip
     return s, messages
 
 
-async def test_only_https_urls_on_allowed_domains_are_returned_with_a_timestamp() -> None:
+async def test_only_https_urls_on_allowed_hosts_are_returned_with_a_timestamp() -> None:
     s, messages = provider(
         [
             result_block(
@@ -101,13 +101,23 @@ async def test_searches_stop_once_the_phase_cost_budget_is_spent() -> None:
     assert out.startswith("REFUSED: phase_cost_budget_exhausted") and searcher.queries == ["a"]
 
 
-def test_host_matching_is_exact_or_subdomain() -> None:
-    assert host_allowed("docs.python.org", ["python.org"])
-    assert not host_allowed("evilpython.org", ["python.org"])
+async def test_search_hits_on_unlisted_subdomains_or_hosts_are_dropped() -> None:
+    messages = FakeMessages(
+        [result_block(
+            "https://docs.python.org/3/x.html", "https://wiki.docs.python.org/x",
+            "https://docs.python.org.evil.example/x", "http://docs.python.org/3/y.html",
+        )]
+    )  # fmt: skip
+    s = AnthropicDocumentSearch(
+        api_key="k", model="m", allowed_hosts=["docs.python.org"],
+        client=SimpleNamespace(messages=messages),
+    )  # fmt: skip
+    r = await s.search("x")
+    assert [h.url for h in r.hits] == ["https://docs.python.org/3/x.html"]
 
 
 class FakeSearcher:
-    allowed_domains = ("docs.python.org",)
+    allowed_hosts = ("docs.python.org",)
 
     def __init__(self) -> None:
         self.queries: list[str] = []
@@ -140,7 +150,7 @@ async def test_official_documentation_ranks_before_registries_and_raw_sources() 
         [result_block("https://pypi.org/project/x/", "https://docs.python.org/3/x.html")]
     )
     s = AnthropicDocumentSearch(
-        api_key="k", model="m", allowed_domains=["pypi.org", "docs.python.org"],
+        api_key="k", model="m", allowed_hosts=["pypi.org", "docs.python.org"],
         client=SimpleNamespace(messages=messages),
     )  # fmt: skip
     r = await s.search("x")
