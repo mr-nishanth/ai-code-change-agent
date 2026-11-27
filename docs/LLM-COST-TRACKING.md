@@ -31,7 +31,7 @@ A local, untracked script under `var/` is run by hand; it makes real model calls
   - `cache_read_input_tokens`;
   - `inference_geo`.
 - **Fallback:** if that block is missing, LangChain's normalised `usage_metadata` is used. Cache reads and writes are subtracted from its `input_tokens`, because LangChain includes them there.
-- **Failed calls:** `on_llm_error` records the call with its usage marked unavailable. Its cost is unknown, never zero.
+- **Failed calls:** `on_llm_error` records the call with its usage marked unavailable. Its cost is unknown, never zero. The agent never streams (both chat models are built without `streaming`, and `tests/unit/test_llm_provider.py::test_the_production_chat_models_never_stream` pins this), so a failed call has no partial usage. If streaming is ever enabled, both `UsageCallbackHandler` and `BudgetGuard` must read the usage in `on_llm_error`'s `response`, de-duplicated by `run_id` through the existing `_seen` set.
 - **Stage:** taken from the thread id:
   - `planning`: repository investigation and the plan;
   - `implementation`: coding, tests and the final structured report;

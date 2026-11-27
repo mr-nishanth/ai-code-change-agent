@@ -7,8 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 
 from ai_code_change_agent.application.costs.pricing import PriceTable, TokenUsage
 from ai_code_change_agent.application.costs.report import (
@@ -410,8 +410,6 @@ async def test_searches_are_charged_to_the_phase_cost_guard_and_stop_further_cal
     from decimal import Decimal
     from types import SimpleNamespace
 
-    import pytest
-
     from ai_code_change_agent.application.costs.usage import BudgetExceededError, BudgetGuard
 
     a = uuid.uuid4()
@@ -448,25 +446,6 @@ def _error_response(status: int) -> LLMResult:
     return LLMResult(generations=[[ChatGeneration(message=AIMessage("", response_metadata=meta))]])
 
 
-def _streamed_then_failed() -> LLMResult:
-    """What LangChain passes to on_llm_error when a streamed call fails after the provider had
-    already reported usage (message_start + some deltas), followed by the error metadata."""
-    partial = AIMessageChunk(
-        content="partial answer",
-        response_metadata={
-            "id": "msg_partial",
-            "model": SONNET,
-            "usage": {"input_tokens": 1000, "output_tokens": 1000},
-        },
-    )
-    return LLMResult(
-        generations=[
-            [ChatGenerationChunk(message=partial)],
-            _error_response(529).generations[0],
-        ]
-    )
-
-
 async def test_a_failed_call_without_streamed_usage_is_unknown_and_adds_nothing_known() -> None:
     from ai_code_change_agent.application.costs.usage import BudgetGuard
 
@@ -482,31 +461,6 @@ async def test_a_failed_call_without_streamed_usage_is_unknown_and_adds_nothing_
     (rec,) = store.records
     assert not rec.succeeded and rec.usage is None and rec.cost_usd is None  # unknown, not zero
     assert guard.spent == spent == D("0.012")  # the earlier spend is kept
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "defect: usage streamed before a provider error is dropped: UsageCallbackHandler and "
-        "BudgetGuard ignore on_llm_error's response, so the tokens are neither recorded nor "
-        "charged to the phase budget. Latent (the agent does not stream today); the fix changes "
-        "the documented failed-call policy in docs/LLM-COST-TRACKING.md"
-    ),
-)
-async def test_usage_streamed_before_a_failure_is_recorded_and_charged() -> None:
-    from ai_code_change_agent.application.costs.usage import BudgetGuard
-
-    store, session, attempt = MemoryStore(), uuid.uuid4(), uuid.uuid4()
-    guard = BudgetGuard(PriceTable(), D("1"))
-    err = RuntimeError("stream interrupted")
-    await guard.on_llm_error(err, run_id=uuid.uuid4(), response=_streamed_then_failed())
-    await handler(store, attempt, "implementation", session).on_llm_error(
-        err, run_id=uuid.uuid4(), response=_streamed_then_failed()
-    )
-    (rec,) = store.records
-    assert not rec.succeeded
-    assert rec.usage == TokenUsage(1000, 1000) and rec.cost_usd == D("0.012")
-    assert guard.spent == D("0.012")
 
 
 class AcceptingStore:

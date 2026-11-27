@@ -127,6 +127,23 @@ def test_every_model_carries_its_context_window_for_summarisation(kw: dict[str, 
     assert model.profile is not None and model.profile["max_input_tokens"] == 200_000
 
 
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"llm_model": "claude-test", "anthropic_api_key": "k"},
+        {"llm_provider": "bedrock", "llm_model": "m", "bedrock_region": "us-east-1"},
+    ],
+)
+def test_the_production_chat_models_never_stream(kw: dict[str, object]) -> None:
+    """The cost handlers ignore on_llm_error's response because a non-streaming call that fails
+    has no partial usage. Enabling streaming would break that (usage streamed before an error
+    would go unrecorded and uncharged), so this trips first: see docs/LLM-COST-TRACKING.md."""
+    model = build_chat_model(s(**kw))
+    assert "streaming" not in model.model_fields_set
+    assert model._should_stream(async_api=True, run_manager=None) is False
+    assert model._should_stream(async_api=False, run_manager=None) is False
+
+
 def test_model_calls_can_be_paced_client_side() -> None:
     paced = build_chat_model(s(llm_model="m", anthropic_api_key="k", llm_requests_per_minute=30))
     assert paced.rate_limiter is not None
