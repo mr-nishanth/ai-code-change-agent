@@ -433,7 +433,7 @@ def main(
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
-    if args.area in ("worker", "changes", "costs"):
+    if args.area in ("worker", "changes", "costs", "reports", "jobs"):
         try:
             return operations.run(args, out)
         except (ChangeError, ConfigurationError, MultiRepoBlockedError) as exc:

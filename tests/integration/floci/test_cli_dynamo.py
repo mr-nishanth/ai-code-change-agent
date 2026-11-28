@@ -14,6 +14,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from ai_code_change_agent.application.jira.reports import ReportState
 from ai_code_change_agent.cli.main import main
 from ai_code_change_agent.core.config import get_settings
 from ai_code_change_agent.persistence.dynamodb import Table, keys
@@ -167,3 +168,34 @@ async def test_costs_by_attempt_and_issue_from_the_dynamodb_ledger(app_table: Ta
     code, out, err = await acli("costs", "--session", str(fx.SESSION_NOW))
     assert code == 0 and err == ""
     assert "Session LLM Cost : at least $1.3639 (INCOMPLETE: 1 call(s) without usage) USD" in out
+
+
+@pytest.mark.usefixtures("cli_env")
+async def test_reports_and_the_dlq_are_observable_from_the_cli(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    from ai_code_change_agent.persistence.dynamodb.jira_report_store import DynamoJiraReportStore
+    from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
+
+    store = DynamoJiraReportStore(app_table)
+    assert await store.create("attempt-x", "SHOP-1", "secret-free text", "a" * 64)
+    claim = await store.claim("attempt-x", 300)
+    assert claim is not None
+    await store.finish("attempt-x", claim.token, ReportState.FAILED_PERMANENT, error="http_401")
+    code, out, _ = await acli("reports", "list")
+    assert code == 0 and "report_id=attempt-x" in out and "state=FAILED_PERMANENT" in out
+    assert "last_error=http_401" in out and "secret-free text" not in out
+    assert (await acli("reports", "list", "--state", "PENDING"))[1] == ""
+    shown = json.loads((await acli("reports", "show", "attempt-x"))[1])
+    assert shown["state"] == "FAILED_PERMANENT" and shown["attempts"] == 1
+    assert "not found" in (await acli("reports", "show", "nope"))[1]
+
+    queue = DynamoSqsJobQueue(app_table, job_queues.sqs, job_queues.url, receive_wait_seconds=0)
+    await queue.enqueue("k.test", {}, dedupe_key="dlq", max_attempts=2)
+    job_id = (await app_table.get(keys.job_dedupe_guard("dlq")))["job_id"]  # type: ignore[index]
+    for body in (json.dumps({"job_id": job_id}), "poison"):
+        job_queues.sqs.send_message(QueueUrl=job_queues.dlq_url, MessageBody=body)
+    code, out, _ = await acli("jobs", "dlq")
+    assert code == 0 and "dlq messages: 2" in out and "not a job message" in out
+    assert f"job {job_id}: kind=k.test status=QUEUED attempts=0/2" in out
+    assert "dlq messages: 2" in (await acli("jobs", "dlq"))[1]  # a peek: nothing is removed

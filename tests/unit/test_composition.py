@@ -35,6 +35,7 @@ from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.orchestration.intake import (
     CHILD,
     INTAKE,
+    PARENT_REPORT,
     RESUME,
     ChildHandler,
     IntakeHandler,
@@ -214,7 +215,15 @@ async def test_the_resume_handler_reports_through_the_cleanup_step_and_knows_the
             stub.assert_no_pending_responses()
     intake = handlers[INTAKE]
     assert isinstance(intake, IntakeHandler)
-    assert on_dead == {INTAKE: intake.on_dead}  # a dead intake job blocks its request
+    # every DEAD job ends what it left behind: a blocked request, a failed attempt or child
+    assert set(on_dead) == {INTAKE, RESUME, CHILD, PARENT_REPORT}
+    assert on_dead[INTAKE] == intake.on_dead
+    assert intake._coordinator is not None and intake._coordinator._reporter is intake._reporter
+    recovery = intake._recovery
+    assert on_dead[RESUME] == recovery.resume_dead and on_dead[CHILD] == recovery.child_dead
+    ((name, step),) = app.worker._periodic
+    assert name == "jira_report_retry" and step == intake._reporter.retry_due
+    assert "DurableJiraReporter" in repr(intake._reporter)
     resume, child = handlers[RESUME], handlers[CHILD]
     assert isinstance(resume, ResumeHandler) and isinstance(child, ChildHandler)
     report = resume._report

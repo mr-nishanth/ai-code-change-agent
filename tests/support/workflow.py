@@ -175,7 +175,7 @@ class FakeReporter:
     def __init__(self) -> None:
         self.reports: list[tuple[str, str]] = []
 
-    async def report(self, issue_key: str, text: str) -> str:
+    async def report(self, issue_key: str, text: str, *, report_id: str | None = None) -> str:
         self.reports.append((issue_key, text))
         return "POSTED"
 

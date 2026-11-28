@@ -157,7 +157,12 @@ async def test_retry_backoff_then_dead_when_attempts_are_exhausted(
     assert await q.fail(job.id, "w", "temporary", retry_in_seconds=1) is JobStatus.DEAD
     stored = await item(app_table, job.id)
     assert (stored["status"], stored["last_error"]) == ("DEAD", "temporary")
-    assert "GSI3PK" not in stored and messages(job_queues) == 0
+    # DEAD waits in GSI3 DEADHOOK until its on_dead hook ran (the recording worker runs it now)
+    assert stored["GSI3PK"] == keys.GSI_DEAD and messages(job_queues) == 0
+    assert await q.dead_pending() == []  # within the grace: not listed for the dispatcher
+    await q.dead_settled(job.id)
+    stored = await item(app_table, job.id)
+    assert "GSI3PK" not in stored and "GSI3SK" not in stored
 
 
 async def test_a_not_due_job_hides_a_duplicate_message_until_it_is_due(
@@ -212,7 +217,10 @@ async def test_an_expired_job_without_attempts_left_is_dead(
     assert await q.claim("w2", 60) is None
     stored = await item(app_table, await job_id_of(app_table, "d"))
     assert (stored["status"], stored["last_error"]) == ("DEAD", EXHAUSTED)
-    assert "lease_owner" not in stored and "GSI3PK" not in stored and messages(job_queues) == 0
+    assert "lease_owner" not in stored and stored["GSI3PK"] == keys.GSI_DEAD
+    assert messages(job_queues) == 0
+    (dead,) = await q.dead_pending()  # nobody ran its hook: listed at once
+    assert (dead.id, dead.last_error) == (stored["id"] and uuid.UUID(stored["id"]), EXHAUSTED)
 
 
 async def test_an_expired_lease_is_reclaimed_by_one_worker_and_a_second_expiry_is_dead(
@@ -438,3 +446,149 @@ async def test_no_receipt_is_kept_after_completion_or_after_a_lost_lease(
     assert (await item(app_table, done))["status"] == "SUCCEEDED"
     held = await item(app_table, lost)
     assert held["status"] == "RUNNING" and held["lease_owner"] == w.owner  # nothing recorded
+
+
+async def test_a_job_the_queue_marks_dead_runs_its_kinds_on_dead_hook_once(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    """A worker crashed on the last attempt: the next receipt marks the job DEAD
+    (lease_expired_attempts_exhausted). The worker's dispatcher hands that job to its kind's
+    on_dead hook (the request/attempt it leaves behind must end), once, with the stored code."""
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {"x": 1}, dedupe_key="d", max_attempts=1)
+    assert await q.claim("crashed", 1) is not None
+    await asyncio.sleep(1.5)
+    hooked: list[Job] = []
+
+    async def on_dead(job: Job) -> None:
+        hooked.append(job)
+
+    async def never(job: Job) -> None:
+        raise AssertionError("an exhausted job is never run again")
+
+    w = Worker(q, {"k.test": never}, lease_seconds=30, heartbeat_seconds=10, poll_seconds=0.05,
+               relay_seconds=0.1, sweep_seconds=0.1, on_dead={"k.test": on_dead})  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    for _ in range(100):
+        if hooked:
+            break
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)  # a second dispatcher tick must not run it again
+    stop.set()
+    await asyncio.wait_for(task, 30)
+    (dead,) = hooked
+    assert dead.payload == {"x": 1} and dead.last_error == EXHAUSTED
+    stored = await item(app_table, dead.id)
+    assert (stored["status"], stored["last_error"]) == ("DEAD", EXHAUSTED)
+    assert "GSI3PK" not in stored and messages(job_queues) == 0  # the hook ran: settled
+
+
+async def test_a_failing_dead_hook_is_retried_later_and_abandoned_after_its_bound(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=1)
+    assert await q.claim("crashed", 1) is not None
+    await asyncio.sleep(1.5)
+    assert await q.claim("w2", 60) is None  # marked DEAD (exhausted)
+    (dead,) = await q.dead_pending()
+    await q.dead_settled(dead.id, failed=True)
+    stored = await item(app_table, dead.id)
+    assert stored["GSI3PK"] == keys.GSI_DEAD and stored["dead_hook_failures"] == 1
+    assert await q.dead_pending() == []  # backed off: not listed again at once
+    for _ in range(4):
+        await q.dead_settled(dead.id, failed=True)
+    stored = await item(app_table, dead.id)
+    assert "GSI3PK" not in stored and stored["dead_hook_failures"] == 5  # abandoned, logged
+    await q.dead_settled(dead.id)  # settling again is a no-op
+    assert stored["status"] == "DEAD"
+
+
+async def test_release_lease_gives_a_claimed_job_back_at_once(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=2)
+    job = await q.claim("stopping", 300)
+    assert job is not None and job.attempts == 1
+    assert not await q.release_lease(job.id, "someone-else", refund=True)  # not the owner
+    assert await q.release_lease(job.id, "stopping", refund=True)  # never started: refunded
+    again = await q.claim("w2", 300)  # visible at once, not after the 300 s lease
+    assert again is not None and again.id == job.id and again.attempts == 1
+    assert await q.release_lease(again.id, "w2", refund=False)  # started: the attempt counts
+    third = await q.claim("w3", 300)
+    assert third is not None and third.attempts == 2
+    assert not await q.complete(job.id, "w2")  # the released owner cannot finish it any more
+    assert await q.complete(third.id, "w3")
+
+
+async def test_a_late_worker_never_overwrites_a_dead_job_and_a_redriven_message_is_dropped(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=1)
+    late = await q.claim("late", 1)
+    assert late is not None
+    await asyncio.sleep(1.5)
+    assert await q.claim("w2", 60) is None  # exhausted: DEAD
+    assert not await q.complete(late.id, "late")
+    assert await q.fail(late.id, "late", "x", retry_in_seconds=1) is JobStatus.RUNNING
+    assert not await q.heartbeat(late.id, "late", 60)
+    assert not await q.release_lease(late.id, "late", refund=False)
+    # a DLQ redrive (or any duplicate) of its message after it is terminal: deleted, no run
+    for _ in range(2):
+        send(job_queues, json.dumps({"job_id": str(late.id)}))
+    assert await q.claim("w3", 60) is None and await q.claim("w3", 60) is None
+    stored = await item(app_table, late.id)
+    assert (stored["status"], stored["attempts"], stored["last_error"]) == ("DEAD", 1, EXHAUSTED)
+    assert messages(job_queues) == 0
+
+
+async def test_concurrent_terminal_writes_leave_exactly_one_outcome(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=1)
+    job = await q.claim("w", 60)
+    assert job is not None
+    done, failed = await asyncio.gather(
+        q.complete(job.id, "w"), q.fail(job.id, "w", "boom", retry_in_seconds=None)
+    )
+    stored = await item(app_table, job.id)
+    assert (done, failed is JobStatus.DEAD).count(True) == 1  # one conditional write wins
+    assert stored["status"] == ("SUCCEEDED" if done else "DEAD")
+
+
+async def test_shutdown_refunds_are_bounded_per_job(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    from ai_code_change_agent.application.jobs.queue import MAX_SHUTDOWN_REFUNDS
+
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=5)
+    for n in range(MAX_SHUTDOWN_REFUNDS + 1):
+        job = await q.claim(f"w{n}", 300)
+        assert job is not None and job.attempts == 1  # every refund gave the attempt back
+        assert await q.release_lease(job.id, f"w{n}", refund=True, bounded=True)
+    job = await q.claim("last", 300)
+    assert job is not None and job.attempts == 2  # past the cap: released without a refund
+    stored = await item(app_table, job.id)
+    assert stored["shutdown_refunds"] == MAX_SHUTDOWN_REFUNDS
+    assert not await q.release_lease(job.id, "nobody", refund=True, bounded=True)
+
+
+async def test_two_dispatchers_never_run_the_same_dead_hook(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    for n in range(3):
+        await q.enqueue("k.test", {}, dedupe_key=f"d{n}", max_attempts=1)
+        assert await q.claim("crashed", 1) is not None
+    await asyncio.sleep(1.5)
+    for _ in range(3):
+        await q.claim("w", 60)  # each marks one exhausted job DEAD
+    one, two = await asyncio.gather(q.dead_pending(), make(app_table, job_queues).dead_pending())
+    ids = [j.id for j in one] + [j.id for j in two]
+    assert len(ids) == 3 and len(set(ids)) == 3  # every hook claimed by exactly one dispatcher
+    assert await q.dead_pending() == []  # claimed: not listed again until the claim lapses

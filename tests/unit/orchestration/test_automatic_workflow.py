@@ -1,6 +1,7 @@
 """The fully automated pipeline (WORKFLOW_APPROVAL_MODE=automatic): deterministic, hash-bound
 policy decisions replace the two human gates; failures never publish and are reported once."""
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
 from ai_code_change_agent.application.artifacts.hashing import load_verified
 from ai_code_change_agent.application.artifacts.models import ArtifactKind
 from ai_code_change_agent.application.dependencies.ports import DependencyBundle, LockedPackage
+from ai_code_change_agent.application.jira.reports import DurableJiraReporter, ReportState
 from ai_code_change_agent.domain.changes.models import AUTOMATIC_ACTOR, ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, DependencyRequest
@@ -25,6 +27,7 @@ from ai_code_change_agent.orchestration.steps import (
 )
 from tests.support import workflow
 from tests.support.changes import python_profile
+from tests.support.jira_reports import MemoryReportStore
 from tests.support.workflow import make_rig
 
 S = AttemptStatus
@@ -97,12 +100,7 @@ async def test_a_permanent_jira_comment_failure_is_recorded_once_and_never_repos
         posts.append(request)
         return httpx.Response(code)
 
-    rig.deps.reporter = JiraOutcomeReporter(  # the real reporter over a fake Jira
-        enabled=True,
-        base_url="https://x.atlassian.net",
-        authenticator=BasicAuthenticator("a@b.c", SecretStr("tok")),
-        transport=httpx.MockTransport(jira),
-    )
+    rig.deps.reporter = durable(jira)  # the real reporters over a fake Jira
     expected = S.COMPLETED if validation_passes else S.FAILED
     assert await run(rig) is expected  # reporting never changes the attempt outcome
     assert [(p.method, p.url.path) for p in posts] == [
@@ -118,7 +116,25 @@ async def test_a_permanent_jira_comment_failure_is_recorded_once_and_never_repos
     assert len(rig.publisher.requests) == int(validation_passes)
 
 
-async def test_a_retryable_jira_comment_failure_is_not_recorded(tmp_path: Path) -> None:
+def durable(
+    handler: Callable[[httpx.Request], httpx.Response], store: MemoryReportStore | None = None
+) -> DurableJiraReporter:
+    async def no_sleep(_: float) -> None:
+        return None
+
+    return DurableJiraReporter(
+        JiraOutcomeReporter(
+            enabled=True,
+            base_url="https://x.atlassian.net",
+            authenticator=BasicAuthenticator("a@b.c", SecretStr("tok")),
+            transport=httpx.MockTransport(handler),
+        ),
+        store or MemoryReportStore(),
+        sleep=no_sleep,
+    )
+
+
+async def test_a_retryable_jira_comment_failure_is_kept_pending_not_settled(tmp_path: Path) -> None:
     rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
     rig.agent.edits = [{"app/greeting.py": b"x = 1\n", ".github/workflows/ci.yml": b"x"}]
     posts: list[httpx.Request] = []
@@ -127,15 +143,15 @@ async def test_a_retryable_jira_comment_failure_is_not_recorded(tmp_path: Path) 
         posts.append(request)
         return httpx.Response(503)
 
-    rig.deps.reporter = JiraOutcomeReporter(
-        enabled=True,
-        base_url="https://x.atlassian.net",
-        authenticator=BasicAuthenticator("a@b.c", SecretStr("tok")),
-        transport=httpx.MockTransport(jira),
-    )
-    assert await run(rig) is S.FAILED
-    assert len(posts) == 1
-    assert ArtifactKind.JIRA_REPORT not in await kinds(rig)  # retryable: nothing stored
+    store = MemoryReportStore()
+    rig.deps.reporter = durable(jira, store)
+    assert await run(rig) is S.FAILED  # reporting never changes the attempt outcome
+    # one POST; the 503 may hide a created comment, so the retries only look for its marker (the
+    # lookups fail too): never a blind second POST
+    assert [p.method for p in posts] == ["POST", "GET", "GET"]
+    assert ArtifactKind.JIRA_REPORT not in await kinds(rig)  # pending: nothing settled
+    pending = await store.get(f"attempt-{rig.attempt_id}")
+    assert pending is not None and pending.state is ReportState.PENDING  # the worker retries it
 
 
 async def test_a_profile_without_a_test_command_uses_the_toolchain_default(

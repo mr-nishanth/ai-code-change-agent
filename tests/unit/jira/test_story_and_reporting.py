@@ -164,22 +164,33 @@ async def test_invalid_issue_key_is_permanent_without_a_request() -> None:
 
 
 async def test_find_comment_matches_the_report_id_in_adf() -> None:
+    me, someone = {"accountId": "bot"}, {"accountId": "user-1"}
     body = {
         "comments": [
-            {"id": "10008", "body": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Report ID: other"}]}]}},
-            {"id": "10009", "body": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Report ID: aica-report-p-r1"}]}]}},
+            {"id": "10007", "author": someone, "body": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Report ID: aica-report-p-r1"}]}]}},
+            {"id": "10008", "author": me, "body": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Report ID: other"}]}]}},
+            {"id": "10009", "author": me, "body": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Report ID: aica-report-p-r1"}]}]}},
         ]
     }  # fmt: skip
     seen: list[httpx.Request] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
         seen.append(req)
+        if req.url.path == "/rest/api/3/myself":
+            return httpx.Response(200, json={"accountId": "bot"})
         return httpx.Response(200, json=body)
 
     rep = reporter(handle)
     found = await rep.find_comment("SHOP-1", "aica-report-p-r1")
     assert found is not None and found.comment_id == "10009"
     assert await rep.find_comment("SHOP-1", "aica-report-p-r2") is None
-    assert seen[0].method == "GET" and seen[0].url.path == "/rest/api/3/issue/SHOP-1/comment"
+    # the reporting account is asked once (cached); a user's comment with the marker never counts
+    assert [r.url.path for r in seen] == [
+        "/rest/api/3/myself",
+        "/rest/api/3/issue/SHOP-1/comment",
+        "/rest/api/3/issue/SHOP-1/comment",
+    ]
+    unknown = await reporter(lambda _: httpx.Response(500)).find_comment("SHOP-1", "m")
+    assert unknown is not None and unknown.error == "lookup_identity_unknown"
     failed = await reporter(lambda _: httpx.Response(503)).find_comment("SHOP-1", "m")
     assert failed is not None and failed.status is CommentStatus.RETRYABLE

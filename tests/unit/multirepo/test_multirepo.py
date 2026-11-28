@@ -5,7 +5,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from ai_code_change_agent.application.artifacts.models import ArtifactKind, Arti
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.errors import ArtifactIntegrityError
 from ai_code_change_agent.application.jira.models import JiraRichText
+from ai_code_change_agent.application.jira.reports import DurableJiraReporter
 from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
@@ -61,6 +62,7 @@ from ai_code_change_agent.orchestration.langgraph.runner import (
 )
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps
 from tests.support.changes import MemoryChanges
+from tests.support.jira_reports import MemoryReportStore
 from tests.support.workflow import FakeJira, make_rig
 
 STORY = """Implement order tracking across the existing applications.
@@ -176,7 +178,10 @@ class MemStore:
         if p.status not in expected:
             return False
         jira = None if f.get("reopen") else p.jira_report
-        self.parents[parent_id] = replace(p, status=f.get("status", p.status), jira_report=jira)
+        rnd = p.report_round + 1 if f.get("reopen") else p.report_round  # as the DynamoDB store
+        self.parents[parent_id] = replace(
+            p, status=f.get("status", p.status), jira_report=jira, report_round=rnd
+        )
         return True
 
     async def claim_report(self, parent_id: uuid.UUID, stale_seconds: int) -> ReportClaim | None:
@@ -250,7 +255,7 @@ class Reporter:
         self.lookups = 0
         self.lost_response = False  # Jira creates the comment but the response is lost
 
-    async def report(self, issue_key: str, text: str) -> str:
+    async def report(self, issue_key: str, text: str, *, report_id: str | None = None) -> str:
         self.texts.append((issue_key, text))
         return "POSTED"
 
@@ -274,6 +279,20 @@ class Reporter:
         return None
 
 
+def durable(fake: "Reporter") -> DurableJiraReporter:
+    """The fake Jira behind the real durable reporter: one POST per call (as one report job run),
+    and a store whose clock runs ahead, so each later call finds its retry due (the report job's
+    own backoff is at least as long)."""
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    later = datetime.now(UTC) + timedelta(days=1)
+    return DurableJiraReporter(
+        fake, MemoryReportStore(lambda: later), sleep=no_sleep, tries_per_round=1
+    )
+
+
 class Changes:
     async def get_request(self, request_id: uuid.UUID) -> Any:
         class R:
@@ -286,7 +305,7 @@ def make(denied: set[str] | None = None) -> tuple[Coordinator, MemStore, Queue, 
     store, queue, reporter = MemStore(), Queue(), Reporter()
     coordinator = Coordinator(
         store=store, changes=Changes(), queue=queue, artifacts=None,  # type: ignore[arg-type]
-        resolver=Resolver(denied), reporter=reporter, max_repositories=5, max_job_attempts=3,
+        resolver=Resolver(denied), reporter=durable(reporter), max_repositories=5, max_job_attempts=3,
     )  # fmt: skip
     return coordinator, store, queue, reporter
 
@@ -376,7 +395,7 @@ async def test_a_blocked_multi_repository_intake_is_reported_once() -> None:
         def __init__(self) -> None:
             self.texts: list[str] = []
 
-        async def report(self, key: str, text: str) -> str:
+        async def report(self, key: str, text: str, *, report_id: str | None = None) -> str:
             self.texts.append(text)
             return "POSTED"
 
@@ -669,7 +688,7 @@ def make_real(
     store, queue, reporter, changes = MemStore(), Queue(), Reporter(), AttemptChanges()
     coordinator = Coordinator(
         store=store, changes=changes, queue=queue, artifacts=artifacts,  # type: ignore[arg-type]
-        resolver=Resolver(), reporter=reporter, max_repositories=max_repositories,
+        resolver=Resolver(), reporter=durable(reporter), max_repositories=max_repositories,
         max_job_attempts=3,
     )  # fmt: skip
     return coordinator, store, queue, reporter, changes
@@ -1351,7 +1370,7 @@ async def paused_children(tmp_path: Path) -> Paused:
     coordinator = Coordinator(
         store=store, changes=changes, queue=queue,  # type: ignore[arg-type]
         artifacts=artifact_service(tmp_path / "artifacts"), resolver=Resolver(),
-        reporter=reporter, max_repositories=5, max_job_attempts=3,
+        reporter=durable(reporter), max_repositories=5, max_job_attempts=3,
     )  # fmt: skip
     parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(TWO))
     attempts = {}
@@ -1612,3 +1631,68 @@ async def test_a_resumed_single_repository_attempt_never_touches_the_coordinator
     await p.handler(p.resume_to(S.COMPLETED))(resume_job(lone))
     assert p.parent_status() is ParentStatus.RUNNING and p.reporter.texts == []
     assert p.single_reports == []  # completed: the workflow's own report step posted already
+
+
+async def test_the_parent_report_is_a_durable_report_with_its_legacy_marker() -> None:
+    coordinator, _, _, reporter, parent = await finished_parent()
+    stored = await coordinator._reporter.record(f"parent-{parent.id}-r0")
+    assert stored is not None and str(stored.state) == "POSTED"  # in `reports list`
+    (text,) = [t for _, t in reporter.texts]
+    assert text.endswith(f"Report ID: aica-report-{parent.id}-r0")
+
+
+async def test_a_dead_report_job_settles_a_projection_left_in_progress() -> None:
+    """A report run crashed after the POST and its job was used up: the on_dead hook takes the
+    claim whatever its age and records the durable report's state (no new POST)."""
+    from ai_code_change_agent.composition import parent_report_dead
+
+    coordinator, store, _, reporter, parent = await finished_parent()
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="IN_PROGRESS")
+    store.stale = True  # claim_report(stale_seconds=0)
+    hook = parent_report_dead(coordinator)
+    await hook(Job(uuid.uuid4(), REPORT_JOB, {"parent_id": str(parent.id)}, 6, 6))
+    settled = store.parents[parent.id]
+    assert settled.jira_report == "SUCCEEDED" and settled.jira_comment_id == "10001"
+    assert len(reporter.texts) == 1
+    await hook(Job(uuid.uuid4(), REPORT_JOB, {}, 6, 6))  # a bad payload: nothing to settle
+
+
+async def test_a_dead_report_job_with_a_pending_report_says_so() -> None:
+    flaky = [CommentResult(R.RETRYABLE, http_status=503, error="http_503")]
+    coordinator, store, _, _, parent = await finished_parent(flaky)
+    await coordinator.settle_report(parent.id)
+    settled = store.parents[parent.id]
+    assert settled.jira_report == "RETRYABLE_FAILURE"
+    assert settled.jira_report_error == "report_delivery_pending"
+
+
+async def test_settle_report_leaves_a_live_claim_and_a_succeeded_projection_alone() -> None:
+    coordinator, store, _, _reporter, parent = await finished_parent()
+    assert store.parents[parent.id].jira_report == "SUCCEEDED"
+    await coordinator.settle_report(parent.id)  # never overwrites SUCCEEDED
+    assert store.parents[parent.id].jira_report == "SUCCEEDED"
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="IN_PROGRESS")
+    store.stale = False  # a live run holds the claim
+    await coordinator.settle_report(parent.id)
+    assert store.parents[parent.id].jira_report == "IN_PROGRESS"
+
+
+async def test_settle_report_truncates_a_permanent_error() -> None:
+    long = CommentResult(R.PERMANENT, http_status=400, error="x" * 300)
+    coordinator, store, _, _, parent = await finished_parent([long])
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="RETRYABLE_FAILURE")
+    await coordinator.settle_report(parent.id)
+    settled = store.parents[parent.id]
+    assert (
+        settled.jira_report == "PERMANENT_FAILURE" and len(settled.jira_report_error or "") <= 120
+    )
+
+
+async def test_the_parent_projection_follows_a_report_the_durable_retry_posts_later() -> None:
+    flaky = [CommentResult(R.RETRYABLE, http_status=503, error="http_503")]
+    coordinator, store, _, reporter, parent = await finished_parent(flaky)
+    assert store.parents[parent.id].jira_report == "RETRYABLE_FAILURE"
+    assert await coordinator._reporter.retry_due() == 1  # the worker's maintenance round
+    refreshed = store.parents[parent.id]
+    assert refreshed.jira_report == "SUCCEEDED" and refreshed.jira_comment_id == "10001"
+    assert len(reporter.texts) == 1

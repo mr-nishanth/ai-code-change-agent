@@ -6,9 +6,12 @@ the registry through its unit of work, costs through `CostQuery`, multi-reposito
 with its outbox entry and sent to SQS directly; when that send fails the worker's relay sends it.
 No SQL database is involved."""
 
+import json
+
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
+from ai_code_change_agent.application.jira.reports import DurableJiraReporter
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.application.repositories.service import RepositoryRegistryService
@@ -19,6 +22,7 @@ from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.integrations.github.references import GitHubReferenceParser
 from ai_code_change_agent.persistence.dynamodb import Table
 from ai_code_change_agent.persistence.dynamodb.change_store import DynamoChangeUnitOfWork
+from ai_code_change_agent.persistence.dynamodb.jira_report_store import DynamoJiraReportStore
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
 from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
 from ai_code_change_agent.persistence.dynamodb.registry_store import DynamoRegistryUnitOfWork
@@ -51,6 +55,17 @@ class CliStores:
     def job_queue(self) -> DynamoSqsJobQueue:
         return DynamoSqsJobQueue(self.table, self.aws.sqs, self.aws.queue_url)
 
+    def reports(self) -> DynamoJiraReportStore:
+        return DynamoJiraReportStore(self.table)
+
+    def dlq_url(self) -> str:
+        """The job queue's DLQ, from its redrive policy (infra/floci/init/10-sqs.sh)."""
+        attrs = self.aws.sqs.get_queue_attributes(
+            QueueUrl=self.aws.queue_url(), AttributeNames=["RedrivePolicy"]
+        )["Attributes"]
+        arn = str(json.loads(attrs["RedrivePolicy"])["deadLetterTargetArn"])
+        return str(self.aws.sqs.get_queue_url(QueueName=arn.rsplit(":", 1)[-1])["QueueUrl"])
+
     def artifacts(self) -> ArtifactService:
         s = self.settings
         return ArtifactService(
@@ -68,5 +83,5 @@ class CliStores:
             changes=self.changes,
             artifacts=self.artifacts(),
             resolver=self.resolver(),
-            reporter=build_jira_reporter(self.settings),
+            reporter=DurableJiraReporter(build_jira_reporter(self.settings), self.reports()),
         )

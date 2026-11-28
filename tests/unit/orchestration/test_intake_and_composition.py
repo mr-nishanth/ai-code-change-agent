@@ -308,7 +308,7 @@ async def test_an_unresolvable_repository_is_reported_to_jira_once() -> None:
         def __init__(self) -> None:
             self.reports: list[tuple[str, str]] = []
 
-        async def report(self, key: str, text: str) -> str:
+        async def report(self, key: str, text: str, *, report_id: str | None = None) -> str:
             self.reports.append((key, text))
             return "POSTED"
 
@@ -363,7 +363,7 @@ async def test_a_refusal_that_cannot_be_recorded_is_retried_before_jira_hears_of
     reports: list[str] = []
 
     class Reporter:
-        async def report(self, key: str, text: str) -> str:
+        async def report(self, key: str, text: str, *, report_id: str | None = None) -> str:
             reports.append(text)
             return "POSTED"
 

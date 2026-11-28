@@ -8,9 +8,10 @@ prepared safely (for example dependencies need network access); REJECTED means a
 rejected the plan or the final artifact. Terminal attempts never change again.
 
 A request's status projects its current attempt's status. Before any attempt it is RECEIVED, or
-BLOCKED when no attempt will start from its intake (intake refused it, or the worker recorded its
-job DEAD; intake is never re-run, so BLOCKED is terminal there too). A job the queue's own sweep
-marks DEAD (`lease_expired_attempts_exhausted`) runs no hook: that request stays RECEIVED.
+BLOCKED when no attempt will start from its intake (intake refused it, or its job ended DEAD by any
+path, including a worker that died on the last attempt: `lease_expired_attempts_exhausted`; intake
+is never re-run, so BLOCKED is terminal there too). An attempt a DEAD job leaves behind becomes
+FAILED (`job_attempts_exhausted`), see `orchestration.dead_jobs`.
 """
 
 from enum import StrEnum

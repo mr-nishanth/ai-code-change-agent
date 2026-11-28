@@ -6,20 +6,24 @@ resume job); the workflow re-reads and re-checks the approval itself."""
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import getpass
 import json
+import os
 import re
 import signal
 import sys
+import threading
 import uuid
 from typing import TextIO
 
 from ai_code_change_agent.application.artifacts.redaction import find_secrets
+from ai_code_change_agent.application.jira.reports import ReportRecord, ReportState
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
-from ai_code_change_agent.core.logging import configure_logging
+from ai_code_change_agent.core.logging import configure_logging, get_logger
 from ai_code_change_agent.domain.changes.models import (
     REASON,
     REASON_MAX,
@@ -27,11 +31,34 @@ from ai_code_change_agent.domain.changes.models import (
     ApprovalGate,
 )
 from ai_code_change_agent.orchestration.intake import RESUME
+from ai_code_change_agent.persistence.dynamodb.job_queue import job_id_of_message as dlq_job_id
+from ai_code_change_agent.persistence.dynamodb.keys import job as job_key
+
+_log = get_logger("worker")
 
 
 def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     worker = top.add_parser("worker", help="run the job worker (trusted host process)")
     worker.add_argument("--once", action="store_true", help="process at most one job and exit")
+    reports = top.add_parser("reports", help="inspect durable Jira reports (pending, failed)")
+    rsub = reports.add_subparsers(dest="command", required=True)
+    rlist = rsub.add_parser("list", help="the newest reports and their delivery state")
+    rlist.add_argument(
+        "--state",
+        choices=[s.value for s in ReportState],
+        help="keep only this state, among the newest --limit reports (no index by state)",
+    )
+    rlist.add_argument("--limit", type=int, default=20, help="newest reports read (max 200)")
+    rshow = rsub.add_parser("show", help="one report (never its comment text)")
+    rshow.add_argument("report_id")
+    jobs = top.add_parser("jobs", help="inspect the job queue")
+    jsub = jobs.add_subparsers(dest="command", required=True)
+    dlq = jsub.add_parser(
+        "dlq",
+        help="peek at dead-lettered messages and their jobs (each peek adds one to a message's "
+        "receive count on the DLQ, which has no redrive of its own)",
+    )
+    dlq.add_argument("--max", type=int, default=10, choices=range(1, 11), metavar="1..10")
     costs = top.add_parser("costs", help="print LLM API cost reports from the usage ledger")
     costs.add_argument("--issue", action="append", default=[], help="Jira issue key (repeatable)")
     costs.add_argument("--attempt", type=uuid.UUID, action="append", default=[])
@@ -83,14 +110,58 @@ async def _worker(once: bool) -> None:
             if once:
                 await app.worker.run_once()
                 return
-            stop = asyncio.Event()
+            stop, force = asyncio.Event(), asyncio.Event()
             loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="acca-worker")
+            loop.set_default_executor(executor)
+            signals = _Signals(stop, force)
             for sig in (signal.SIGINT, signal.SIGTERM):
                 with contextlib.suppress(NotImplementedError):
-                    loop.add_signal_handler(sig, stop.set)
-            await app.worker.run(stop)
+                    loop.add_signal_handler(sig, signals.received, sig)
+            try:
+                await app.worker.run(stop, force)
+            finally:  # queued blocking calls are dropped; running ones are bounded by the deadline
+                executor.shutdown(wait=False, cancel_futures=True)
         finally:
             await app.costs.print_session_summary()  # recomputed from the persisted ledger
+
+
+# After the first signal the process exits within this long whatever still runs: one SQS long poll
+# (20 s) plus the 30 s grace, plus room for the lease release and the cost summary. It also bounds
+# asyncio.run's wait for executor threads (otherwise up to 300 s for a blocked Docker or AWS call).
+SHUTDOWN_DEADLINE_SECONDS = 90.0
+
+
+class _Signals:
+    """SIGINT and SIGTERM alike. The first stops claiming, gives a running job the worker's
+    shutdown grace and arms a hard deadline; the second cancels the job at once (its lease is
+    released either way); the third, or the deadline, exits the process immediately."""
+
+    deadline: threading.Timer | None = None  # the armed hard deadline (cancelled on a clean exit)
+
+    def __init__(self, stop: asyncio.Event, force: asyncio.Event) -> None:
+        self.stop, self.force, self.count = stop, force, 0
+
+    def received(self, sig: signal.Signals) -> None:
+        self.count += 1
+        if self.count == 1:
+            self.stop.set()
+            _log.warning("worker_shutdown_requested", signal=sig.name,
+                         deadline_seconds=SHUTDOWN_DEADLINE_SECONDS)  # fmt: skip
+            timer = threading.Timer(SHUTDOWN_DEADLINE_SECONDS, _hard_exit, ("deadline",))
+            timer.daemon = True
+            timer.start()
+            _Signals.deadline = timer
+        elif self.count == 2:
+            self.force.set()
+            _log.warning("worker_shutdown_forced", signal=sig.name)
+        else:
+            _hard_exit(sig.name)
+
+
+def _hard_exit(reason: str) -> None:
+    _log.error("worker_shutdown_hard_exit", reason=reason)
+    os._exit(130)
 
 
 async def _costs(args: argparse.Namespace, out: TextIO) -> None:
@@ -152,6 +223,66 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
     )
 
 
+async def _reports(args: argparse.Namespace, out: TextIO) -> None:
+    """Delivery state of app-posted Jira comments (DurableJiraReporter); never the text."""
+    store = CliStores(get_settings()).reports()
+    if args.command == "show":
+        record = await store.get(args.report_id)
+        if record is None:
+            out.write(f"report {args.report_id} not found\n")
+            return
+        out.write(json.dumps(_report_row(record), indent=2) + "\n")
+        return
+    for record in await store.recent(max(1, min(args.limit, 200))):
+        if args.state and record.state.value != args.state:
+            continue
+        row = _report_row(record)
+        out.write(" ".join(f"{k}={v}" for k, v in row.items() if v is not None) + "\n")
+
+
+def _report_row(record: ReportRecord) -> dict[str, object]:
+    def when(moment: object) -> str | None:
+        return moment.isoformat(timespec="seconds") if hasattr(moment, "isoformat") else None
+
+    return {
+        "report_id": record.report_id, "issue": record.issue_key, "state": record.state.value,
+        "attempts": record.attempts, "next_retry_at": when(record.next_retry_at),
+        "last_error": record.last_error, "comment_id": record.comment_id,
+        "sha256": record.content_sha256[:12], "updated_at": when(record.updated_at),
+    }  # fmt: skip
+
+
+async def _jobs(args: argparse.Namespace, out: TextIO) -> None:
+    """`jobs dlq`: what reached the dead-letter queue (job id, and the job's stored state). A peek:
+    the messages stay in the DLQ, visible. A job that is not terminal is recovered by the worker's
+    sweep (it re-sends a message for it); a terminal one needs nothing (a redrive is a no-op)."""
+    stores = CliStores(get_settings())
+    url = await asyncio.to_thread(stores.dlq_url)
+    sqs = stores.aws.sqs
+    attrs = (await asyncio.to_thread(
+        sqs.get_queue_attributes, QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
+    ))["Attributes"]  # fmt: skip
+    out.write(f"dlq messages: {attrs.get('ApproximateNumberOfMessages', '0')}\n")
+    got = await asyncio.to_thread(
+        sqs.receive_message, QueueUrl=url, MaxNumberOfMessages=args.max, WaitTimeSeconds=0,
+        VisibilityTimeout=0, AttributeNames=["ApproximateReceiveCount"],
+    )  # fmt: skip
+    for message in got.get("Messages") or []:
+        job_id = dlq_job_id(message.get("Body"))
+        if job_id is None:
+            out.write("message: not a job message (poison)\n")
+            continue
+        item = await stores.table.get(job_key(job_id))
+        if item is None:
+            out.write(f"job {job_id}: unknown (no job item)\n")
+            continue
+        out.write(
+            f"job {job_id}: kind={item.get('kind')} status={item.get('status')} "
+            f"attempts={item.get('attempts')}/{item.get('max_attempts')} "
+            f"last_error={item.get('last_error') or '-'}\n"
+        )
+
+
 def _line_buffered_output() -> None:
     """The worker is long-running and often redirected to a file: write every line as it is
     printed instead of holding it in a block buffer (as PYTHONUNBUFFERED=1 would)."""
@@ -165,9 +296,17 @@ def _line_buffered_output() -> None:
 def run(args: argparse.Namespace, out: TextIO) -> int:
     if args.area == "worker":
         _line_buffered_output()
-        asyncio.run(_worker(args.once))
+        try:
+            asyncio.run(_worker(args.once))
+        finally:
+            if _Signals.deadline is not None:  # exited in time: nothing left to cut short
+                _Signals.deadline.cancel()
     elif args.area == "costs":
         asyncio.run(_costs(args, out))
+    elif args.area == "reports":
+        asyncio.run(_reports(args, out))
+    elif args.area == "jobs":
+        asyncio.run(_jobs(args, out))
     else:
         asyncio.run(_changes(args, out))
     return 0

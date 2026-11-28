@@ -49,16 +49,35 @@ class CommentResult:
     comment_id: str | None = None
     http_status: int | None = None
     error: str | None = None
+    retry_after: float | None = None  # seconds, from a 429/503 Retry-After header
 
 
 _PERMANENT_HTTP = frozenset({400, 401, 403, 404, 405, 410, 413, 422})
 _COMMENT_ID = re.compile(r"[0-9]{1,20}")
+_RETRY_AFTER_MAX = 3600.0
 
 
-def _classify(code: int) -> CommentResult:
+def _retry_after(response: httpx.Response | None) -> float | None:
+    """Retry-After in delta-seconds (the form Jira sends); anything else is ignored."""
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        seconds = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    if seconds is None or not 0 <= seconds <= _RETRY_AFTER_MAX:
+        return None
+    return seconds
+
+
+def _classify(code: int, response: httpx.Response | None = None) -> CommentResult:
     if code in _PERMANENT_HTTP:
         return CommentResult(CommentStatus.PERMANENT, http_status=code, error=f"http_{code}")
-    return CommentResult(CommentStatus.RETRYABLE, http_status=code, error=f"http_{code}")
+    return CommentResult(
+        CommentStatus.RETRYABLE,
+        http_status=code,
+        error=f"http_{code}",
+        retry_after=_retry_after(response),
+    )
 
 
 def _adf_text(node: Any) -> str:
@@ -86,9 +105,31 @@ class JiraOutcomeReporter:
         self._auth = authenticator
         self._transport = transport
         self._timeout = timeout_seconds
+        self._account: str | None = None
 
     def __repr__(self) -> str:
         return f"JiraOutcomeReporter(enabled={self._enabled})"
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout
+
+    async def _account_id(self, client: httpx.AsyncClient) -> str | None:
+        """The reporting account's id (`GET /rest/api/3/myself`, cached): only its comments can
+        carry a genuine report marker. None when Jira did not say (the lookup then fails)."""
+        if self._account is None:
+            try:
+                response = await client.get("/rest/api/3/myself", headers=self._headers())
+                account = response.json().get("accountId") if response.status_code == 200 else None
+            except (httpx.HTTPError, ValueError, AttributeError):
+                account = None
+            if isinstance(account, str) and account:
+                self._account = account
+        return self._account
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -128,7 +169,7 @@ class JiraOutcomeReporter:
         except httpx.HTTPError:
             return CommentResult(CommentStatus.RETRYABLE, error="transport_error")
         if response.status_code != 201:
-            return _classify(response.status_code)
+            return _classify(response.status_code, response)
         try:
             raw = response.json().get("id")
         except ValueError:
@@ -137,15 +178,19 @@ class JiraOutcomeReporter:
         return CommentResult(CommentStatus.POSTED, comment_id=cid, http_status=201)
 
     async def find_comment(self, issue_key: str, marker: str) -> CommentResult | None:
-        """The newest comment on the issue whose text contains marker (a report id), or None
-        when Jira confirms there is none. A failed lookup is returned as RETRYABLE/PERMANENT:
-        the caller must not post while the outcome is unknown."""
+        """The newest comment by the reporting account (`/myself`) whose text contains marker (a
+        report id), or None when Jira confirms there is none; a user who pastes the marker into a
+        comment of their own cannot suppress the report. A failed lookup is returned as
+        RETRYABLE/PERMANENT: the caller must not post while the outcome is unknown."""
         if not self._enabled:
             return CommentResult(CommentStatus.DISABLED)
         if not _KEY.fullmatch(issue_key):
             return CommentResult(CommentStatus.PERMANENT, error="issue_key_invalid")
         try:
             async with self._client() as client:
+                account = await self._account_id(client)
+                if account is None:
+                    return CommentResult(CommentStatus.RETRYABLE, error="lookup_identity_unknown")
                 response = await client.get(
                     f"/rest/api/3/issue/{issue_key}/comment",
                     params={"orderBy": "-created", "maxResults": 100},
@@ -156,16 +201,24 @@ class JiraOutcomeReporter:
         except httpx.HTTPError:
             return CommentResult(CommentStatus.RETRYABLE, error="lookup_transport_error")
         if response.status_code != 200:
-            found = _classify(response.status_code)
+            found = _classify(response.status_code, response)
             return CommentResult(
-                found.status, http_status=found.http_status, error="lookup_" + str(found.error)
+                found.status,
+                http_status=found.http_status,
+                error="lookup_" + str(found.error),
+                retry_after=found.retry_after,
             )
         try:
             comments = response.json().get("comments") or []
         except ValueError:
             return CommentResult(CommentStatus.RETRYABLE, error="lookup_invalid_json")
-        for comment in comments:
-            if isinstance(comment, dict) and marker in _adf_text(comment.get("body")):
+        for comment in comments:  # only the reporting account's own comments can be the report
+            if not isinstance(comment, dict):
+                continue
+            author = comment.get("author")
+            if not isinstance(author, dict) or author.get("accountId") != account:
+                continue
+            if marker in _adf_text(comment.get("body")):
                 cid = str(comment.get("id", ""))
                 return CommentResult(
                     CommentStatus.POSTED,

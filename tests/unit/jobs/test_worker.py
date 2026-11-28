@@ -1,6 +1,7 @@
 """Worker behaviour over an in-memory queue double."""
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -28,6 +29,10 @@ class MemoryQueue:
         self.relays = 0
         self.sweeps = 0
         self.released: list[uuid.UUID] = []
+        self.lease_released: list[tuple[uuid.UUID, bool]] = []
+        self.bounded: list[bool] = []
+        self.dead: list[Job] = []  # what dead_pending lists next (DEAD by another path)
+        self.settled: list[tuple[uuid.UUID, bool]] = []
 
     async def enqueue(
         self, kind: str, payload: dict[str, Any], *, dedupe_key: str, max_attempts: int
@@ -66,6 +71,20 @@ class MemoryQueue:
     async def sweep(self) -> int:
         self.sweeps += 1
         return 0
+
+    async def release_lease(
+        self, job_id: uuid.UUID, owner: str, *, refund: bool, bounded: bool = False
+    ) -> bool:
+        self.lease_released.append((job_id, refund))
+        self.bounded.append(bounded)
+        return True
+
+    async def dead_pending(self) -> list[Job]:
+        pending, self.dead = self.dead, []
+        return pending
+
+    async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
+        self.settled.append((job_id, failed))
 
 
 def job(kind: str = "k.one", attempts: int = 1) -> Job:
@@ -585,3 +604,229 @@ async def test_the_claim_is_released_whatever_the_outcome(handler: Any, queue: A
     w = Worker(q, {"k.one": handler}, lease_seconds=1, heartbeat_seconds=0.05)
     await asyncio.wait_for(w.run_once(), 5)
     assert q.released == [claimed.id]  # no per-job state is left in the queue adapter
+
+
+async def test_the_dispatcher_runs_the_hook_of_a_job_another_path_recorded_dead() -> None:
+    """A crashed worker's last attempt is marked DEAD by a claim (no hook ran): the dispatcher
+    lists it through dead_pending, runs its kind's hook with the stored code and settles it."""
+    hooked: list[Job] = []
+
+    async def on_dead(j: Job) -> None:
+        hooked.append(j)
+
+    q = MemoryQueue()
+    dead = Job(uuid.uuid4(), "k.one", {"x": 1}, 3, 3, last_error="lease_expired_attempts_exhausted")
+    other = Job(uuid.uuid4(), "k.nohook", {}, 1, 1, last_error="x")
+    q.dead = [dead, other]
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+               on_dead={"k.one": on_dead})  # fmt: skip
+    stop = asyncio.Event()
+    with capture_logs() as logs:
+        task = asyncio.create_task(w.run(stop))
+        await asyncio.sleep(0.1)
+        stop.set()
+        await task
+    assert hooked == [dead]
+    assert q.settled == [(dead.id, False), (other.id, False)]  # a kind without a hook settles too
+    recovered = [e for e in logs if e["event"] == "job_dead_recovered"]
+    assert [e["reason"] for e in recovered] == ["lease_expired_attempts_exhausted", "x"]
+
+
+async def test_a_dead_hook_gets_the_code_and_a_failing_one_is_listed_again() -> None:
+    seen: list[str | None] = []
+
+    async def on_dead(j: Job) -> None:
+        seen.append(j.last_error)
+        raise RuntimeError("hook broke")
+
+    async def refused(j: Job) -> None:
+        raise JobFailedError("repository_unknown")
+
+    q = MemoryQueue([job()])
+    w = Worker(q, {"k.one": refused}, lease_seconds=60, heartbeat_seconds=30,
+               on_dead={"k.one": on_dead})  # fmt: skip
+    await w.run_once()
+    assert seen == ["repository_unknown"] and q.settled == [(q.failed[0][0], True)]
+
+
+async def test_a_job_without_a_handler_is_dead_and_settled() -> None:
+    q = MemoryQueue([job("k.unknown")])
+    await worker(q, {}).run_once()
+    assert q.failed[0][1] == "no_handler" and q.settled == [(q.failed[0][0], False)]
+
+
+async def test_shutdown_lets_a_short_job_finish() -> None:
+    finished = asyncio.Event()
+
+    async def short(j: Job) -> None:
+        await asyncio.sleep(0.1)
+        finished.set()
+
+    q = MemoryQueue([job()])
+    w = Worker(q, {"k.one": short}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01,
+               shutdown_grace_seconds=5)  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert finished.is_set() and len(q.completed) == 1 and q.lease_released == []
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_shutdown_cancels_a_long_job_after_the_grace_and_gives_its_lease_back(
+    force: bool,
+) -> None:
+    """SIGINT/SIGTERM set stop: a handler still running after the grace (or at once on a second
+    signal, force) is cancelled and its lease released, so the job is not abandoned until the
+    lease runs out; nothing is recorded as its result."""
+    cancelled = asyncio.Event()
+
+    async def long(j: Job) -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    claimed = job()
+    q = MemoryQueue([claimed])
+    w = Worker(q, {"k.one": long}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01,
+               shutdown_grace_seconds=0.2 if not force else 30)  # fmt: skip
+    stop, hard = asyncio.Event(), asyncio.Event()
+    with capture_logs() as logs:
+        task = asyncio.create_task(w.run(stop, hard))
+        await asyncio.sleep(0.05)
+        started = asyncio.get_running_loop().time()
+        stop.set()
+        if force:
+            hard.set()
+        await asyncio.wait_for(task, 3)
+        took = asyncio.get_running_loop().time() - started
+    assert cancelled.is_set() and took < (1 if force else 2)
+    assert q.lease_released == [(claimed.id, True)] and q.released == [claimed.id]
+    assert q.completed == [] and q.failed == []
+    assert any(e["event"] == "job_shutdown_cancelled" for e in logs)
+
+
+async def test_a_job_claimed_after_stop_is_given_back_with_its_attempt() -> None:
+    stop = asyncio.Event()
+    claimed = job()
+
+    class StopDuringClaim(MemoryQueue):
+        async def claim(self, owner: str, lease_seconds: int) -> Job | None:
+            stop.set()  # the signal arrives while the long poll is open
+            return await super().claim(owner, lease_seconds)
+
+    ran: list[Job] = []
+
+    async def handler(j: Job) -> None:
+        ran.append(j)
+
+    q = StopDuringClaim([claimed])
+    w = Worker(q, {"k.one": handler}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
+    await asyncio.wait_for(w.run(stop), 2)
+    assert ran == [] and q.lease_released == [(claimed.id, True)] and q.released == [claimed.id]
+
+
+async def test_one_worker_consumes_several_jobs_and_keeps_no_state_per_job() -> None:
+    seen: list[uuid.UUID] = []
+
+    async def ok(j: Job) -> None:
+        seen.append(j.id)
+
+    async def bad(j: Job) -> None:
+        raise JobFailedError("no")
+
+    jobs = [job(), job("k.bad"), job(), job()]
+    q = MemoryQueue(list(jobs))
+    w = Worker(q, {"k.one": ok, "k.bad": bad}, lease_seconds=60, heartbeat_seconds=30,
+               poll_seconds=0.01)  # fmt: skip
+    stop = asyncio.Event()
+    with capture_logs() as logs:
+        task = asyncio.create_task(w.run(stop))
+        for _ in range(100):
+            if len(q.completed) == 3 and q.failed:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await task
+    assert len(seen) == 3 and q.released == [j.id for j in jobs]  # every outcome released
+    events = [e["event"] for e in logs]
+    assert events.count("job_claimed") == 4 and events.count("job_succeeded") == 3
+    assert events.count("job_dead") == 1
+
+
+async def test_the_relay_keeps_dispatching_while_jira_reporting_hangs() -> None:
+    """Report retries and dead hooks run in their own task with a time budget: a Jira outage
+    (a periodic step that never answers) never delays the outbox relay."""
+    hung = asyncio.Event()
+
+    async def report_retry() -> int:
+        hung.set()
+        await asyncio.sleep(3600)  # Jira hangs
+        return 0
+
+    q = MemoryQueue()
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+               sweep_seconds=0.05, periodic=[("jira_report_retry", report_retry)],
+               maintenance_budget_seconds=0.1)  # fmt: skip
+    stop = asyncio.Event()
+    with capture_logs() as logs:
+        task = asyncio.create_task(w.run(stop))
+        await asyncio.wait_for(hung.wait(), 1)
+        before = q.relays
+        await asyncio.sleep(0.3)
+        stop.set()
+        await asyncio.wait_for(task, 2)
+    assert q.relays - before >= 10  # the relay ran on while the step hung
+    assert any(e["event"] == "job_maintenance_budget_exceeded" for e in logs)
+
+
+async def test_a_handler_that_swallows_the_shutdown_cancel_is_never_completed() -> None:
+    async def stubborn(j: Job) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(60)
+
+    claimed = job()
+    q = MemoryQueue([claimed])
+    w = Worker(q, {"k.one": stubborn}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01,
+               shutdown_grace_seconds=0.05)  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert q.completed == [] and q.failed == []
+    assert q.lease_released == [(claimed.id, True)] and q.bounded == [True]  # capped refund
+
+
+async def test_only_the_shutdown_cancel_path_bounds_its_refund() -> None:
+    stop = asyncio.Event()
+
+    class StopDuringClaim(MemoryQueue):
+        async def claim(self, owner: str, lease_seconds: int) -> Job | None:
+            stop.set()
+            return await super().claim(owner, lease_seconds)
+
+    q = StopDuringClaim([job()])
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
+    await asyncio.wait_for(w.run(stop), 2)
+    assert q.bounded == [False]  # never started: always refunded
+
+
+async def test_a_dead_hook_cut_off_by_the_maintenance_budget_counts_as_a_failure() -> None:
+    async def slow_hook(j: Job) -> None:
+        await asyncio.sleep(3600)
+
+    q = MemoryQueue()
+    dead = Job(uuid.uuid4(), "k.one", {}, 3, 3, last_error="x")
+    q.dead = [dead]
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+               on_dead={"k.one": slow_hook}, maintenance_budget_seconds=0.05)  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.3)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert q.settled == [(dead.id, True)]  # toward DEAD_HOOK_MAX_FAILURES, then abandoned

@@ -54,12 +54,24 @@ from ai_code_change_agent.validation.schemas import ValidationReport
 _log = get_logger(__name__)
 CHILD_JOB = "code_change.child"
 REPORT_JOB = "code_change.parent_report"
-MAX_REPORT_ATTEMPTS = 6  # per report round; then PERMANENT_FAILURE (operator re-runs it)
+MAX_REPORT_ATTEMPTS = 6  # report job attempts per round (the durable reporter bounds the POSTs)
 REPORT_STALE_SECONDS = 300  # an IN_PROGRESS claim older than this belongs to a crashed worker
 
 
 class ReportRetryableError(Exception):
     """Raised by the report job so the job queue retries it with backoff."""
+
+
+def parent_report_id(parent_id: uuid.UUID, report_round: int) -> str:
+    """The durable report of one aggregated round; its marker is `report_marker` (unchanged)."""
+    return f"parent-{parent_id}-r{report_round}"
+
+
+_PROJECTION = {
+    "POSTED": ReportState.SUCCEEDED,
+    "DISABLED": ReportState.DISABLED,
+    "PERMANENT_FAILURE": ReportState.PERMANENT_FAILURE,
+}
 
 
 def report_marker(parent_id: uuid.UUID, report_round: int) -> str:
@@ -158,6 +170,8 @@ class Coordinator:
         self._max = max_repositories
         self._job_attempts = max_job_attempts
         self._cost = cost_of_issue
+        if hasattr(reporter, "on_settled"):  # durable reporting: keep the parent projection fresh
+            reporter.on_settled = self.report_settled
 
     @property
     def store(self) -> MultiRepoStore:
@@ -325,11 +339,15 @@ class Coordinator:
         await self.report(parent.id)
 
     async def report(self, parent_id: uuid.UUID) -> ReportState:
-        """Post the aggregated comment of the current report round to the parent Story, at most
-        once. Lifecycle: PENDING -> IN_PROGRESS -> SUCCEEDED | RETRYABLE_FAILURE |
-        PERMANENT_FAILURE. A claim left IN_PROGRESS (crash) or RETRYABLE_FAILURE (timeout,
-        429, 5xx) may hide a comment Jira already created, so Jira is searched for this round's
-        report id first; only a confirmed absence leads to a new POST."""
+        """Post the aggregated comment of the current report round to the parent Story, once,
+        through the durable reporter (report `parent-<pid>-r<round>`, marker
+        `aica-report-<pid>-r<round>` as before). The parent's `jira_report` is a projection of
+        that report: PENDING -> IN_PROGRESS -> SUCCEEDED | RETRYABLE_FAILURE | PERMANENT_FAILURE |
+        DISABLED. The claim keeps two runs from overlapping; a claim taken over from a crashed
+        run, or one that follows a retryable failure (possibly a report started before durable
+        reporting), looks for the marker before any POST (`reconcile`). A retryable outcome
+        schedules a report job, which refreshes the projection; the durable reporter retries the
+        POST itself and bounds it."""
         parent, children = await self._store.load(parent_id)
         if parent.status is ParentStatus.RUNNING:
             return ReportState(parent.jira_report or ReportState.PENDING)
@@ -338,38 +356,30 @@ class Coordinator:
             return ReportState(parent.jira_report or ReportState.PENDING)
         request = await self._changes.get_request(parent.request_id)
         issue_key = request.jira_issue_key
-        marker = report_marker(parent.id, claim.round)
+        report_id = parent_report_id(parent.id, claim.round)
         log = _log.bind(
-            parent_id=str(parent.id), issue_key=issue_key, report_id=marker,
+            parent_id=str(parent.id), issue_key=issue_key, report_id=report_id,
             report_attempt=claim.attempts, previous_state=claim.previous.value,
         )  # fmt: skip
-        state, comment_id, error, http_status = ReportState.RETRYABLE_FAILURE, None, None, None
+        state, comment_id, error = ReportState.RETRYABLE_FAILURE, None, None
         try:
-            found = None
-            if claim.previous in (ReportState.IN_PROGRESS, ReportState.RETRYABLE_FAILURE):
-                found = await self._reporter.find_comment(issue_key, marker)
-                if found is not None:
-                    log.info("jira_report_reconciled", lookup=str(found.status))
-            result = found
-            if result is None:  # confirmed absent (or a first attempt): post this round's report
-                text = await self.summary(parent, children, issue_key, marker=marker)
-                result = await self._reporter.post_comment(issue_key, text)
-            state = {
-                "POSTED": ReportState.SUCCEEDED,
-                "DISABLED": ReportState.DISABLED,
-                "PERMANENT": ReportState.PERMANENT_FAILURE,
-            }.get(str(result.status), ReportState.RETRYABLE_FAILURE)
-            comment_id, error, http_status = result.comment_id, result.error, result.http_status
-            if state is ReportState.RETRYABLE_FAILURE and claim.attempts >= MAX_REPORT_ATTEMPTS:
-                state, error = ReportState.PERMANENT_FAILURE, f"retries_exhausted:{error}"
-        finally:  # a crash before this line leaves IN_PROGRESS, which the next run reconciles
+            text = await self.summary(parent, children, issue_key)
+            outcome = await self._reporter.report(
+                issue_key,
+                text,
+                report_id=report_id,
+                reconcile=claim.previous
+                in (ReportState.IN_PROGRESS, ReportState.RETRYABLE_FAILURE),
+            )
+            state = _PROJECTION.get(str(outcome), ReportState.RETRYABLE_FAILURE)
+            stored = await self._reporter.record(report_id)
+            if stored is not None:
+                comment_id, error = stored.comment_id, stored.last_error
+        finally:  # a crash before this line leaves IN_PROGRESS, which the next run takes over
             await self._store.finish_report(
                 parent.id, state, comment_id=comment_id, error=(error or None) and error[:120]
             )
-        log.info(
-            "jira_report", report_state=state.value, comment_id=comment_id,
-            jira_status=http_status, error=error,
-        )  # fmt: skip
+        log.info("jira_report", report_state=state.value, comment_id=comment_id, error=error)
         if state is ReportState.RETRYABLE_FAILURE:
             await self._queue.enqueue(
                 REPORT_JOB,
@@ -378,6 +388,41 @@ class Coordinator:
                 max_attempts=MAX_REPORT_ATTEMPTS,
             )
         return state
+
+    async def settle_report(self, parent_id: uuid.UUID) -> None:
+        """on_dead of the report job: a projection left IN_PROGRESS by a crashed run (once its
+        claim is stale) or RETRYABLE_FAILURE takes the durable report's state (still pending:
+        RETRYABLE_FAILURE with `report_delivery_pending`; `report_settled` refreshes it when the
+        durable reporter posts it later). A live claim and a settled projection are left alone."""
+        parent, _ = await self._store.load(parent_id)
+        stored = await self._reporter.record(parent_report_id(parent.id, parent.report_round))
+        await self._project(parent.id, stored)
+
+    async def report_settled(self, report_id: str, record: Any) -> None:
+        """The durable reporter settled a report (POSTED / FAILED_PERMANENT), possibly long after
+        the parent's own run gave up: refresh the projection of the current round's report."""
+        if not report_id.startswith("parent-"):
+            return
+        try:
+            parent_id = uuid.UUID(report_id.removeprefix("parent-").rsplit("-r", 1)[0])
+        except ValueError:
+            return
+        parent, _ = await self._store.load(parent_id)
+        if parent_report_id(parent.id, parent.report_round) == report_id:
+            await self._project(parent.id, record)
+
+    async def _project(self, parent_id: uuid.UUID, stored: Any) -> None:
+        claim = await self._store.claim_report(parent_id, REPORT_STALE_SECONDS)
+        if claim is None:  # SUCCEEDED / PERMANENT / DISABLED, or a live run holds it
+            return
+        state = ReportState.RETRYABLE_FAILURE
+        error: str | None = "report_delivery_pending"
+        comment_id = None
+        if stored is not None and str(stored.state) == "POSTED":
+            state, error, comment_id = ReportState.SUCCEEDED, None, stored.comment_id
+        elif stored is not None and str(stored.state) == "FAILED_PERMANENT":
+            state, error = ReportState.PERMANENT_FAILURE, (stored.last_error or "")[:120] or None
+        await self._store.finish_report(parent_id, state, comment_id=comment_id, error=error)
 
     async def summary(
         self, parent: Parent, children: list[Child], issue_key: str, *, marker: str | None = None

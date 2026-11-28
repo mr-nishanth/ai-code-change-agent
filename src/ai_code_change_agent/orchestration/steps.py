@@ -129,7 +129,7 @@ class Agent(Protocol):
 
 
 class Reporter(Protocol):
-    async def report(self, issue_key: str, text: str) -> Any: ...
+    async def report(self, issue_key: str, text: str, *, report_id: str | None = None) -> Any: ...
 
 
 class DependencyLockDoc(BaseModel):
@@ -238,6 +238,7 @@ _RETRYABLE = (
     "connection",
     "outcome",
 )
+DELIVERY_UNKNOWN = "delivery_outcome_unknown"  # a dead job left the attempt in DELIVERING
 _STAGES = (
     ("dependency", "dependency preparation"),
     ("agent", "agent"),
@@ -1076,8 +1077,25 @@ class CodeChangeSteps:
             f"Reason: {reason}\n"
             f"{await self._failure_detail(a)}"
             f"Retryable: {advice}.\n"
-            "No pull request was created by this attempt."
+            + (
+                "A branch or draft pull request may exist for this attempt (its delivery outcome "
+                "is unknown); check the repository before retrying."
+                if a.failure_code == DELIVERY_UNKNOWN
+                else "No pull request was created by this attempt."
+            )
         )
+
+    async def pull_request_created(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt's latest delivery result says the pull request was created (an
+        attempt that died in DELIVERING after publishing: it is reported, not failed)."""
+        a = await self._attempt(attempt_id)
+        latest = await self._latest_optional(a, ArtifactKind.DELIVERY_RESULT)
+        if latest is None:
+            return False
+        doc = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], DeliveryResultDoc
+        )
+        return doc.outcome == DeliveryOutcome.PULL_REQUEST_CREATED.value
 
     async def _failure_detail(self, a: CodeChangeAttempt) -> str:
         """Bounded detail lines for the Jira comment: why independent validation failed (failed
@@ -1106,17 +1124,19 @@ class CodeChangeSteps:
         return validation_detail(report)
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
-        """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either
-        posted or permanently failed (PERMANENT_FAILURE: Jira refused it with 400/401/403/404 or
-        similar, so posting again cannot help). Only a retryable failure (FAILED) stores nothing,
-        so a later cleanup may try again. Reporting never changes or re-runs the attempt. A
-        multi-repository child reports nothing here: its parent posts one aggregated comment."""
+        """One Jira comment per attempt outcome, keyed `attempt-<id>`: the durable reporter stores
+        the report before it posts, retries a transient failure (in the call, then from the
+        worker's dispatcher across restarts) and never posts it twice. A JIRA_REPORT artifact marks
+        it as settled here, either posted or permanently failed (PERMANENT_FAILURE: Jira refused it
+        with 400/401/403/404 or similar, or the retries ran out). A pending retry (FAILED) stores
+        nothing. Reporting never changes or re-runs the attempt. A multi-repository child reports
+        nothing here: its parent posts one aggregated comment."""
         if self._d.multirepo is not None and await self._d.multirepo.is_child(a.id):
             return
         scope = self._scope(a)
         if any(m.kind is ArtifactKind.JIRA_REPORT for m in await self._d.artifacts.list(scope)):
             return
-        outcome = await self._d.reporter.report(issue_key, text)
+        outcome = await self._d.reporter.report(issue_key, text, report_id=f"attempt-{a.id}")
         _log.info("jira_report", attempt_id=str(a.id), outcome=str(outcome))
         if str(outcome) == "PERMANENT_FAILURE":
             _log.warning("jira_report_permanent_failure", attempt_id=str(a.id))

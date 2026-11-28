@@ -36,7 +36,7 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[import-untyped]
 
-from ai_code_change_agent.application.jobs.queue import Job, JobStatus
+from ai_code_change_agent.application.jobs.queue import MAX_SHUTDOWN_REFUNDS, Job, JobStatus
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.persistence.dynamodb import keys
 from ai_code_change_agent.persistence.dynamodb.clock import Clock, SystemClock
@@ -60,11 +60,19 @@ MAX_RECEIVE_WAIT_SECONDS = 20  # SQS long-poll maximum
 RETENTION_DAYS = 90  # TTL on terminal jobs (DM 7)
 RELAY_BATCH = 100
 EXHAUSTED = "lease_expired_attempts_exhausted"
+# A job this worker's own `fail` records DEAD runs its hook at once: the DEAD write itself claims
+# the hook run for this long (the dispatcher lists it only afterwards, as after its own claim).
+DEAD_HOOK_GRACE_SECONDS = 300
+DEAD_HOOK_MAX_FAILURES = 5  # a hook that keeps raising is retried this often, then abandoned
+DEAD_HOOK_RETRY_SECONDS = 300
 _TERMINAL = frozenset({JobStatus.SUCCEEDED, JobStatus.DEAD})
 _NEW = "attribute_not_exists(PK)"
 _BUMP = "row_version = row_version + :one, updated_at = :now"
 _TERMINAL_SET = "finished_at = :now, expires_at = :ttl, " + _BUMP
 _TERMINAL_REMOVE = "lease_owner, lease_expires_at, GSI3PK, GSI3SK"
+# DEAD keeps GSI3, moved to the DEADHOOK partition, until its kind's on_dead hook has run
+_DEAD_SET = "GSI3PK = :deadp, GSI3SK = :deadsk"
+_DEAD_REMOVE = "lease_owner, lease_expires_at"
 _S = {"#s": "status"}
 
 
@@ -328,14 +336,15 @@ class DynamoSqsJobQueue:
         try:
             await self._table.update(
                 keys.job(job_id),
-                update=f"SET #s = :dead, last_error = :code, {_TERMINAL_SET} "
-                f"REMOVE {_TERMINAL_REMOVE}",
+                update=f"SET #s = :dead, last_error = :code, {_DEAD_SET}, {_TERMINAL_SET} "
+                f"REMOVE {_DEAD_REMOVE}",
                 condition="row_version = :seen",
                 names=_S,
                 values={
                     ":dead": JobStatus.DEAD.value,
                     ":code": code,
                     ":seen": old.get("row_version"),
+                    **self._dead_values(job_id, 0),  # nobody runs its hook inline: due now
                     **self._terminal_values(),
                 },
                 on_failed=_Stale(None),
@@ -360,6 +369,11 @@ class DynamoSqsJobQueue:
 
     def release(self, job_id: uuid.UUID, owner: str) -> None:
         self._forget(job_id, owner)
+
+    def _dead_values(self, job_id: uuid.UUID, grace_seconds: int) -> dict[str, Any]:
+        due = self._clock.now() + timedelta(seconds=grace_seconds)
+        partition = keys.job_dead_gsi3(due, job_id)
+        return {":deadp": partition["GSI3PK"], ":deadsk": partition["GSI3SK"]}
 
     def _terminal_values(self) -> dict[str, Any]:
         now = self._clock.now()
@@ -454,11 +468,16 @@ class DynamoSqsJobQueue:
         try:
             await self._table.update(
                 keys.job(job_id),
-                update=f"SET #s = :dead, last_error = :code, {_TERMINAL_SET} "
-                f"REMOVE {_TERMINAL_REMOVE}",
+                update=f"SET #s = :dead, last_error = :code, {_DEAD_SET}, {_TERMINAL_SET} "
+                f"REMOVE {_DEAD_REMOVE}",
                 condition=owned,
                 names=_S,
-                values={**base, ":dead": JobStatus.DEAD.value, **self._terminal_values()},
+                values={
+                    **base,
+                    ":dead": JobStatus.DEAD.value,
+                    **self._dead_values(job_id, DEAD_HOOK_GRACE_SECONDS),  # the worker runs it
+                    **self._terminal_values(),
+                },
                 on_failed=_Stale(None),
                 return_values="NONE",
             )
@@ -505,6 +524,146 @@ class DynamoSqsJobQueue:
                 sent += 1
                 _log.info("job_message_resent", job_id=str(job_id))
         return sent
+
+    async def release_lease(
+        self, job_id: uuid.UUID, owner: str, *, refund: bool, bounded: bool = False
+    ) -> bool:
+        """End `owner`'s lease now (shutdown) and make the message visible again at once. With
+        `refund` the claim's attempt is given back too; `bounded` refunds only while the job's
+        `shutdown_refunds` is under MAX_SHUTDOWN_REFUNDS (counted), else releases without one."""
+        if refund and bounded:
+            if await self._release(job_id, owner, refund=True, counted=True):
+                return True
+            refund = False  # at the cap (or not ours: the plain release below says which)
+        return await self._release(job_id, owner, refund=refund, counted=False)
+
+    async def _release(self, job_id: uuid.UUID, owner: str, *, refund: bool, counted: bool) -> bool:
+        now = self._clock.now()
+        update = "SET lease_expires_at = :past"
+        condition = "#s = :running AND lease_owner = :owner"
+        values: dict[str, Any] = {
+            ":running": JobStatus.RUNNING.value,
+            ":owner": owner,
+            ":past": encode_timestamp(now - timedelta(seconds=1)),
+            ":now": encode_timestamp(now),
+            ":one": 1,
+        }
+        if refund:
+            update += ", attempts = attempts - :one"
+            condition += " AND attempts > :zero"
+            values[":zero"] = 0
+        if counted:
+            update += ", shutdown_refunds = if_not_exists(shutdown_refunds, :zero) + :one"
+            condition += " AND (attribute_not_exists(shutdown_refunds) OR shutdown_refunds < :cap)"
+            values[":cap"] = MAX_SHUTDOWN_REFUNDS
+        try:
+            await self._table.update(
+                keys.job(job_id),
+                update=update + ", " + _BUMP,
+                condition=condition,
+                names=_S,
+                values=values,
+                on_failed=_Stale(None),
+                return_values="NONE",
+            )
+        except _Stale:
+            if counted:
+                return False  # the caller retries without the refund
+            self._forget(job_id, owner)
+            return False
+        await self._visibility(job_id, self._forget(job_id, owner), 0)
+        _log.info("job_lease_released", job_id=str(job_id), refunded=refund)
+        return True
+
+    # Dead-job hooks ----------------------------------------------------------------------------
+
+    async def dead_pending(self) -> list[Job]:
+        """DEAD jobs (`GSI3PK = DEADHOOK`, due) whose kind's on_dead hook has not run."""
+        now = self._clock.now()
+        rows = await self._table.query(
+            key_condition="GSI3PK = :p AND GSI3SK <= :bound",
+            values={":p": keys.GSI_DEAD, ":bound": encode_timestamp(now) + "#~"},
+            index="GSI3",
+            limit=RELAY_BATCH,
+            page_size=RELAY_BATCH,
+        )
+        found: list[Job] = []
+        for job_id, item in await self._reread(rows):
+            if (
+                item is None
+                or item.get("GSI3PK") != keys.GSI_DEAD
+                or item.get("status") != JobStatus.DEAD.value
+                or not await self._claim_dead(job_id, str(item.get("GSI3SK")))
+            ):
+                continue
+            found.append(
+                Job(
+                    decode_uuid(item.get("id")),
+                    str(item.get("kind")),
+                    dict(decode_json(item.get("payload_json"), "payload_json")),
+                    decode_int(item.get("attempts"), "attempts"),
+                    decode_int(item.get("max_attempts"), "max_attempts"),
+                    last_error=str(item.get("last_error") or "") or None,
+                )
+            )
+        return found
+
+    async def _claim_dead(self, job_id: uuid.UUID, seen: str) -> bool:
+        """Take the hook run: push its due time DEAD_HOOK_RETRY_SECONDS ahead, conditional on the
+        due time just read, so two dispatchers never run the same hook at once (the worker that
+        records DEAD itself holds the same window from the DEAD write)."""
+        due = keys.job_dead_gsi3(
+            self._clock.now() + timedelta(seconds=DEAD_HOOK_RETRY_SECONDS), job_id
+        )
+        try:
+            await self._table.update(
+                keys.job(job_id),
+                update="SET GSI3SK = :due",
+                condition="GSI3PK = :deadp AND GSI3SK = :seen",
+                values={":deadp": keys.GSI_DEAD, ":seen": seen, ":due": due["GSI3SK"]},
+                on_failed=_Stale(None),
+                return_values="NONE",
+            )
+        except _Stale:
+            return False
+        return True
+
+    async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
+        """Leave the DEADHOOK partition; a failed hook is listed again after a backoff, and is
+        abandoned (logged `job_dead_hook_abandoned`) after DEAD_HOOK_MAX_FAILURES."""
+        values: dict[str, Any] = {":deadp": keys.GSI_DEAD, ":now": self._now(), ":one": 1}
+        if failed:
+            due = keys.job_dead_gsi3(
+                self._clock.now() + timedelta(seconds=DEAD_HOOK_RETRY_SECONDS), job_id
+            )
+            try:
+                after = await self._table.update(
+                    keys.job(job_id),
+                    update="SET GSI3SK = :due, updated_at = :now "
+                    "ADD dead_hook_failures :one, row_version :one",
+                    condition="GSI3PK = :deadp",
+                    values={**values, ":due": due["GSI3SK"]},
+                    on_failed=_Stale(None),
+                    return_values="ALL_NEW",
+                )
+            except _Stale:
+                return
+            failures = decode_int(after.get("dead_hook_failures"), "dead_hook_failures")
+            if failures < DEAD_HOOK_MAX_FAILURES:
+                return
+            _log.error("job_dead_hook_abandoned", job_id=str(job_id), failures=failures)
+        with contextlib.suppress(_Stale):
+            await self._table.update(
+                keys.job(job_id),
+                update="SET updated_at = :now ADD row_version :one REMOVE GSI3PK, GSI3SK",
+                condition="GSI3PK = :deadp",
+                values=values,
+                on_failed=_Stale(None),
+                return_values="NONE",
+            )
+
+    def _now(self) -> str:
+        return encode_timestamp(self._clock.now())
 
     async def _reread(self, rows: list[Item]) -> list[tuple[uuid.UUID, Item | None]]:
         """The job items behind GSI3 hits, strongly consistent, in one `BatchGetItem` per 100
@@ -554,4 +713,9 @@ def _code(exc: ClientError | BotoCoreError) -> str:
     return type(exc).__name__
 
 
-__all__ = ["EXHAUSTED", "DynamoSqsJobQueue"]
+def job_id_of_message(body: object) -> uuid.UUID | None:
+    """The job id a queue (or DLQ) message names, or None for anything else."""
+    return _job_id(body)
+
+
+__all__ = ["EXHAUSTED", "DynamoSqsJobQueue", "job_id_of_message"]

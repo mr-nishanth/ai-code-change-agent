@@ -64,7 +64,44 @@ with attempts no worker is running (`changes show <attempt-id>`, job not `RUNNIN
 that container: `docker rm -f $(docker ps -q --filter label=aica.attempt=<attempt-id>)`. Never remove
 a sandbox whose attempt is still running.
 
+A DEAD job no longer leaves its attempt running in the database: its on_dead hook marks the attempt
+FAILED (`job_attempts_exhausted`), so such a sandbox belongs to a FAILED attempt.
+
 Heavy Docker or Floci tests run only when `docker ps --filter label=aica.role=agent-sandbox` is empty.
+
+## Stuck jobs, the DLQ and pending Jira reports
+
+```bash
+uv run ai-code-change jobs dlq                    # peek: job id, kind, status, attempts, last error
+uv run ai-code-change reports list --state PENDING --limit 200  # among the newest 200
+uv run ai-code-change reports list --state FAILED_PERMANENT  # reports Jira refused or retries ran out
+uv run ai-code-change reports show attempt-<attempt-id>      # one report (never its text)
+```
+
+- `jobs dlq` never removes a message. A DLQ message of a job that is still QUEUED or RUNNING needs no
+  action: the worker's sweep re-sends a message for that job once it is overdue, and the claim either
+  runs it or records it DEAD. A DLQ message of a terminal job (SUCCEEDED or DEAD) can be redriven or
+  purged safely; the claim deletes it and runs nothing.
+- Worker log events: `job_claimed`, `job_succeeded`, `job_failed` (retry scheduled), `job_dead`
+  (with `reason`), `job_dead_recovered` (a DEAD job found by the dispatcher, hook run now),
+  `job_dead_hook_failed` / `job_dead_hook_abandoned`, `job_lease_released` and
+  `job_shutdown_cancelled` (shutdown), `jira_report_retry_scheduled`, `jira_report_posted`,
+  `jira_report_failed_permanent`. Identifiers and codes only, never payloads, Story or comment text.
+- `jobs dlq` adds one to each peeked message's receive count on the DLQ (harmless: the DLQ has no
+  redrive policy of its own).
+- Also in the log: `job_maintenance_budget_exceeded` (a maintenance round of dead-job hooks and
+  report retries ran out of its 60 s; the rest waits for the next round, the relay is not affected).
+- A worker stops on SIGINT or SIGTERM within one SQS long poll (at most 20 s) plus a 30 s grace for a
+  running job; a second signal cancels the job at once (its lease is released, so a restarted worker
+  resumes it immediately); a third signal, or 90 s after the first, exits the process at once.
+- Why a worker once ignored SIGINT for minutes (PID 37638): three things stacked. The SIGINT handler
+  only set the stop event, and every further Ctrl-C did the same, so nothing could force an exit; the
+  in-flight workflow job (model calls, sandbox validation) was, by design then, processed to the end;
+  and after the worker returned, `asyncio.run` waits up to 300 s for executor threads still blocked
+  in a Docker or AWS call. The grace, the second-signal cancel and the hard deadline now bound all
+  three.
+- DEAD jobs written before the dead-job hooks existed are not listed by them; see the migration note
+  in [DYNAMODB-DATA-MODEL.md 8.5](aws/DYNAMODB-DATA-MODEL.md).
 
 ## lazydocker (terminal UI)
 

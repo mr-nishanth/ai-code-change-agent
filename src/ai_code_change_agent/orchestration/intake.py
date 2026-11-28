@@ -30,7 +30,7 @@ from ai_code_change_agent.application.repositories.resolver import (
     build_resolution_request,
 )
 from ai_code_change_agent.core.logging import get_logger
-from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
+from ai_code_change_agent.domain.changes.errors import ChangeNotFoundError, InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import CodeChangeRequest
 from ai_code_change_agent.domain.changes.multirepo import DeclarationError, parse_story
 from ai_code_change_agent.domain.changes.states import AttemptStatus
@@ -64,10 +64,12 @@ class IntakeHandler:
         resolver: RepositoryResolver,
         start: Launch,
         repository_field_configured: bool,
-        reporter: Any = None,  # JiraOutcomeReporter: one comment when no attempt can start
+        reporter: Any = None,  # DurableJiraReporter: one comment when no attempt can start
         coordinator: Coordinator | None = None,  # multi-repository Stories
+        recovery: Any = None,  # dead_jobs.AttemptRecovery: ends an attempt a dead intake left
     ) -> None:
         self._coordinator = coordinator
+        self._recovery = recovery
         self._reporter = reporter
         self._changes = changes
         self._jira = jira
@@ -133,16 +135,66 @@ class IntakeHandler:
         await self._start(attempt.id)
 
     async def on_dead(self, job: Job) -> None:
-        """The worker's hook for an intake job it recorded DEAD for any reason (a refusal, or a
-        transient Jira error or an unexpected exception on the last attempt): no attempt will
-        start from this intake, so the request ends BLOCKED instead of RECEIVED (idempotent; a
-        request that already has an attempt keeps its status). No Jira comment: the cause is
-        only a code in the job."""
+        """The worker's hook for an intake job that ended DEAD by any path (a refusal, a transient
+        Jira error or an unexpected exception on the last attempt, or a worker that died on the
+        last attempt). Idempotent:
+
+        * no attempt was started: the request ends BLOCKED instead of RECEIVED; when this hook is
+          what blocked it (not a refusal, which reported itself), Jira gets one "could not start"
+          comment with the job's code, through the same per-request report as a refusal;
+        * the intake died while running the workflow it started: that attempt ends
+          (`AttemptRecovery.end_attempt`: FAILED with `job_attempts_exhausted`, reported once);
+        * a multi-repository parent it created advances (children run as their own jobs)."""
         try:
             request_id = uuid.UUID(str(job.payload["code_change_request_id"]))
         except (KeyError, ValueError):
             return
-        await self._changes.refuse_request(request_id)
+        try:
+            request = await self._changes.get_request(request_id)
+        except ChangeNotFoundError:
+            return
+        if request.current_attempt_id is not None:
+            if self._recovery is not None:
+                await self._recovery.end_attempt(request.current_attempt_id, job.last_error)
+            return
+        if self._coordinator is not None:
+            found = await self._coordinator.store.find_by_request(request_id)
+            if found is not None:
+                await self._coordinator.advance(found[0].id)
+                return
+        if request.status != "RECEIVED":
+            return  # refused (and reported) already
+        code = job.last_error or "job_dead"
+        text = _not_started(
+            request.jira_issue_key,
+            f"intake failed on every attempt ({code}); no attempt was started",
+            advice="not automatically; an operator must check the cause and resubmit",
+        )
+        report_id = intake_report_id(request_id)
+        # the report is stored before the request is blocked: a failure in between leaves either
+        # nothing changed (the hook runs again) or a stored report the worker's retry delivers
+        await self._prepare(request.jira_issue_key, text, report_id)
+        if await self._changes.refuse_request(request_id):
+            if self._reporter is not None:
+                await self._reporter.report(request.jira_issue_key, text, report_id=report_id)
+        else:
+            await self._cancel_unless_blocked(request_id, report_id)
+
+    async def _cancel_unless_blocked(self, request_id: uuid.UUID, report_id: str) -> bool:
+        """Blocking was refused: when the request is not BLOCKED either, an attempt started
+        meanwhile, so the stored "no attempt was started" report must never be delivered (a
+        BLOCKED request was refused by another run, whose report keeps the same id)."""
+        if (await self._changes.get_request(request_id)).status == AttemptStatus.BLOCKED.value:
+            return False
+        cancel = getattr(self._reporter, "cancel", None)
+        if cancel is not None:
+            await cancel(report_id)
+        return True  # an attempt exists: nothing may say none was started
+
+    async def _prepare(self, issue_key: str, text: str, report_id: str) -> None:
+        prepare = getattr(self._reporter, "prepare", None)
+        if prepare is not None:
+            await prepare(issue_key, text, report_id=report_id)
 
     async def _refused(
         self,
@@ -151,23 +203,40 @@ class IntakeHandler:
         issue_key: str | None = None,
         text: str | None = None,
     ) -> JobFailedError:
-        """The intake job ends DEAD with `code`, so no attempt will start from it: the request
-        becomes BLOCKED (idempotent) before Jira is told, so a storage failure here retries the
-        job without posting a comment. A request already BLOCKED when this run began was refused
+        """The intake job ends DEAD with `code`, so no attempt will start from it: the report is
+        stored (not posted), then the request becomes BLOCKED (idempotent), then Jira is told, so
+        a failure at any point either retries the job or leaves a stored report the worker's retry
+        delivers; it is never lost. A request already BLOCKED when this run began was refused
         and reported by an earlier run (its lease expired before the job failed): no second
-        comment. At most once, best effort: two overlapping runs after a lease expiry may both
-        post, and a Jira post that fails after the request is BLOCKED is not retried."""
+        comment. The report is durable and keyed per request (`intake-<rid>`): a transient Jira
+        failure is retried and an overlapping run never posts it twice."""
+        report_id = intake_report_id(request.id)
+        tells = text is not None and issue_key is not None and self._reporter is not None
+        if tells and request.status != AttemptStatus.BLOCKED.value:
+            assert text is not None and issue_key is not None  # noqa: S101 - checked above
+            await self._prepare(issue_key, text, report_id)  # stored before BLOCKED is written
         changed = await self._changes.refuse_request(request.id)
+        unchanged = not changed and tells and request.status != AttemptStatus.BLOCKED.value
+        if unchanged and await self._cancel_unless_blocked(request.id, report_id):
+            return JobFailedError(code)
         first = changed or request.status != AttemptStatus.BLOCKED.value
-        if first and text is not None and issue_key is not None and self._reporter is not None:
-            await self._reporter.report(issue_key, text)
+        if first and tells:
+            assert text is not None and issue_key is not None  # noqa: S101 - checked above
+            await self._reporter.report(issue_key, text, report_id=report_id)
         return JobFailedError(code)
 
 
-def _not_started(issue_key: str, reason: str) -> str:
+def intake_report_id(request_id: uuid.UUID) -> str:
+    """The one report a Story gets when no attempt starts from its intake (refusal or DEAD job)."""
+    return f"intake-{request_id}"
+
+
+def _not_started(
+    issue_key: str, reason: str, *, advice: str = "no, the cause must be fixed first"
+) -> str:
     return (
         f"AI Code Change Agent could not start {issue_key}.\nReason: {reason}.\n"
-        "Retryable: no, the cause must be fixed first."
+        f"Retryable: {advice}."
     )
 
 

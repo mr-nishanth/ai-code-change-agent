@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+MAX_SHUTDOWN_REFUNDS = 3  # shutdown cancellations that give a job its attempt back
+
 
 class JobStatus(StrEnum):
     QUEUED = "QUEUED"
@@ -21,6 +23,7 @@ class Job:
     payload: dict[str, Any]
     attempts: int  # including the current one
     max_attempts: int
+    last_error: str | None = None  # the code a DEAD job ended with (on_dead hooks only)
 
 
 class JobRetryableError(Exception):
@@ -82,4 +85,28 @@ class JobQueue(Protocol):
     async def sweep(self) -> int:
         """Re-deliver non-terminal jobs whose message was lost (overdue by more than a grace
         period). Returns how many were re-sent; a queue that cannot lose messages returns 0."""
+        ...
+
+    async def release_lease(
+        self, job_id: uuid.UUID, owner: str, *, refund: bool, bounded: bool = False
+    ) -> bool:
+        """Give a claimed job back at once (worker shutdown): its lease ends now, so the next
+        receipt reclaims it instead of waiting for the lease to run out. `refund` also returns
+        the attempt the claim counted: unconditionally for a job claimed during the stop (its
+        handler never started); with `bounded` (a handler cancelled after the grace) only while
+        the job was refunded fewer than MAX_SHUTDOWN_REFUNDS times, else the lease is released and
+        the attempt counts. False when `owner` no longer holds it."""
+        ...
+
+    async def dead_pending(self) -> list[Job]:
+        """DEAD jobs whose kind's on_dead hook has not run yet, whichever path recorded them DEAD
+        (the worker's last failure, or a claim that found the last attempt's lease expired), with
+        `last_error` set. Each listed job is claimed for the caller (a second caller does not get
+        it until the claim lapses). A job recorded DEAD by this worker's own `fail` is claimed by
+        that write (the worker runs its hook at once) and listed only after it lapses."""
+        ...
+
+    async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
+        """The DEAD job's hook ran (or it has none): it leaves `dead_pending`. With `failed` the
+        hook raised: it is listed again after a backoff, at most a bounded number of times."""
         ...
