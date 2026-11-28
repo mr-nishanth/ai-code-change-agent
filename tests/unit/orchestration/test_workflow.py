@@ -94,6 +94,28 @@ async def test_a_rejected_plan_ends_the_workflow(tmp_path: Any) -> None:
     await rig.runner.resume(rig.attempt_id)
     assert await status(rig) is S.REJECTED
     assert [s.writable for s in rig.sandboxes.started] == [False]  # never implemented
+    ((_, text),) = rig.reporter.reports
+    assert "REJECTED at the plan approval gate" in text
+    assert "Reason: plan rejected by an operator" in text
+    assert "automatic policy" not in text and "Reason: rejected\n" not in text
+    assert "Retryable: no, an operator rejected" in text
+
+
+async def test_an_operator_rejection_at_the_final_gate_names_that_gate(tmp_path: Any) -> None:
+    rig = await make_rig(tmp_path, delivery=False)
+    await rig.runner.start(rig.attempt_id)
+    await approve(rig, ApprovalGate.PLAN)
+    await rig.runner.resume(rig.attempt_id)
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.manifest_sha256 is not None
+    await rig.deps.changes.decide(
+        att.id, ApprovalGate.FINAL, att.manifest_sha256, ApprovalDecision.REJECTED, "cli:op"
+    )
+    await rig.runner.resume(rig.attempt_id)
+    assert await status(rig) is S.REJECTED and rig.publisher.requests == []
+    ((_, text),) = rig.reporter.reports
+    assert "REJECTED at the final approval gate" in text
+    assert "Reason: final change rejected by an operator" in text
 
 
 async def test_a_profile_without_the_python_toolchain_blocks_the_attempt(tmp_path: Any) -> None:

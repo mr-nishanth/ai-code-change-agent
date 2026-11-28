@@ -939,20 +939,37 @@ class CodeChangeSteps:
             for m in await self._d.artifacts.list(self._scope(a))
             if m.kind is ArtifactKind.AUTOMATIC_DECISION
         ]
-        if a.status is S.REJECTED and decisions:
+        stage = {
+            S.BLOCKED: "preparation",
+            S.REJECTED: "automatic policy gate",
+        }.get(a.status) or next((s for p, s in _STAGES if reason.startswith(p)), "workflow")
+        rejection = None
+        if a.status is S.REJECTED:
+            rejected = [
+                p
+                for p in await self._d.changes.approvals(a.id)
+                if p.decision is ApprovalDecision.REJECTED
+            ]
+            rejection = max(rejected, key=lambda p: p.decided_at, default=None)
+        operator = rejection is not None and rejection.actor != AUTOMATIC_ACTOR
+        if operator and rejection is not None:
+            # An operator's decision (changes reject): name the gate; the CLI records no reason.
+            subject = "plan" if rejection.gate is ApprovalGate.PLAN else "final change"
+            stage = f"{rejection.gate.value.lower()} approval gate"
+            reason = f"{subject} rejected by an operator (no rejection reason is recorded)"
+        elif a.status is S.REJECTED and decisions:
             latest = max(decisions, key=lambda m: (m.created_at, m.id))
             doc = await load_verified(
                 self._d.artifacts, self._scope(a), latest.id, latest.sha256, AutomaticDecisionDoc
             )
             reason = f"{doc.gate} policy rejected: " + "; ".join(doc.reasons)[:600]
-        stage = {
-            S.BLOCKED: "preparation",
-            S.REJECTED: "automatic policy gate",
-        }.get(a.status) or next((s for p, s in _STAGES if reason.startswith(p)), "workflow")
+            stage = f"automatic {doc.gate.lower()} policy gate"
         retryable = any(word in reason for word in _RETRYABLE)
         advice = (
             "yes, after the temporary cause is resolved"
             if retryable
+            else "no, an operator rejected this attempt"
+            if operator
             else "no, the cause must be fixed first"
         )
         request = await self._d.changes.get_request(a.request_id)
