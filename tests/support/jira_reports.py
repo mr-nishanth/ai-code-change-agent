@@ -172,6 +172,16 @@ class MemoryReportStore:
         item.update(token=None, due=None if settled else (next_retry_at or self.now()))
         return True
 
+    async def cancel(self, report_id: str, error: str) -> bool:
+        item = self.items.get(report_id)
+        if item is None or item["record"].state is not ReportState.PENDING:
+            return False
+        item["record"] = replace(
+            item["record"], state=ReportState.FAILED_PERMANENT, last_error=error, next_retry_at=None
+        )
+        item.update(due=None)
+        return True
+
     async def due(self, limit: int) -> list[str]:
         now = self.now()
         ready = [(i["due"], k) for k, i in self.items.items() if i["due"] is not None]

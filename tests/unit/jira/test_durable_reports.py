@@ -236,3 +236,14 @@ async def test_a_long_text_keeps_its_marker_and_a_report_without_id_posts_once()
     assert rig.jira.posts == 2 and "DurableJiraReporter" in repr(rig.reporter)
     assert (await rig.reporter.find_comment(KEY, marker("attempt-1"))).status == "POSTED"
     assert (await rig.reporter.post_comment(KEY, "w")).status == "POSTED"
+
+
+async def test_a_parent_report_always_looks_for_its_marker_before_a_retry_posts() -> None:
+    """A parent report stored but never delivered (or carried over from before durable
+    reporting) may already be on the issue: every maintenance round looks first."""
+    jira = CommentJira()
+    jira.comments.append((f"/rest/api/3/issue/{KEY}/comment", "old\nReport ID: aica-report-p2-r0"))
+    rig = Rig(jira)
+    assert await rig.reporter.prepare(KEY, "x", report_id="parent-p2-r0")
+    assert await rig.reporter.retry_due() == 1
+    assert (await rig.state("parent-p2-r0")).state is ReportState.POSTED and jira.posts == 0

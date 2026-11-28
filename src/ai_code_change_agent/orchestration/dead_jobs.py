@@ -70,7 +70,7 @@ class AttemptRecovery:
                          status=attempt.status.value, reason=reason)  # fmt: skip
             code = DEAD_JOB_CODE
             if attempt.status is AttemptStatus.DELIVERING:
-                if self._delivered is not None and await self._delivered(attempt_id):
+                if await self._pull_request_created(attempt_id):
                     with contextlib.suppress(InvalidTransitionError):
                         attempt = await self._changes.transition(
                             attempt_id, AttemptStatus.REPORTING
@@ -95,6 +95,17 @@ class AttemptRecovery:
                 return  # an old child attempt: only the parent's aggregated comment reports
         if attempt.terminal:
             await self._report(attempt_id)
+
+    async def _pull_request_created(self, attempt_id: uuid.UUID) -> bool:
+        """Whether the delivery result says the PR exists; unreadable counts as unknown."""
+        if self._delivered is None:
+            return False
+        try:
+            return await self._delivered(attempt_id)
+        except Exception as exc:  # an unreadable result: delivery_outcome_unknown, never a guess
+            _log.warning("delivery_result_unreadable", attempt_id=str(attempt_id),
+                         code=type(exc).__name__)  # fmt: skip
+            return False
 
     async def resume_dead(self, job: Job) -> None:
         """on_dead of `code_change.resume`: the attempt it was resuming ends."""

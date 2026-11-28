@@ -89,3 +89,18 @@ async def test_a_permanent_failure_is_recorded_once(app_table: Table) -> None:
         ReportState.FAILED_PERMANENT,
         "http_401",
     )
+
+
+async def test_cancel_settles_only_a_pending_report(app_table: Table) -> None:
+    jira = CommentJira()
+    reporter, store, clock = rig(app_table, jira)
+    assert await reporter.prepare(KEY, "x", report_id="intake-e")
+    assert await reporter.cancel("intake-e")
+    rec = await store.get("intake-e")
+    assert rec is not None and (rec.state, rec.last_error) == (
+        ReportState.FAILED_PERMANENT,
+        "report_cancelled",
+    )
+    assert not await reporter.cancel("intake-e")  # settled: nothing to cancel
+    clock.advance(10_000)
+    assert await store.due(10) == [] and jira.posts == 0

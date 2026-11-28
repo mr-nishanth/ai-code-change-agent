@@ -174,8 +174,22 @@ class IntakeHandler:
         # the report is stored before the request is blocked: a failure in between leaves either
         # nothing changed (the hook runs again) or a stored report the worker's retry delivers
         await self._prepare(request.jira_issue_key, text, report_id)
-        if await self._changes.refuse_request(request_id) and self._reporter is not None:
-            await self._reporter.report(request.jira_issue_key, text, report_id=report_id)
+        if await self._changes.refuse_request(request_id):
+            if self._reporter is not None:
+                await self._reporter.report(request.jira_issue_key, text, report_id=report_id)
+        else:
+            await self._cancel_unless_blocked(request_id, report_id)
+
+    async def _cancel_unless_blocked(self, request_id: uuid.UUID, report_id: str) -> bool:
+        """Blocking was refused: when the request is not BLOCKED either, an attempt started
+        meanwhile, so the stored "no attempt was started" report must never be delivered (a
+        BLOCKED request was refused by another run, whose report keeps the same id)."""
+        if (await self._changes.get_request(request_id)).status == AttemptStatus.BLOCKED.value:
+            return False
+        cancel = getattr(self._reporter, "cancel", None)
+        if cancel is not None:
+            await cancel(report_id)
+        return True  # an attempt exists: nothing may say none was started
 
     async def _prepare(self, issue_key: str, text: str, report_id: str) -> None:
         prepare = getattr(self._reporter, "prepare", None)
@@ -202,6 +216,9 @@ class IntakeHandler:
             assert text is not None and issue_key is not None  # noqa: S101 - checked above
             await self._prepare(issue_key, text, report_id)  # stored before BLOCKED is written
         changed = await self._changes.refuse_request(request.id)
+        unchanged = not changed and tells and request.status != AttemptStatus.BLOCKED.value
+        if unchanged and await self._cancel_unless_blocked(request.id, report_id):
+            return JobFailedError(code)
         first = changed or request.status != AttemptStatus.BLOCKED.value
         if first and tells:
             assert text is not None and issue_key is not None  # noqa: S101 - checked above

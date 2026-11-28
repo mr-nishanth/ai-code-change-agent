@@ -325,3 +325,71 @@ async def test_the_unknown_delivery_comment_says_a_pull_request_may_exist(tmp_pa
     ((_, text),) = rig.reporter.reports
     assert "may exist" in text and "No pull request was created" not in text
     assert "at the delivery stage" in text
+
+
+async def test_a_dead_intake_whose_request_got_an_attempt_meanwhile_cancels_its_report() -> None:
+    """The report is stored before the request is blocked; when blocking is refused because an
+    attempt started meanwhile, the stored "no attempt was started" report is cancelled."""
+    from ai_code_change_agent.application.jira.reports import DurableJiraReporter, ReportState
+
+    changes, jira = MemoryChanges(), CommentJira()
+    req = changes.add_request(repository_id=uuid.uuid4(), profile_version_id=uuid.uuid4())
+    service = changes.service()
+    real = service.refuse_request
+
+    async def raced(request_id: uuid.UUID) -> bool:
+        await service.start_attempt(request_id)  # a redelivered intake started one first
+        return await real(request_id)
+
+    service.refuse_request = raced  # type: ignore[method-assign]
+    store = MemoryReportStore()
+    handler = durable_intake(changes, jira)
+    handler._changes = service
+    handler._reporter = DurableJiraReporter(jira.reporter(), store)
+    await handler.on_dead(dead("code_change.intake", code_change_request_id=req.id))
+    cancelled = await store.get(intake_report_id(req.id))
+    assert cancelled is not None and cancelled.state is ReportState.FAILED_PERMANENT
+    assert cancelled.last_error == "report_cancelled"
+    assert await handler._reporter.retry_due() == 0 and jira.comments == []
+
+
+async def test_an_unreadable_delivery_result_counts_as_an_unknown_delivery() -> None:
+    changes, rec = MemoryChanges(), Recorded()
+    _, attempt = await attempt_in(changes, S.DELIVERING)
+
+    async def broken(_: uuid.UUID) -> bool:
+        raise RuntimeError("artifact store down")
+
+    hooks = AttemptRecovery(changes=changes.service(), report=rec.report, complete=rec.complete,
+                            delivered=broken)  # fmt: skip
+    await hooks.end_attempt(attempt.id)
+    after = await changes.service().get_attempt(attempt.id)
+    assert after.status is S.FAILED and after.failure_code == "delivery_outcome_unknown"
+
+
+async def test_a_refusal_whose_request_got_an_attempt_meanwhile_posts_nothing() -> None:
+    from ai_code_change_agent.application.jira.reports import DurableJiraReporter
+    from tests.support.workflow import UnregisteredRepositoryJira
+
+    changes, jira = MemoryChanges(), CommentJira()
+    req = changes.add_request(repository_id=uuid.uuid4(), profile_version_id=uuid.uuid4())
+    service = changes.service()
+    real = service.refuse_request
+
+    async def raced(request_id: uuid.UUID) -> bool:
+        await service.start_attempt(request_id)
+        return await real(request_id)
+
+    service.refuse_request = raced  # type: ignore[method-assign]
+    handler = IntakeHandler(
+        changes=service,
+        jira=UnregisteredRepositoryJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=lambda _: None,  # type: ignore[arg-type,return-value]
+        repository_field_configured=False,
+        reporter=DurableJiraReporter(jira.reporter(), MemoryReportStore()),
+    )
+    payload = Job(uuid.uuid4(), "code_change.intake", {"code_change_request_id": str(req.id)}, 1, 3)
+    with pytest.raises(JobFailedError):
+        await handler(payload)
+    assert jira.comments == [] and await handler._reporter.retry_due() == 0

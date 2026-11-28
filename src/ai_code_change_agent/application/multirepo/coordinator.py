@@ -170,6 +170,8 @@ class Coordinator:
         self._max = max_repositories
         self._job_attempts = max_job_attempts
         self._cost = cost_of_issue
+        if hasattr(reporter, "on_settled"):  # durable reporting: keep the parent projection fresh
+            reporter.on_settled = self.report_settled
 
     @property
     def store(self) -> MultiRepoStore:
@@ -388,23 +390,39 @@ class Coordinator:
         return state
 
     async def settle_report(self, parent_id: uuid.UUID) -> None:
-        """on_dead of the report job: its projection must not stay IN_PROGRESS (a crashed run) or
-        RETRYABLE_FAILURE for good. It takes the claim whatever its age and records the durable
-        report's state (still pending: RETRYABLE_FAILURE with `report_delivery_pending`; the
-        durable reporter keeps retrying, and `reports list` shows it)."""
+        """on_dead of the report job: a projection left IN_PROGRESS by a crashed run (once its
+        claim is stale) or RETRYABLE_FAILURE takes the durable report's state (still pending:
+        RETRYABLE_FAILURE with `report_delivery_pending`; `report_settled` refreshes it when the
+        durable reporter posts it later). A live claim and a settled projection are left alone."""
         parent, _ = await self._store.load(parent_id)
-        claim = await self._store.claim_report(parent.id, 0)
-        if claim is None:
+        stored = await self._reporter.record(parent_report_id(parent.id, parent.report_round))
+        await self._project(parent.id, stored)
+
+    async def report_settled(self, report_id: str, record: Any) -> None:
+        """The durable reporter settled a report (POSTED / FAILED_PERMANENT), possibly long after
+        the parent's own run gave up: refresh the projection of the current round's report."""
+        if not report_id.startswith("parent-"):
             return
-        stored = await self._reporter.record(parent_report_id(parent.id, claim.round))
+        try:
+            parent_id = uuid.UUID(report_id.removeprefix("parent-").rsplit("-r", 1)[0])
+        except ValueError:
+            return
+        parent, _ = await self._store.load(parent_id)
+        if parent_report_id(parent.id, parent.report_round) == report_id:
+            await self._project(parent.id, record)
+
+    async def _project(self, parent_id: uuid.UUID, stored: Any) -> None:
+        claim = await self._store.claim_report(parent_id, REPORT_STALE_SECONDS)
+        if claim is None:  # SUCCEEDED / PERMANENT / DISABLED, or a live run holds it
+            return
         state = ReportState.RETRYABLE_FAILURE
         error: str | None = "report_delivery_pending"
         comment_id = None
         if stored is not None and str(stored.state) == "POSTED":
             state, error, comment_id = ReportState.SUCCEEDED, None, stored.comment_id
         elif stored is not None and str(stored.state) == "FAILED_PERMANENT":
-            state, error = ReportState.PERMANENT_FAILURE, stored.last_error
-        await self._store.finish_report(parent.id, state, comment_id=comment_id, error=error)
+            state, error = ReportState.PERMANENT_FAILURE, (stored.last_error or "")[:120] or None
+        await self._store.finish_report(parent_id, state, comment_id=comment_id, error=error)
 
     async def summary(
         self, parent: Parent, children: list[Child], issue_key: str, *, marker: str | None = None

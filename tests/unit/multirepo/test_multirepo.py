@@ -1664,3 +1664,35 @@ async def test_a_dead_report_job_with_a_pending_report_says_so() -> None:
     settled = store.parents[parent.id]
     assert settled.jira_report == "RETRYABLE_FAILURE"
     assert settled.jira_report_error == "report_delivery_pending"
+
+
+async def test_settle_report_leaves_a_live_claim_and_a_succeeded_projection_alone() -> None:
+    coordinator, store, _, _reporter, parent = await finished_parent()
+    assert store.parents[parent.id].jira_report == "SUCCEEDED"
+    await coordinator.settle_report(parent.id)  # never overwrites SUCCEEDED
+    assert store.parents[parent.id].jira_report == "SUCCEEDED"
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="IN_PROGRESS")
+    store.stale = False  # a live run holds the claim
+    await coordinator.settle_report(parent.id)
+    assert store.parents[parent.id].jira_report == "IN_PROGRESS"
+
+
+async def test_settle_report_truncates_a_permanent_error() -> None:
+    long = CommentResult(R.PERMANENT, http_status=400, error="x" * 300)
+    coordinator, store, _, _, parent = await finished_parent([long])
+    store.parents[parent.id] = replace(store.parents[parent.id], jira_report="RETRYABLE_FAILURE")
+    await coordinator.settle_report(parent.id)
+    settled = store.parents[parent.id]
+    assert (
+        settled.jira_report == "PERMANENT_FAILURE" and len(settled.jira_report_error or "") <= 120
+    )
+
+
+async def test_the_parent_projection_follows_a_report_the_durable_retry_posts_later() -> None:
+    flaky = [CommentResult(R.RETRYABLE, http_status=503, error="http_503")]
+    coordinator, store, _, reporter, parent = await finished_parent(flaky)
+    assert store.parents[parent.id].jira_report == "RETRYABLE_FAILURE"
+    assert await coordinator._reporter.retry_due() == 1  # the worker's maintenance round
+    refreshed = store.parents[parent.id]
+    assert refreshed.jira_report == "SUCCEEDED" and refreshed.jira_comment_id == "10001"
+    assert len(reporter.texts) == 1

@@ -238,7 +238,7 @@ ahead, which is its claim on the hook run. The worker's maintenance task (its ow
 relay, on the sweep cadence `JOB_SWEEP_SECONDS`, each round bounded by 60 s) lists due `DEADHOOK`
 jobs (`dead_pending`, `job_dead_recovered` in the log), claims each with a conditional
 `SET GSI3SK = now + 300 s WHERE GSI3SK = <seen>` (two workers never run the same hook at once) and
-runs the hook for the rest. After the hook the job leaves GSI3 (`dead_settled`); a hook that raises is listed
+runs the hook for the rest. A hook cut off by the round's budget counts as a failed run. After the hook the job leaves GSI3 (`dead_settled`); a hook that raises is listed
 again after 300 s, at most 5 times (`dead_hook_failures`, then `job_dead_hook_abandoned`). Hooks are
 idempotent (conditional writes), so an overlap of the two paths changes nothing twice:
 
@@ -290,7 +290,11 @@ started after 45 s. The text ends with `Report ID: aica-report-<report_id>`; any
 repeat an earlier one is preceded by a search of the issue's newest 100 comments, written by the
 reporting account (`/myself`), for that marker. The multi-repository parent's aggregated comment is
 the report `parent-<pid>-r<round>` with its historical marker `aica-report-<pid>-r<round>`; the
-parent item's `jira_report` fields (M9-M10) are a projection of it. Residual duplicate windows: see
+parent item's `jira_report` fields (M9-M10) are a projection of it, refreshed whenever the report
+settles, whoever delivered it (`on_settled`); a maintenance retry of a parent report always looks
+for its marker before posting. A stored report whose premise no longer holds (a dead intake's "no
+attempt was started" while an attempt started meanwhile) is cancelled: FAILED_PERMANENT
+`report_cancelled`, never posted. Residual duplicate windows: see
 [AUTOMATED-PIPELINE.md](../AUTOMATED-PIPELINE.md#jira-reporting).
 
 ## 9. LangGraph checkpointer

@@ -183,6 +183,30 @@ class DynamoJiraReportStore:
             return False
         return True
 
+    async def cancel(self, report_id: str, error: str) -> bool:
+        now = self._clock.now()
+        try:
+            await self._table.update(
+                keys.jira_report(report_id),
+                update="SET #state = :failed, last_error = :error, updated_at = :now, "
+                "expires_at = :ttl ADD row_version :one REMOVE GSI3PK, GSI3SK, next_retry_at",
+                condition="#state = :pending",
+                names=_N,
+                values={
+                    ":failed": ReportState.FAILED_PERMANENT.value,
+                    ":pending": ReportState.PENDING.value,
+                    ":error": error,
+                    ":now": encode_timestamp(now),
+                    ":ttl": encode_epoch_seconds(now + timedelta(days=RETENTION_DAYS)),
+                    ":one": 1,
+                },
+                on_failed=_Refused(),
+                return_values="NONE",
+            )
+        except _Refused:
+            return False
+        return True
+
     async def due(self, limit: int) -> list[str]:
         now = self._clock.now()
         rows = await self._table.query(

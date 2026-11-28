@@ -128,6 +128,11 @@ class JiraReportStore(Protocol):
         """The newest reports, newest first (operator CLI)."""
         ...
 
+    async def cancel(self, report_id: str, error: str) -> bool:
+        """Settle a PENDING report as FAILED_PERMANENT with `error` without posting it; False when
+        it is not PENDING (posted, settled, or a delivery holds it)."""
+        ...
+
 
 def marker(report_id: str) -> str:
     """The id written into the comment. A multi-repository parent's report (`parent-<pid>-r<n>`)
@@ -164,6 +169,9 @@ class DurableJiraReporter:
         tries_per_round: int = TRIES_PER_ROUND,
     ) -> None:
         self._tries = tries_per_round
+        # called with (report_id, record) once a report is POSTED or FAILED_PERMANENT, whoever
+        # delivered it (the multi-repository coordinator refreshes the parent's projection)
+        self.on_settled: Callable[[str, ReportRecord], Awaitable[None]] | None = None
         self._reporter = reporter
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
@@ -221,6 +229,14 @@ class DurableJiraReporter:
     async def record(self, report_id: str) -> ReportRecord | None:
         return await self._store.get(report_id)
 
+    async def cancel(self, report_id: str) -> bool:
+        """Never deliver a stored report whose premise no longer holds (an intake that was going to
+        say "no attempt was started" while one started): FAILED_PERMANENT `report_cancelled`."""
+        cancelled = await self._store.cancel(report_id, "report_cancelled")
+        if cancelled:
+            _log.info("jira_report_cancelled", report_id=report_id)
+        return cancelled
+
     async def retry_due(self) -> int:
         """Deliver due reports (the worker's maintenance round): at most DUE_BATCH, one POST each
         (no in-round pauses), and none started after RETRY_BUDGET_SECONDS; returns how many."""
@@ -232,7 +248,8 @@ class DurableJiraReporter:
         for report_id in await self._store.due(DUE_BATCH):
             if loop.time() >= deadline:
                 break
-            await self.deliver(report_id, tries=1)
+            # a parent report may predate durable reporting (or be stored, never delivered): look
+            await self.deliver(report_id, tries=1, reconcile=report_id.startswith("parent-"))
             tried += 1
         return tried
 
@@ -323,6 +340,13 @@ class DurableJiraReporter:
             log.warning("jira_report_retry_scheduled", next_retry_at=str(retry_at), **fields)
         else:
             log.info("jira_report_posted", comment_id=result.comment_id, **fields)
+        if recorded and state is not ReportState.PENDING and self.on_settled is not None:
+            try:
+                stored = await self._store.get(report_id)
+                if stored is not None:
+                    await self.on_settled(report_id, stored)
+            except Exception as exc:  # the report is settled; a projection lags at worst
+                log.warning("jira_report_settled_hook_failed", code=type(exc).__name__)
         return state
 
 
