@@ -36,7 +36,11 @@ from ai_code_change_agent.application.git_providers.delivery import (
     DeliveryRequest,
     DeliveryTarget,
 )
-from ai_code_change_agent.application.jira.comment_lines import clarification_detail, safe_line
+from ai_code_change_agent.application.jira.comment_lines import (
+    clarification_detail,
+    safe_line,
+    validation_detail,
+)
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jira.story import story_of
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
@@ -1090,19 +1094,7 @@ class CodeChangeSteps:
         report = await load_verified(
             self._d.artifacts, self._scope(a), latest[0], latest[1], ValidationReport
         )
-        lines = [
-            f"{c.kind.value}: {' '.join((c.detail or c.status.value).split())[:300]}"
-            for c in report.checks
-            if c.status.value == "FAILED"
-        ]
-        lines += [
-            f"command {c.command_id}: {c.status}" + (f" ({c.reason})" if c.reason else "")
-            for c in report.commands
-            if c.status != "PASSED"
-        ]
-        if not lines:
-            return ""
-        return "Validation detail:\n" + "".join(f"- {ln[:320]}\n" for ln in lines[:8])
+        return validation_detail(report)
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
         """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either
