@@ -929,15 +929,15 @@ async def test_the_aggregated_comment_caps_the_detail_of_many_failed_children(
     tmp_path: Path,
 ) -> None:
     artifacts = artifact_service(tmp_path / "artifacts")
-    coordinator, store, _, reporter, changes = make_real(artifacts, max_repositories=10)
-    story = "".join(f"Repository: acme/repo-{i}\n" for i in range(10))
+    coordinator, store, _, reporter, changes = make_real(artifacts, max_repositories=20)
+    story = "".join(f"Repository: acme/repo-{i}\n" for i in range(20))
     await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(story))
     check = {"kind": "plan_scope", "status": "FAILED", "detail": "outside the plan: " + "p" * 480}
     report_doc = {
         "decision": "FAILED", "base_commit_sha": "a" * 40, "validation_policy": "v1",
         "changeset_sha256": "b" * 64, "changed_files": [], "checks": [check] * 8, "commands": [],
     }  # fmt: skip
-    for i in range(10):
+    for i in range(20):
         await fail_with_artifact(
             coordinator, store, changes, artifacts, f"repo-{i}",
             "validation_failed", ArtifactKind.VALIDATION_REPORT, report_doc,
@@ -945,7 +945,7 @@ async def test_the_aggregated_comment_caps_the_detail_of_many_failed_children(
     (report,) = [t for _, t in reporter.texts]
     assert len(report) < 8000  # Jira's MAX_COMMENT, with room to spare
     assert "   [... more detail omitted]" in report
-    for i in range(10):  # every child keeps its status, reason and retry line
+    for i in range(20):  # every child keeps its status, reason and retry line
         assert "Reason: validation_failed" in entry(report, f"repo-{i}")
     assert "Report ID:" in report or "Cross-Repository Result:" in report
     for line in report.splitlines():  # whole lines only

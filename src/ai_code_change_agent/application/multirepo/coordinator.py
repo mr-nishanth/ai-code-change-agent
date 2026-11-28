@@ -78,8 +78,10 @@ _INTEGRITY_FAILURES = frozenset(
 )
 _CHILD_DETAIL_CHARS = 2000  # one aggregated comment holds every child's detail
 # All children's detail together: Jira comments are cut at 8000 characters (MAX_COMMENT), and
-# the status, reason and retry lines of every child and the footer must always fit.
-_COMMENT_DETAIL_CHARS = 4000
+# the status, reason and retry lines of every child (at most ~350 characters each, up to 20
+# children) and the footer must always fit, so the detail gets what they leave.
+_COMMENT_CHARS = 7500
+_CHILD_LINES_CHARS = 350
 _RESULT_TEXT = {
     ParentStatus.COMPLETED: "all repository executions and required contracts completed.",
     ParentStatus.PARTIALLY_COMPLETED: "partially completed; successful PRs are kept.",
@@ -370,7 +372,7 @@ class Coordinator:
             "",
             "Repositories:",
         ]
-        budget: int | None = _COMMENT_DETAIL_CHARS
+        budget: int | None = max(0, _COMMENT_CHARS - _CHILD_LINES_CHARS * len(children))
         for i, c in enumerate(sorted(children, key=lambda c: c.position), start=1):
             lines.append(f"{i}. {c.repository_key}" + (f" ({c.role})" if c.role else ""))
             lines.append(f"   Status: {c.status.value}")
