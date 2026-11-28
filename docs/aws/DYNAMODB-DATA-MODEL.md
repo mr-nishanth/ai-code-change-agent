@@ -280,6 +280,12 @@ consistent_read=True, s3_offload_config={"bucket_name": <bucket>, "endpoint_url"
 ttl_seconds=ACCA_CHECKPOINT_TTL_DAYS * 86_400)` (default 30 days, 1..365; was 90 days), pinned `langgraph-checkpoint-aws==1.3.0` (exact: 15 releases since
 1.0.4). Add the conformance suite to the `floci` tests so an upgrade is gated.
 
+The saver takes no `serde` argument, so `use_checkpoint_serde` (`checkpointer.py`) replaces both
+`saver.serde` and `saver.serializer.serde` (the copy 1.3.0 takes at construction) with a
+`JsonPlusSerializer(allowed_msgpack_modules=...)` that allows LangGraph's safe types plus
+`ImplementationPlan`, `ImplementationReport` and `PlannedChange`. Any other type is blocked and read
+back as raw data, so a new type stored in graph state must be added to `CHECKPOINT_MSGPACK_TYPES`.
+
 ## 10. Floci 2.5.0 verification
 
 Probes: `scratchpad/s2116/probes/{ddb_probe.py, sqs_s3_probe.py, bedrock_probe.py, graph_probe.py,
