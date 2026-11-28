@@ -6,6 +6,10 @@ PENDING -> PREPARING -> PLANNING -> AWAITING_PLAN_APPROVAL -> IMPLEMENTING -> VA
 VALIDATING may return to IMPLEMENTING for a bounded repair. BLOCKED means the attempt could not be
 prepared safely (for example dependencies need network access); REJECTED means an operator
 rejected the plan or the final artifact. Terminal attempts never change again.
+
+A request's status projects its current attempt's status. Before any attempt it is RECEIVED, or
+BLOCKED when no attempt will start from its intake (intake refused it or its job ended DEAD;
+intake is never re-run, so BLOCKED is terminal there too).
 """
 
 from enum import StrEnum
