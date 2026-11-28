@@ -27,6 +27,7 @@ from ai_code_change_agent.domain.changes.states import TERMINAL, AttemptStatus, 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 ACTOR = re.compile(r"[a-z]{2,16}:[A-Za-z0-9_.@-]{1,64}")
+AUTOMATIC_ACTOR = "policy:automatic"  # the automatic approval mode's decisions, never an operator
 REASON_MAX = 500
 # One line of printable text: no C0/C1 controls, no zero-width, bidi-override or isolate marks and
 # no line or paragraph separators (they could reorder or hide text in a Jira comment).

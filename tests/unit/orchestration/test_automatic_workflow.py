@@ -12,14 +12,13 @@ from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
 from ai_code_change_agent.application.artifacts.hashing import load_verified
 from ai_code_change_agent.application.artifacts.models import ArtifactKind
 from ai_code_change_agent.application.dependencies.ports import DependencyBundle, LockedPackage
-from ai_code_change_agent.domain.changes.models import ApprovalGate
+from ai_code_change_agent.domain.changes.models import AUTOMATIC_ACTOR, ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyError, DependencyRequest
 from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.integrations.jira.authentication import BasicAuthenticator
 from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
 from ai_code_change_agent.orchestration.steps import (
-    AUTOMATIC_ACTOR,
     CodeChangeSteps,
     JiraReportDoc,
     complete_plan_scope,

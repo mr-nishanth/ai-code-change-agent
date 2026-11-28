@@ -5,6 +5,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from ai_code_change_agent.application.multirepo.models import (
 )
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import (
+    AUTOMATIC_ACTOR,
     Approval,
     ApprovalDecision,
     ApprovalGate,
@@ -1439,6 +1441,32 @@ async def test_an_operator_rejection_reason_is_shown_for_that_child(tmp_path: Pa
     assert "   Reason given by the operator: wrong module, use billing/\n" in text
     assert "   Reason given by the operator: [withheld: possible secret]\n" in text
     assert "hunter2" not in text
+
+
+async def test_a_reason_on_an_automatic_rejection_is_not_shown_as_the_operators(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    attempt = p.attempts["backend-api"]
+    older = Approval(
+        attempt.id,
+        ApprovalGate.PLAN,
+        "a" * 64,
+        ApprovalDecision.REJECTED,
+        "cli:op",
+        reason="operator words",
+    )
+    automatic = replace(older, id=uuid.uuid4(), actor=AUTOMATIC_ACTOR, reason="policy words",
+                        decided_at=older.decided_at + timedelta(seconds=1))  # fmt: skip
+
+    async def listed(attempt_id: uuid.UUID) -> list[Approval]:
+        return [older, automatic] if attempt_id == attempt.id else []
+
+    p.changes.approvals = listed  # type: ignore[attr-defined]
+    for key in ("backend-api", "web-app"):
+        await p.handler(p.resume_to(S.REJECTED))(resume_job(p.attempts[key]))
+    ((_, text),) = p.reporter.texts
+    assert "Reason given by the operator" not in text  # the latest decision was the policy's
 
 
 async def test_an_expired_checkpoint_fails_the_child_and_the_parent_reports_it_once(

@@ -30,7 +30,7 @@ Gate decisions are recorded exactly like operator approvals: bound to the plan o
 | PLAN | the dependency request is invalid (URL, path, VCS, extras, markers, duplicates, over limit); a planned path is unsafe or protected (`.git`, `.github`, CI, secrets…); more files than the profile allows; **the profile defines no test command** |
 | FINAL | independent validation did not pass; no test command ran or a test command did not pass; the manifest does not match the approved plan |
 
-`WORKFLOW_APPROVAL_MODE=manual` restores operator gates (`ai-code-change changes approve|reject`), for exceptional or recovery use. `changes reject --reason TEXT` (optional, one line, at most 500 characters) records why; the Jira comment shows it as "Reason given by the operator: ..." (withheld when it looks like a secret), otherwise "(no rejection reason is recorded)".
+`WORKFLOW_APPROVAL_MODE=manual` restores operator gates (`ai-code-change changes approve|reject`), for exceptional or recovery use. `changes reject --reason TEXT` (optional, one line, at most 500 characters) records why; the Jira comment shows it as "Reason given by the operator: ..." (withheld when it looks like a secret), otherwise "(no rejection reason is recorded)". The comment shows up to 500 characters of it; a multi-repository Story comment shows up to 300 per child, within that comment's detail budget.
 
 ## What is checked independently (validation engine)
 

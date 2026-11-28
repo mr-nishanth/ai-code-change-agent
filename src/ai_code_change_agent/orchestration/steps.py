@@ -57,6 +57,7 @@ from ai_code_change_agent.application.workspaces.registry_baseline import Regist
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import (
+    AUTOMATIC_ACTOR,
     REASON_MAX,
     ApprovalDecision,
     ApprovalGate,
@@ -216,7 +217,6 @@ class JiraReportDoc(BaseModel):
     outcome: str
 
 
-AUTOMATIC_ACTOR = "policy:automatic"
 # Codes of transient infrastructure failures (Git host or network), never code defects.
 INFRA_CODES = frozenset({"provider_unavailable", "rate_limited", "provider_timeout"})
 # Validation could not run the checks at all (Docker gone, a container that never started, the

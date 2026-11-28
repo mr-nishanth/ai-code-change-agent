@@ -37,7 +37,11 @@ from ai_code_change_agent.application.multirepo.models import (
     ReportState,
 )
 from ai_code_change_agent.core.logging import get_logger
-from ai_code_change_agent.domain.changes.models import ApprovalDecision, CodeChangeAttempt
+from ai_code_change_agent.domain.changes.models import (
+    AUTOMATIC_ACTOR,
+    ApprovalDecision,
+    CodeChangeAttempt,
+)
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
     RepositoryDeclaration,
@@ -490,8 +494,8 @@ class Coordinator:
             return []
         rejected = [a for a in approvals if a.decision is ApprovalDecision.REJECTED]
         latest = max(rejected, key=lambda a: a.decided_at, default=None)
-        if latest is None or not latest.reason:
-            return []
+        if latest is None or latest.actor == AUTOMATIC_ACTOR or not latest.reason:
+            return []  # as the single-repository comment: only an operator's own reason
         return [f"Reason given by the operator: {safe_line(latest.reason, 300)}"]
 
     # ---- child lifecycle --------------------------------------------------------------------
