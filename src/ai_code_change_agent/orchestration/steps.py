@@ -289,7 +289,11 @@ def dependency_preparation(profile: RepositoryProfile, toolchains: frozenset[str
     return None
 
 
-_PATH_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10}")
+# A token starts at a boundary (never inside ../x, .github/x, /abs/x, a\x or ~/x, so an unsafe
+# path is dropped whole, not read from its tail); only an explicit leading ./ is stripped.
+_PATH_TOKEN = re.compile(
+    r"(?<![\w./~\\-])(?:\./)?([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10})"
+)
 _CHANGE_WORDS = re.compile(
     r"\b(updat|modif|chang|edit|extend|adjust|fix|add|refactor|rewrit|replac|renam|amend|cover)",
     re.IGNORECASE,

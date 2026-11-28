@@ -632,7 +632,8 @@ def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> Non
     )
     existing = frozenset(
         {"app/greeting.py", "tests/test_vehicles_api.py", "app/config.py", "app/models.py",
-         "app/routes.py", "tests/test_greeting.py", ".github/workflows/ci.yml"}
+         "app/routes.py", "tests/test_greeting.py", ".github/workflows/ci.yml",
+         "outside.py", "github/workflows/ci.yml"}  # what a stripped token would name
     )  # fmt: skip
     done = complete_plan_scope(plan, existing)
     assert [(c.path, c.operation) for c in done.changes] == [
@@ -645,6 +646,31 @@ def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> Non
     assert all("added by the platform" in c.purpose for c in done.changes[1:])
     assert complete_plan_scope(done, existing) == done  # idempotent
     assert complete_plan_scope(workflow.PLAN, frozenset(workflow.FILES)) == workflow.PLAN
+
+
+def test_a_path_token_is_taken_whole_or_not_at_all() -> None:
+    """A token whose start is unsafe (traversal, a dot directory, absolute, a backslash) is
+    dropped whole: its tail is never read as another repository path."""
+    plan = plan_with(
+        findings=[
+            "../outside.py must be updated",
+            ".github/workflows/ci.yml must be updated",
+            "/workspace/tests/test_x.py must be updated",
+            "a\\b.py must be updated",
+            "~/home.py must be updated",
+            "./app/models.py must be updated",  # an explicit ./ prefix names app/models.py
+        ],
+        tests=["Add /workspace/tests/test_y.py", "Add ../tests/test_z.py"],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "outside.py", "github/workflows/ci.yml", "workspace/tests/test_x.py",
+         "b.py", "home.py", "app/models.py"}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("app/models.py", "modify"),
+    ]
 
 
 async def test_a_test_file_named_only_in_the_findings_may_be_changed(tmp_path: Path) -> None:
