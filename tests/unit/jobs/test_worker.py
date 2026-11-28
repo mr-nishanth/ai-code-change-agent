@@ -813,3 +813,20 @@ async def test_only_the_shutdown_cancel_path_bounds_its_refund() -> None:
     w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
     await asyncio.wait_for(w.run(stop), 2)
     assert q.bounded == [False]  # never started: always refunded
+
+
+async def test_a_dead_hook_cut_off_by_the_maintenance_budget_counts_as_a_failure() -> None:
+    async def slow_hook(j: Job) -> None:
+        await asyncio.sleep(3600)
+
+    q = MemoryQueue()
+    dead = Job(uuid.uuid4(), "k.one", {}, 3, 3, last_error="x")
+    q.dead = [dead]
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+               on_dead={"k.one": slow_hook}, maintenance_budget_seconds=0.05)  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.3)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert q.settled == [(dead.id, True)]  # toward DEAD_HOOK_MAX_FAILURES, then abandoned

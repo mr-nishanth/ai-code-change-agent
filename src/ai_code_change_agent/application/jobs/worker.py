@@ -239,6 +239,11 @@ class Worker:
         if hook is not None:
             try:
                 await hook(job)
+            except asyncio.CancelledError:  # cut off by the maintenance budget (or shutdown)
+                with contextlib.suppress(Exception):  # counts toward DEAD_HOOK_MAX_FAILURES
+                    await asyncio.shield(self._queue.dead_settled(job.id, failed=True))
+                _log.warning("job_dead_hook_cut_off", job_id=str(job.id), kind=job.kind)
+                raise
             except Exception as exc:  # the job is already DEAD; the hook never changes that
                 failed = True
                 _log.warning(
