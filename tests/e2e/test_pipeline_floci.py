@@ -775,7 +775,8 @@ async def test_a_crashed_last_attempt_ends_dead_terminal_and_reported_once_despi
 
         async def pending_report() -> Any:
             item = report_item()
-            return item if item and item["state"]["S"] == "PENDING" else None
+            failed_round = item and item["state"]["S"] == "PENDING" and "last_error" in item
+            return item if failed_round else None  # stored first, then one round failed
 
         pending = await until(pending_report, "the Jira report PENDING after a failed round", 90)
     assert (pending["attempts"]["N"], pending["last_error"]["S"]) == ("1", "http_503")
