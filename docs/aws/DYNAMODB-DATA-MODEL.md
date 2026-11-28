@@ -423,7 +423,7 @@ never will with a 30-day TTL. The class can be switched with `UpdateTable` (AWS 
 **Point-in-time recovery and deletion protection** are production choices, not enabled locally.
 Deletion protection has no charge and should be on for both production tables. Point-in-time recovery is
 charged per GB-month of table size: worth it for `acca-app` (the only copy of requests, registry,
-ledger and audit history), optional for `acca-checkpoints` (re-creatable state, 30-day TTL).
+ledger and audit history), optional for `acca-checkpoints` (30-day TTL; re-creatable only for finished attempts: an attempt paused at an approval gate cannot resume without its checkpoint and fails with `checkpoint_expired`).
 
 **Indexes: three, each serving real queries.** GSI1: U3 (cost report by Story: issue key -> request ids)
 and R17 by repository. GSI2: studio S1 (recent attempts), R5 (repositories), R17 (all mappings), R19

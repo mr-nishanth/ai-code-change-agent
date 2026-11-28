@@ -46,7 +46,9 @@ disturbing the live runtime that keeps serving Jira from the main checkout.
 - **Checkpointer.** `DynamoDBSaver` from `langgraph-checkpoint-aws==1.3.0` (exact pin), with
   `consistent_read=True` and mandatory S3 offload: payloads over the library's 358,400-byte threshold go
   to the `checkpoints/` prefix of the application bucket. Retention `ACCA_CHECKPOINT_TTL_DAYS` (default 30)
-  is both the item TTL and an S3 lifecycle rule the saver installs.
+  is both the item TTL and an S3 lifecycle rule the saver installs. An attempt paused at an approval gate
+  longer than that has no checkpoint to resume: the resume job fails it with `checkpoint_expired`
+  (`WorkflowRunner.resume`, `ResumeHandler`), which releases its active guard.
 - **Artifacts in S3.** `S3ArtifactStore` (`execution/s3_artifacts.py`) under the `artifacts/` prefix:
   write-once (`PutObject` with `IfNoneMatch="*"`), re-hashed on every read, same size limits. Workspaces
   (`WORKSPACE_ROOT`) and dependency bundles (`ARTIFACT_ROOT/dependency-bundles`) stay on local disk because

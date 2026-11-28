@@ -79,6 +79,7 @@ sequenceDiagram
 `PENDING -> PREPARING -> PLANNING -> AWAITING_PLAN_APPROVAL -> IMPLEMENTING -> VALIDATING -> AWAITING_FINAL_APPROVAL -> DELIVERING -> REPORTING -> COMPLETED`
 
 - A bounded repair loops `VALIDATING -> IMPLEMENTING`.
+- An attempt waiting at an approval gate can become `FAILED` only with `checkpoint_expired`: its LangGraph checkpoint expired (`ACCA_CHECKPOINT_TTL_DAYS`) before the approval, so it cannot resume.
 - Terminal states: `COMPLETED`, `BLOCKED`, `FAILED`, `CANCELLED`, `REJECTED`.
 - Every transition goes through the domain (`CodeChangeAttempt.transition`).
 - Conditional writes and transactions in the DynamoDB adapters keep (as database triggers did before ADR-015):

@@ -70,7 +70,7 @@ These variables carry the `ACCA_` prefix so the standard `AWS_*` variables of a 
 | ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME | acca-local-checkpoints | | LangGraph checkpoint table (`DynamoDBSaver`); worker, Studio |
 | ACCA_SQS_JOB_QUEUE_NAME | acca-local-jobs | | job queue (standard queue; its URL is resolved once with `GetQueueUrl`) |
 | ACCA_S3_BUCKET_NAME | acca-local-artifacts | | artifact bucket: `artifacts/` (write-once attempt artifacts) and `checkpoints/` (checkpoint payloads over 358,400 bytes) |
-| ACCA_CHECKPOINT_TTL_DAYS | 30 (1..365) | | checkpoint retention: DynamoDB TTL and the S3 lifecycle rule for offloaded payloads |
+| ACCA_CHECKPOINT_TTL_DAYS | 30 (1..365) | | checkpoint retention: DynamoDB TTL and the S3 lifecycle rule for offloaded payloads. An attempt left at an approval gate longer than this cannot resume: approving it fails the attempt with `checkpoint_expired` (job DEAD with that code, active guard released), so start a new attempt |
 | ACCA_JIRA_DELIVERY_RETENTION_DAYS | 30 (1..365) | | TTL of Jira delivery dedupe records (the Story guard is permanent) |
 
 Without an endpoint (staging and production) the clients use the process's default AWS credential chain (for example an IAM role). `JOB_LEASE_SECONDS` is capped at 3,600 s, below the SQS visibility-timeout limit of 43,200 s.

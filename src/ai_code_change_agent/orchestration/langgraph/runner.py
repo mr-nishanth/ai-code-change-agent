@@ -8,6 +8,13 @@ from langgraph.types import Command
 from ai_code_change_agent.orchestration.langgraph.ports import checked_thread_id
 
 
+class CheckpointExpiredError(Exception):
+    """The attempt's workflow thread has no checkpoint: it expired (ACCA_CHECKPOINT_TTL_DAYS) while
+    the attempt waited at an approval gate, so there is nothing to resume."""
+
+    code = "checkpoint_expired"
+
+
 def _config(attempt_id: uuid.UUID) -> dict[str, Any]:
     return {"configurable": {"thread_id": checked_thread_id(f"attempt:{attempt_id}")}}
 
@@ -26,6 +33,9 @@ class WorkflowRunner:
         return result
 
     async def resume(self, attempt_id: uuid.UUID) -> dict[str, Any]:
+        state = await self._graph.aget_state(_config(attempt_id))
+        if not state.values:  # resuming an empty thread would fail in an undefined way
+            raise CheckpointExpiredError
         result: dict[str, Any] = await self._graph.ainvoke(
             Command(resume=True), config=_config(attempt_id)
         )

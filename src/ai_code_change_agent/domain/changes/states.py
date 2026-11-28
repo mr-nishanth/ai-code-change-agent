@@ -37,10 +37,11 @@ TRANSITIONS: dict[AttemptStatus, frozenset[AttemptStatus]] = {
     S.PENDING: frozenset({S.PREPARING, *_STOP}),
     S.PREPARING: frozenset({S.PLANNING, S.BLOCKED, *_STOP}),
     S.PLANNING: frozenset({S.AWAITING_PLAN_APPROVAL, *_STOP}),
-    S.AWAITING_PLAN_APPROVAL: frozenset({S.IMPLEMENTING, S.REJECTED, S.CANCELLED}),
+    # FAILED from a gate: the workflow checkpoint expired before the approval (checkpoint_expired)
+    S.AWAITING_PLAN_APPROVAL: frozenset({S.IMPLEMENTING, S.REJECTED, *_STOP}),
     S.IMPLEMENTING: frozenset({S.VALIDATING, *_STOP}),
     S.VALIDATING: frozenset({S.AWAITING_FINAL_APPROVAL, S.IMPLEMENTING, *_STOP}),
-    S.AWAITING_FINAL_APPROVAL: frozenset({S.DELIVERING, S.REJECTED, S.CANCELLED}),
+    S.AWAITING_FINAL_APPROVAL: frozenset({S.DELIVERING, S.REJECTED, *_STOP}),
     S.DELIVERING: frozenset({S.REPORTING, *_STOP}),
     S.REPORTING: frozenset({S.COMPLETED}),
     **{t: frozenset() for t in TERMINAL},

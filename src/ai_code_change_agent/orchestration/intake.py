@@ -4,6 +4,7 @@ Intake never trusts the webhook payload: it re-reads the Story from Jira, resolv
 repository deterministically through the registry (no automatic registration), assigns it,
 creates (or re-uses) the single active attempt and starts the parent workflow."""
 
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -28,7 +29,11 @@ from ai_code_change_agent.application.repositories.resolver import (
     RepositoryResolver,
     build_resolution_request,
 )
+from ai_code_change_agent.core.logging import get_logger
+from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.multirepo import DeclarationError, parse_story
+from ai_code_change_agent.domain.changes.states import AttemptStatus
+from ai_code_change_agent.orchestration.langgraph.runner import CheckpointExpiredError
 
 INTAKE = "code_change.intake"
 RESUME = "code_change.resume"
@@ -40,6 +45,7 @@ Launch = Callable[[uuid.UUID], Awaitable[Any]]
 # a truncated body, 408 Request Timeout, 425 Too Early): retried within the job's attempts.
 _TRANSIENT_RESPONSES = frozenset({"unexpected_content_type", "malformed_json"})
 _TRANSIENT_STATUSES = frozenset({408, 425})
+_log = get_logger("intake")
 
 
 def _transient(exc: JiraIntegrationError) -> bool:
@@ -201,12 +207,26 @@ class ParentReportHandler:
 
 
 class ResumeHandler:
-    def __init__(self, resume: Launch) -> None:
+    """Resumes an attempt after an approval. When the workflow's checkpoint has expired
+    (ACCA_CHECKPOINT_TTL_DAYS) the attempt cannot resume: it becomes FAILED with
+    `checkpoint_expired`, which releases its active guard, and the job ends with that code."""
+
+    def __init__(self, resume: Launch, *, changes: CodeChangeService | None = None) -> None:
         self._resume = resume
+        self._changes = changes
 
     async def __call__(self, job: Job) -> None:
         try:
             attempt_id = uuid.UUID(str(job.payload["attempt_id"]))
         except (KeyError, ValueError):
             raise JobFailedError("payload_invalid") from None
-        await self._resume(attempt_id)
+        try:
+            await self._resume(attempt_id)
+        except CheckpointExpiredError as exc:
+            if self._changes is not None:
+                with contextlib.suppress(InvalidTransitionError):  # already terminal
+                    await self._changes.transition(
+                        attempt_id, AttemptStatus.FAILED, failure_code=exc.code
+                    )
+            _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
+            raise JobFailedError(exc.code) from None
