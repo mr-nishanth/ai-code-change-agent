@@ -599,11 +599,16 @@ async def test_a_story_that_needs_clarification_stops_before_implementation(
     assert "at the planning stage" in text and "Retryable: no" in text
     assert "- Which connector failures must be retried?" in text
     assert "- What is the maximum acceptable latency?" in text
+    assert "Summary: The Story does not define 'more robust'\n" in text
 
 
 async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path: Path) -> None:
     rig = await make_rig(tmp_path, approval_mode="automatic")
-    many = {**_ASK, "clarification_questions": [f"Q{i} " + "x" * 1900 for i in range(10)]}
+    many = {
+        **_ASK,
+        "summary": "S " + "y" * 1900,
+        "clarification_questions": [f"Q{i} " + "x" * 1900 for i in range(10)],
+    }
     workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(many)
     try:
         assert await run(rig) is S.FAILED
@@ -611,6 +616,7 @@ async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path:
         workflow.FakeAgent.plan_result = None
     ((_, text),) = rig.reporter.reports
     assert len(text) < 4000 and "- Q0 " in text
+    assert "Summary: S yyy" in text and "y" * 299 not in text
 
 
 # Stored plans are scanned as JSON, where an escaped quote hides this assignment from the

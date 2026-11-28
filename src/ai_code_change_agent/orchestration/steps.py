@@ -36,7 +36,7 @@ from ai_code_change_agent.application.git_providers.delivery import (
     DeliveryRequest,
     DeliveryTarget,
 )
-from ai_code_change_agent.application.jira.comment_lines import safe_line
+from ai_code_change_agent.application.jira.comment_lines import clarification_detail, safe_line
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jira.story import story_of
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
@@ -1081,8 +1081,7 @@ class CodeChangeSteps:
         plan = await load_verified(
             self._d.artifacts, self._scope(a), latest[0], latest[1], ImplementationPlan
         )
-        questions = "".join(f"- {safe_line(q, 300)}\n" for q in plan.clarification_questions[:10])
-        return f"Questions to answer in the Story before a new attempt:\n{questions}"
+        return clarification_detail(plan)
 
     async def _validation_detail(self, a: CodeChangeAttempt) -> str:
         latest = await self._latest_optional(a, ArtifactKind.VALIDATION_REPORT)
