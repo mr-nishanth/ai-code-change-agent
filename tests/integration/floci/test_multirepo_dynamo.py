@@ -7,10 +7,15 @@ constraints and index used to give. Each test runs on its own `s2116-<uuid>` tab
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import pytest
 
+from ai_code_change_agent.application.jobs.queue import JobFailedError
+from ai_code_change_agent.application.multirepo.coordinator import Coordinator
 from ai_code_change_agent.application.multirepo.models import (
     Child,
     ChildStatus,
@@ -18,7 +23,10 @@ from ai_code_change_agent.application.multirepo.models import (
     ParentStatus,
     ReportState,
 )
-from ai_code_change_agent.domain.changes.models import CodeChangeRequest
+from ai_code_change_agent.domain.changes.models import CodeChangeAttempt, CodeChangeRequest
+from ai_code_change_agent.domain.changes.multirepo import parse_story
+from ai_code_change_agent.domain.changes.states import AttemptStatus
+from ai_code_change_agent.orchestration.intake import ResumeHandler
 from ai_code_change_agent.persistence.dynamodb import PersistenceError, Table, keys
 from ai_code_change_agent.persistence.dynamodb.change_store import request_item
 from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
@@ -366,3 +374,72 @@ async def test_corrupt_items_raise_without_values(app_table: Table) -> None:
     await app_table.put({**row, "depends_on_json": '{"a": 1}'})
     with pytest.raises(PersistenceError, match=r"^corrupt_item:depends_on_json$"):
         await store.child(c.id)
+
+
+# S2117: children paused at a manual gate finish through the RESUME job ------------------------
+
+
+async def test_children_resumed_after_their_gates_finish_the_parent_once(
+    app_table: Table, tmp_path: Path
+) -> None:
+    from tests.unit.multirepo.test_multirepo import (
+        TWO,
+        Queue,
+        Reporter,
+        Resolver,
+        ResumeChanges,
+        artifact_service,
+        expired,
+        resume_job,
+    )
+
+    store = DynamoMultiRepoStore(app_table)
+    changes, reporter = ResumeChanges(), Reporter()
+    coordinator = Coordinator(
+        store=store, changes=changes, queue=Queue(),  # type: ignore[arg-type]
+        artifacts=artifact_service(tmp_path / "artifacts"), resolver=Resolver(),
+        reporter=reporter, max_repositories=5, max_job_attempts=3,
+    )  # fmt: skip
+    request_id = await seed_request(app_table)
+    parent = await coordinator.start(request_id, "SHOP-9", "SHOP", parse_story(TWO))
+    _, children = await store.load(parent.id)
+    attempts: dict[str, CodeChangeAttempt] = {}
+    for c in children:  # each CHILD job ran up to its plan gate and SUCCEEDED
+        attempt = CodeChangeAttempt(
+            uuid.uuid4(), request_id, 1, c.repository_id, c.profile_version_id,
+            status=AttemptStatus.AWAITING_PLAN_APPROVAL,
+        )  # fmt: skip
+        changes.attempts[attempt.id] = attempt
+        assert await store.update_child(
+            c.id, frozenset({ChildStatus.QUEUED}), status=ChildStatus.RUNNING, attempt_id=attempt.id
+        )
+        attempts[c.repository_key] = attempt
+
+    async def approved(attempt_id: uuid.UUID) -> None:
+        changes.attempts[attempt_id] = replace(
+            changes.attempts[attempt_id], status=AttemptStatus.COMPLETED
+        )
+
+    def handler(resume: Any) -> ResumeHandler:
+        return ResumeHandler(resume, changes=changes, coordinator=coordinator)  # type: ignore[arg-type]
+
+    async def state() -> tuple[ParentStatus, dict[str, Child]]:
+        loaded, kids = await store.load(parent.id)
+        return loaded.status, {c.repository_key: c for c in kids}
+
+    await handler(approved)(resume_job(attempts["backend-api"]))
+    status, kids = await state()
+    assert kids["backend-api"].status is ChildStatus.COMPLETED
+    assert kids["web-app"].status is ChildStatus.RUNNING and status is ParentStatus.RUNNING
+    job = resume_job(attempts["web-app"])
+    for _ in range(2):  # the expired child, then its redelivered RESUME job
+        with pytest.raises(JobFailedError, match="checkpoint_expired"):
+            await handler(expired)(job)
+    status, kids = await state()
+    assert kids["web-app"].status is ChildStatus.FAILED
+    assert kids["web-app"].failure_code == "checkpoint_expired"
+    assert status is ParentStatus.PARTIALLY_COMPLETED  # not RUNNING once every child is terminal
+    await handler(approved)(resume_job(attempts["backend-api"]))  # a duplicate notification
+    loaded, _ = await store.load(parent.id)
+    assert loaded.jira_report == ReportState.SUCCEEDED.value
+    assert len(reporter.texts) == 1 and "Reason: checkpoint_expired" in reporter.texts[0][1]

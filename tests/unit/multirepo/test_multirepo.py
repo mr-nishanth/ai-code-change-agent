@@ -4,7 +4,7 @@ import json
 import os
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.errors import ArtifactIntegrityError
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
     REPORT_JOB,
@@ -30,6 +31,7 @@ from ai_code_change_agent.application.multirepo.models import (
     ReportClaim,
     ReportState,
 )
+from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
@@ -43,9 +45,12 @@ from ai_code_change_agent.domain.repositories.resolution import (
 )
 from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.integrations.jira.reporting import CommentResult, CommentStatus
-from ai_code_change_agent.orchestration.intake import ChildHandler
+from ai_code_change_agent.orchestration.intake import ChildHandler, ResumeHandler
 from ai_code_change_agent.orchestration.langgraph.graph import build_graph
-from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
+from ai_code_change_agent.orchestration.langgraph.runner import (
+    CheckpointExpiredError,
+    WorkflowRunner,
+)
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps
 from tests.support.workflow import make_rig
 
@@ -1080,3 +1085,207 @@ async def test_a_resumed_parent_never_reruns_completed_children(tmp_path: Path) 
     for payload in list(jobs.values()):  # a second replay changes nothing
         await handler(type("J", (), {"payload": payload})())
     assert changes.started == [web.attempt_id] and len(reporter.texts) == 1
+
+
+# ---- S2117: children paused at a manual gate finish through the resume job -------------------
+
+TWO = """Repository: acme/backend-api
+Repository: acme/web-app
+"""  # two independent children; each pauses at its plan gate (manual approval mode)
+S = AttemptStatus
+
+
+class ResumeChanges(AttemptChanges):
+    """What ResumeHandler needs: attempts and the checkpoint_expired transition."""
+
+    async def transition(
+        self, attempt_id: uuid.UUID, status: AttemptStatus, *, failure_code: str | None = None
+    ) -> CodeChangeAttempt:
+        attempt = self.attempts[attempt_id]
+        if attempt.terminal:
+            raise InvalidTransitionError(f"{attempt.status.value} is terminal")
+        attempt = replace(attempt, status=status, failure_code=failure_code)
+        self.attempts[attempt_id] = attempt
+        return attempt
+
+
+@dataclass
+class Paused:
+    coordinator: Coordinator
+    store: MemStore
+    reporter: Reporter
+    changes: ResumeChanges
+    parent_id: uuid.UUID
+    attempts: dict[str, CodeChangeAttempt]
+    single_reports: list[uuid.UUID]  # the single-repository report path (never for a child)
+
+    def handler(self, resume: Callable[[uuid.UUID], Awaitable[Any]]) -> ResumeHandler:
+        return ResumeHandler(
+            resume,
+            changes=self.changes,  # type: ignore[arg-type]
+            coordinator=self.coordinator,
+        )
+
+    def resume_to(
+        self, status: AttemptStatus, failure_code: str | None = None
+    ) -> Callable[[uuid.UUID], Awaitable[None]]:
+        """The workflow after the approval: runs on and stops at `status`."""
+
+        async def resume(attempt_id: uuid.UUID) -> None:
+            attempt = self.changes.attempts[attempt_id]
+            self.changes.attempts[attempt_id] = replace(
+                attempt, status=status, failure_code=failure_code
+            )
+
+        return resume
+
+    def status(self, key: str) -> ChildStatus:
+        return by_key(self.store, key).status
+
+    @property
+    def parent(self) -> Parent:
+        return self.store.parents[self.parent_id]
+
+    def parent_status(self) -> ParentStatus:  # a call, so mypy never narrows it between steps
+        return self.parent.status
+
+
+def resume_job(attempt: CodeChangeAttempt) -> Job:
+    return Job(uuid.uuid4(), "code_change.resume", {"attempt_id": str(attempt.id)}, 1, 3)
+
+
+async def expired(attempt_id: uuid.UUID) -> None:
+    raise CheckpointExpiredError
+
+
+async def paused_children(tmp_path: Path) -> Paused:
+    """Both children ran their CHILD job up to the plan gate: child RUNNING, attempt paused."""
+    store, queue, reporter, changes = MemStore(), Queue(), Reporter(), ResumeChanges()
+    coordinator = Coordinator(
+        store=store, changes=changes, queue=queue,  # type: ignore[arg-type]
+        artifacts=artifact_service(tmp_path / "artifacts"), resolver=Resolver(),
+        reporter=reporter, max_repositories=5, max_job_attempts=3,
+    )  # fmt: skip
+    parent = await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(TWO))
+    attempts = {}
+    for key in ("backend-api", "web-app"):
+        attempt = await begin(store, changes, key)
+        attempt = replace(attempt, status=S.AWAITING_PLAN_APPROVAL)
+        changes.attempts[attempt.id] = attempt
+        attempts[key] = attempt
+    return Paused(coordinator, store, reporter, changes, parent.id, attempts, [])
+
+
+async def test_a_child_resumed_after_approval_completes_and_the_parent_waits_for_the_other(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["backend-api"]))
+    assert p.status("backend-api") is ChildStatus.COMPLETED
+    assert p.status("web-app") is ChildStatus.RUNNING  # still at its gate
+    assert p.parent_status() is ParentStatus.RUNNING and p.reporter.texts == []
+    assert p.single_reports == []  # a child never reports on its own
+
+
+async def test_the_parent_completes_and_reports_once_after_the_last_child_is_resumed(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    for key in ("web-app", "backend-api"):
+        await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts[key]))
+    assert {p.status(k) for k in ("backend-api", "web-app")} == {ChildStatus.COMPLETED}
+    assert p.parent_status() is ParentStatus.COMPLETED  # never left RUNNING
+    assert p.store.request_status[p.parent.request_id] == "COMPLETED"
+    assert len(p.reporter.texts) == 1 and "Execution: COMPLETED" in p.reporter.texts[0][1]
+    assert p.single_reports == []
+
+
+async def test_a_child_that_stops_at_the_next_gate_does_not_notify_the_parent(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    await p.handler(p.resume_to(S.AWAITING_FINAL_APPROVAL))(resume_job(p.attempts["web-app"]))
+    assert p.status("web-app") is ChildStatus.RUNNING  # manual approval semantics unchanged
+    assert p.parent_status() is ParentStatus.RUNNING and p.reporter.texts == []
+
+
+async def test_a_resumed_child_that_fails_finishes_the_parent_partially(tmp_path: Path) -> None:
+    p = await paused_children(tmp_path)
+    await p.handler(p.resume_to(S.FAILED, "validation_failed"))(
+        resume_job(p.attempts["backend-api"])
+    )
+    assert p.status("backend-api") is ChildStatus.FAILED
+    assert by_key(p.store, "backend-api").failure_code == "validation_failed"
+    assert p.parent_status() is ParentStatus.RUNNING
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["web-app"]))
+    assert p.parent_status() is ParentStatus.PARTIALLY_COMPLETED
+    assert len(p.reporter.texts) == 1 and "Reason: validation_failed" in p.reporter.texts[0][1]
+
+
+async def test_every_child_failing_finishes_the_parent_as_failed(tmp_path: Path) -> None:
+    p = await paused_children(tmp_path)
+    for key in ("backend-api", "web-app"):
+        await p.handler(p.resume_to(S.REJECTED))(resume_job(p.attempts[key]))
+    assert p.parent_status() is ParentStatus.FAILED and len(p.reporter.texts) == 1
+
+
+async def test_an_expired_checkpoint_fails_the_child_and_the_parent_reports_it_once(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    job = resume_job(p.attempts["backend-api"])
+    with pytest.raises(JobFailedError) as raised:
+        await p.handler(expired)(job)
+    assert raised.value.code == "checkpoint_expired"
+    child = by_key(p.store, "backend-api")
+    assert child.status is ChildStatus.FAILED and child.failure_code == "checkpoint_expired"
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["web-app"]))
+    assert p.parent_status() is ParentStatus.PARTIALLY_COMPLETED
+    with pytest.raises(JobFailedError):  # a redelivered RESUME job: nothing new
+        await p.handler(expired)(job)
+    assert len(p.reporter.texts) == 1 and "Reason: checkpoint_expired" in p.reporter.texts[0][1]
+    assert p.single_reports == []  # children are reported through the parent only
+
+
+async def test_a_duplicate_completion_notification_counts_once(tmp_path: Path) -> None:
+    p = await paused_children(tmp_path)
+    for key in ("backend-api", "web-app"):
+        job = resume_job(p.attempts[key])
+        await p.handler(p.resume_to(S.COMPLETED))(job)
+        await p.handler(p.resume_to(S.COMPLETED))(job)  # redelivery of the same RESUME job
+    finished = p.changes.attempts[p.attempts["web-app"].id]
+    await p.coordinator.child_finished(by_key(p.store, "web-app").id, finished)  # and again
+    assert p.parent_status() is ParentStatus.COMPLETED
+    assert len(p.reporter.texts) == 1 and p.store.reports == 1
+
+
+async def test_a_duplicate_notification_finishes_a_parent_whose_advance_was_lost(
+    tmp_path: Path,
+) -> None:
+    """The child was recorded terminal but the worker died before advancing the parent: the
+    next notification for that child (a redelivered job) finishes the parent."""
+    p = await paused_children(tmp_path)
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["backend-api"]))
+    web = by_key(p.store, "web-app")
+    p.changes.attempts[web.attempt_id] = replace(  # type: ignore[index]
+        p.attempts["web-app"], status=S.COMPLETED
+    )
+    await p.store.update_child(
+        web.id, frozenset({ChildStatus.RUNNING}), status=ChildStatus.COMPLETED
+    )
+    assert p.parent_status() is ParentStatus.RUNNING  # crashed before advance
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["web-app"]))
+    assert p.parent_status() is ParentStatus.COMPLETED and len(p.reporter.texts) == 1
+
+
+async def test_a_resumed_single_repository_attempt_never_touches_the_coordinator(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    lone = CodeChangeAttempt(
+        uuid.uuid4(), uuid.uuid4(), 1, uuid.uuid4(), uuid.uuid4(), status=S.AWAITING_PLAN_APPROVAL
+    )
+    p.changes.attempts[lone.id] = lone
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(lone))
+    assert p.parent_status() is ParentStatus.RUNNING and p.reporter.texts == []
+    assert p.single_reports == []  # completed: the workflow's own report step posted already

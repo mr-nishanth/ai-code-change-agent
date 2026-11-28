@@ -209,11 +209,22 @@ class ParentReportHandler:
 class ResumeHandler:
     """Resumes an attempt after an approval. When the workflow's checkpoint has expired
     (ACCA_CHECKPOINT_TTL_DAYS) the attempt cannot resume: it becomes FAILED with
-    `checkpoint_expired`, which releases its active guard, and the job ends with that code."""
+    `checkpoint_expired`, which releases its active guard, and the job ends with that code.
 
-    def __init__(self, resume: Launch, *, changes: CodeChangeService | None = None) -> None:
+    A multi-repository child that paused at a gate is finished here: once the resumed (or
+    expired) attempt is terminal the coordinator records the child and advances its parent, so
+    the parent never stays RUNNING after its last child."""
+
+    def __init__(
+        self,
+        resume: Launch,
+        *,
+        changes: CodeChangeService | None = None,
+        coordinator: Coordinator | None = None,
+    ) -> None:
         self._resume = resume
         self._changes = changes
+        self._coordinator = coordinator
 
     async def __call__(self, job: Job) -> None:
         try:
@@ -221,12 +232,32 @@ class ResumeHandler:
         except (KeyError, ValueError):
             raise JobFailedError("payload_invalid") from None
         try:
-            await self._resume(attempt_id)
+            await self._resume_or_expire(attempt_id)
+        except CheckpointExpiredError as exc:
+            _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
+            await self._child_finished(attempt_id)
+            raise JobFailedError(exc.code) from None
+        await self._child_finished(attempt_id)
+
+    async def _resume_or_expire(self, attempt_id: uuid.UUID) -> Any:
+        try:
+            return await self._resume(attempt_id)
         except CheckpointExpiredError as exc:
             if self._changes is not None:
                 with contextlib.suppress(InvalidTransitionError):  # already terminal
                     await self._changes.transition(
                         attempt_id, AttemptStatus.FAILED, failure_code=exc.code
                     )
-            _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
-            raise JobFailedError(exc.code) from None
+            raise
+
+    async def _child_finished(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt belongs to a multi-repository child (notified if terminal)."""
+        if self._coordinator is None or self._changes is None:
+            return False
+        child = await self._coordinator.store.child_by_attempt(attempt_id)
+        if child is None:
+            return False
+        attempt = await self._changes.get_attempt(attempt_id)
+        if attempt.terminal:  # still at a gate: nothing to record yet (manual approval)
+            await self._coordinator.child_finished(child.id, attempt)
+        return True

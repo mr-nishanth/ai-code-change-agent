@@ -585,7 +585,9 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
                 reporter=deps.reporter,
                 coordinator=coordinator,
             ),
-            RESUME: ResumeHandler(costs.around(runner.resume), changes=changes),
+            RESUME: ResumeHandler(
+                costs.around(runner.resume), changes=changes, coordinator=coordinator
+            ),
             CHILD: ChildHandler(
                 coordinator=coordinator, changes=changes, start=costs.around(runner.start)
             ),
