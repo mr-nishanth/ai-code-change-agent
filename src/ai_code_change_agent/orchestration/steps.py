@@ -238,6 +238,7 @@ _RETRYABLE = (
     "connection",
     "outcome",
 )
+DELIVERY_UNKNOWN = "delivery_outcome_unknown"  # a dead job left the attempt in DELIVERING
 _STAGES = (
     ("dependency", "dependency preparation"),
     ("agent", "agent"),
@@ -1076,8 +1077,25 @@ class CodeChangeSteps:
             f"Reason: {reason}\n"
             f"{await self._failure_detail(a)}"
             f"Retryable: {advice}.\n"
-            "No pull request was created by this attempt."
+            + (
+                "A branch or draft pull request may exist for this attempt (its delivery outcome "
+                "is unknown); check the repository before retrying."
+                if a.failure_code == DELIVERY_UNKNOWN
+                else "No pull request was created by this attempt."
+            )
         )
+
+    async def pull_request_created(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt's latest delivery result says the pull request was created (an
+        attempt that died in DELIVERING after publishing: it is reported, not failed)."""
+        a = await self._attempt(attempt_id)
+        latest = await self._latest_optional(a, ArtifactKind.DELIVERY_RESULT)
+        if latest is None:
+            return False
+        doc = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], DeliveryResultDoc
+        )
+        return doc.outcome == DeliveryOutcome.PULL_REQUEST_CREATED.value
 
     async def _failure_detail(self, a: CodeChangeAttempt) -> str:
         """Bounded detail lines for the Jira comment: why independent validation failed (failed

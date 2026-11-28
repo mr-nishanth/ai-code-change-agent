@@ -278,3 +278,50 @@ async def test_a_report_store_failure_in_a_refusal_retries_the_job_and_reports_o
         await handler(payload)
     assert (await changes.service().get_request(req.id)).status == "BLOCKED"
     assert len(jira.comments) == 1
+
+
+async def test_an_attempt_that_died_after_its_pull_request_was_created_is_reported_delivered() -> (
+    None
+):
+    changes, rec = MemoryChanges(), Recorded()
+    _, attempt = await attempt_in(changes, S.DELIVERING)
+
+    async def delivered(_: uuid.UUID) -> bool:
+        return True
+
+    hooks = AttemptRecovery(changes=changes.service(), report=rec.report, complete=rec.complete,
+                            delivered=delivered)  # fmt: skip
+    await hooks.end_attempt(attempt.id)
+    assert (await changes.service().get_attempt(attempt.id)).status is S.REPORTING
+    assert rec.completed == [attempt.id]  # the report step posts the success, COMPLETED
+
+
+async def test_an_attempt_that_died_in_delivery_without_a_result_says_the_outcome_is_unknown() -> (
+    None
+):
+    changes, rec = MemoryChanges(), Recorded()
+    _, attempt = await attempt_in(changes, S.DELIVERING)
+
+    async def delivered(_: uuid.UUID) -> bool:
+        return False
+
+    hooks = AttemptRecovery(changes=changes.service(), report=rec.report, complete=rec.complete,
+                            delivered=delivered)  # fmt: skip
+    await hooks.end_attempt(attempt.id)
+    after = await changes.service().get_attempt(attempt.id)
+    assert after.status is S.FAILED and after.failure_code == "delivery_outcome_unknown"
+    assert rec.reported == [attempt.id] and rec.completed == []
+
+
+async def test_the_unknown_delivery_comment_says_a_pull_request_may_exist(tmp_path: Any) -> None:
+    from ai_code_change_agent.orchestration.steps import CodeChangeSteps
+    from tests.support.workflow import make_rig
+
+    rig = await make_rig(tmp_path)
+    steps = CodeChangeSteps(rig.deps)
+    assert not await steps.pull_request_created(rig.attempt_id)  # no delivery result stored
+    rig.changes.force(rig.attempt_id, status=S.FAILED, failure_code="delivery_outcome_unknown")
+    await steps.cleanup(rig.attempt_id)
+    ((_, text),) = rig.reporter.reports
+    assert "may exist" in text and "No pull request was created" not in text
+    assert "at the delivery stage" in text

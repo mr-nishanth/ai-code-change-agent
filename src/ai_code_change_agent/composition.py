@@ -595,7 +595,11 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
         runner = WorkflowRunner(build_graph(steps, saver))
         # ends what a DEAD job leaves behind, whichever path recorded it DEAD
         recovery = AttemptRecovery(
-            changes=changes, report=steps.cleanup, complete=steps.report, coordinator=coordinator
+            changes=changes,
+            report=steps.cleanup,
+            complete=steps.report,
+            coordinator=coordinator,
+            delivered=steps.pull_request_created,
         )
         intake = IntakeHandler(
             changes=changes,

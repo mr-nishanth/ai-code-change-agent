@@ -8,7 +8,10 @@ nothing and reports nothing new):
 
 * an attempt that is not terminal becomes FAILED with `job_attempts_exhausted` (its active guard is
   released with it), or COMPLETED through the report step when it was REPORTING (its pull request
-  exists); then it is reported once through the workflow's own once-per-attempt report
+  exists). One that died in DELIVERING is reported as delivered when its delivery result says the
+  pull request was created (REPORTING, then the report step), else FAILED with
+  `delivery_outcome_unknown`, whose comment says a branch or pull request may exist. Then it is
+  reported once through the workflow's own once-per-attempt report
   (`CodeChangeSteps.cleanup`), or, for a multi-repository child, recorded by the coordinator
   (`child_finished`), which advances and finally reports its parent;
 * a child that never got an attempt becomes FAILED and its parent advances;
@@ -29,6 +32,7 @@ from ai_code_change_agent.application.multirepo.models import ChildStatus
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.states import AttemptStatus
+from ai_code_change_agent.orchestration.steps import DELIVERY_UNKNOWN
 
 DEAD_JOB_CODE = "job_attempts_exhausted"
 Launch = Callable[[uuid.UUID], Awaitable[Any]]
@@ -50,7 +54,9 @@ class AttemptRecovery:
         report: Launch,  # CodeChangeSteps.cleanup: reports a failed attempt once
         complete: Launch | None = None,  # CodeChangeSteps.report: REPORTING -> COMPLETED
         coordinator: Coordinator | None = None,
+        delivered: Callable[[uuid.UUID], Awaitable[bool]] | None = None,  # PR created?
     ) -> None:
+        self._delivered = delivered
         self._changes = changes
         self._report = report
         self._complete = complete
@@ -62,12 +68,21 @@ class AttemptRecovery:
         if not attempt.terminal:
             _log.warning("attempt_abandoned_by_dead_job", attempt_id=str(attempt_id),
                          status=attempt.status.value, reason=reason)  # fmt: skip
+            code = DEAD_JOB_CODE
+            if attempt.status is AttemptStatus.DELIVERING:
+                if self._delivered is not None and await self._delivered(attempt_id):
+                    with contextlib.suppress(InvalidTransitionError):
+                        attempt = await self._changes.transition(
+                            attempt_id, AttemptStatus.REPORTING
+                        )
+                else:  # it may have published before it died: never claim it did not
+                    code = DELIVERY_UNKNOWN
             if attempt.status is AttemptStatus.REPORTING and self._complete is not None:
                 await self._complete(attempt_id)  # the pull request exists: report it, COMPLETED
-            else:
+            elif not attempt.terminal:
                 with contextlib.suppress(InvalidTransitionError):  # finished meanwhile
                     await self._changes.transition(
-                        attempt_id, AttemptStatus.FAILED, failure_code=DEAD_JOB_CODE
+                        attempt_id, AttemptStatus.FAILED, failure_code=code
                     )
             attempt = await self._changes.get_attempt(attempt_id)
         if self._coordinator is not None:
