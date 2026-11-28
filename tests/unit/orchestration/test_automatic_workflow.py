@@ -561,3 +561,48 @@ async def test_the_story_frame_is_labelled_with_the_validated_request_key(tmp_pa
         (await rig.deps.changes.get_attempt(rig.attempt_id)).request_id
     )
     assert seen == [request.jira_issue_key] and "\n" not in seen[0]
+
+
+_ASK = {
+    "summary": "The Story does not define 'more robust'",
+    "needs_clarification": True,
+    "clarification_questions": [
+        "Which connector failures must be retried?",
+        "What is the maximum acceptable latency?",
+    ],
+}
+
+
+@pytest.mark.parametrize("mode", ["automatic", "manual"])
+async def test_a_story_that_needs_clarification_stops_before_implementation(
+    tmp_path: Path, mode: str
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode=mode)
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(_ASK)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == "story_needs_clarification" and att.plan_sha256 is None
+    assert [s.writable for s in rig.sandboxes.started] == [False]  # planning only
+    assert rig.publisher.requests == []
+    assert await rig.deps.changes.approvals(rig.attempt_id) == []  # nothing to approve
+    assert ArtifactKind.IMPLEMENTATION_PLAN in await kinds(rig)  # kept for the record
+    ((key, text),) = rig.reporter.reports
+    assert key == "SHOP-1" and "story_needs_clarification" in text
+    assert "at the planning stage" in text and "Retryable: no" in text
+    assert "- Which connector failures must be retried?" in text
+    assert "- What is the maximum acceptable latency?" in text
+
+
+async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    many = {**_ASK, "clarification_questions": [f"Q{i} " + "x" * 1900 for i in range(10)]}
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(many)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert len(text) < 4000 and "- Q0 " in text

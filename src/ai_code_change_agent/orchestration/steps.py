@@ -238,6 +238,7 @@ _STAGES = (
     ("delivery", "delivery"),
     ("publish", "delivery"),
     ("repository", "repository authorisation"),
+    ("story", "planning"),
 )
 
 
@@ -472,6 +473,8 @@ class CodeChangeSteps:
             stored = await store_model(
                 self._d.artifacts, self._scope(a), ArtifactKind.IMPLEMENTATION_PLAN, plan
             )
+            if plan.needs_clarification:  # never approved or implemented, in either mode
+                return await self._fail(attempt_id, "story_needs_clarification")
             await self._d.changes.record_plan(attempt_id, stored.ref, stored.sha256)
             a = await self._d.changes.transition(attempt_id, S.AWAITING_PLAN_APPROVAL)
             return StepResult(a.status.value)
@@ -978,9 +981,26 @@ class CodeChangeSteps:
             f"Repository: {await self._repository_name(a)}\n"
             f"Outcome: {a.status.value} at the {stage} stage (attempt {a.number}, {a.id}).\n"
             f"Reason: {reason}\n"
+            f"{await self._failure_detail(a)}"
             f"Retryable: {advice}.\n"
             "No pull request was created by this attempt."
         )
+
+    async def _failure_detail(self, a: CodeChangeAttempt) -> str:
+        """Bounded detail lines for the Jira comment: the planner's questions for a Story that
+        needs clarification. Empty for every other outcome."""
+        if a.failure_code != "story_needs_clarification":
+            return ""
+        latest = await self._latest_optional(a, ArtifactKind.IMPLEMENTATION_PLAN)
+        if latest is None:
+            return ""
+        plan = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], ImplementationPlan
+        )
+        questions = "".join(
+            f"- {' '.join(q.split())[:300]}\n" for q in plan.clarification_questions[:10]
+        )
+        return f"Questions to answer in the Story before a new attempt:\n{questions}"
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
         """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either

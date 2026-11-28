@@ -553,3 +553,39 @@ async def test_a_provider_error_after_a_priced_call_keeps_the_recorded_usage(
     assert guard.spent == Decimal("0.012")  # the error did not reset or add to the spend
     t = totals(store.records)
     assert t.cost == Decimal("0.012") and not t.complete
+
+
+def test_a_plan_may_ask_for_clarification_instead_of_listing_changes() -> None:
+    plan = ImplementationPlan.model_validate(
+        {
+            "summary": "The Story does not say what 'more robust' means",
+            "needs_clarification": True,
+            "clarification_questions": "- Which failures must the connector survive?\n- Retry how often?",
+        }
+    )
+    assert plan.changes == [] and plan.clarification_questions == [
+        "Which failures must the connector survive?",
+        "Retry how often?",
+    ]
+    with pytest.raises(ValueError, match="clarification_questions"):
+        ImplementationPlan.model_validate({"summary": "vague", "needs_clarification": True})
+    with pytest.raises(ValueError, match="changes"):
+        ImplementationPlan.model_validate({"summary": "no files", "changes": []})
+    assert PLAN.needs_clarification is False and PLAN.clarification_questions == []
+
+
+def test_the_planner_is_told_to_ask_instead_of_guessing() -> None:
+    assert "needs_clarification" in PLANNING_SYSTEM
+    assert "clarification_questions" in PLANNING_SYSTEM
+    assert "speculative" in PLANNING_SYSTEM
+
+
+async def test_a_clarification_request_is_returned_as_the_typed_schema(tmp_path: Path) -> None:
+    ask = {
+        "summary": "Too vague to plan",
+        "needs_clarification": True,
+        "clarification_questions": ["Which error must be handled?"],
+    }
+    model = ScriptedChatModel(script=[call("ImplementationPlan", ask, 1)])
+    plan = await CodingAgent(model).plan(STORY, sandbox(tmp_path, False), thread_id="t")
+    assert plan.needs_clarification and plan.changes == []

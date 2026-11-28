@@ -50,6 +50,13 @@ explore the structure and dependencies, find the existing patterns and the relev
 run read-only commands if useful. Then return a structured implementation plan: every file you
 intend to create, modify or delete, the tests you will add or update, the risks, and a TODO list.
 Do not attempt to change files.
+CLARIFICATION: if the Story is too vague or ambiguous to name concrete, verifiable changes (for
+example "make it more robust" with no failure, behaviour or acceptance criterion you can check,
+or several incompatible readings), do not write a speculative plan and do not merely list the
+vagueness as a risk. Set `needs_clarification` to true, put up to 10 specific questions the Story
+author must answer in `clarification_questions`, explain the gap in `summary`, and leave
+`changes` empty. The platform stops the attempt and posts the questions to the Jira issue. Do not
+use it for details you can settle by reading the repository.
 PATHS: every path in the plan (`changes`, `tests`) is repository-relative, such as
 `app/main.py` or `tests/test_main.py`; never prefix it with /workspace or use an absolute path.
 DEPENDENCIES: the platform automatically discovers and provisions runtime and test/dev
