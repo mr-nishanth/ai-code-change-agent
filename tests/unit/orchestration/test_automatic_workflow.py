@@ -620,12 +620,14 @@ def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> Non
             "app/config.py must not be changed",
             "app/models.py defines the Vehicle model",  # no change wording: only context
             ".github/workflows/ci.yml must be updated as well",  # protected: never added
+            "../outside.py must be updated",  # not a repository path: never added
         ],
         todo=["Extend `app/routes.py` with the new endpoint.", "Fix docs/missing.py"],
         tests=[
             "Update tests/test_greeting.py with a Goodbye case",
             "Add tests/test_routes.py for the endpoint",
             "tests/test_new_api.py",  # an exact entry is already allowed as a test path
+            "Document it in docs/notes.txt",  # neither an existing file nor a test module
         ],
     )
     existing = frozenset(
