@@ -717,7 +717,6 @@ def test_only_whole_change_verbs_without_a_negation_add_a_file() -> None:
         findings=[
             "tests/conftest.py provides the fixture used by app/a.py",  # fixture is not fix
             "app/b.py reads the address from settings",  # address is not add
-            "tests/test_c.py covers the parser",  # describes the file, asks no change
             "Avoid touching app/d.py while updating the routes",
             "Keep app/e.py and update the callers",
             "Preserve app/f.py when refactoring",
@@ -736,7 +735,7 @@ def test_only_whole_change_verbs_without_a_negation_add_a_file() -> None:
             "Update app/m.py to expose the hook",  # an existing non-test file: never from tests
             "Update tests/helpers.py with a builder",  # not a test module
             "Update tests/conftest.py with a fixture",
-            "tests/test_n.py covers it",  # no change wording
+            "tests/test_n.py documents it",  # no change wording
             "Add tests/test_new.py",
             "Do not add tests/test_never.py",
         ],
@@ -753,6 +752,27 @@ def test_only_whole_change_verbs_without_a_negation_add_a_file() -> None:
         ("app/q.py", "modify"),
         ("tests/conftest.py", "modify"),
         ("tests/test_new.py", "create"),
+    ]
+
+
+def test_third_person_change_verbs_add_the_file_too() -> None:
+    verbs = ["Updates", "Modifies", "Changes", "Edits", "Extends", "Adjusts", "Fixes", "Adds a case to",
+             "Refactors", "Rewrites", "Replaces", "Renames", "Amends", "Covers", "Creates"]  # fmt: skip
+    plan = plan_with(
+        todo=[f"{v} src/m{i}.py" for i, v in enumerate(verbs)]
+        + ["Provides the fixture in src/f.py", "Reads the address from src/r.py"],
+        tests=["Adds tests/test_added.py for the endpoint", "Updates tests/test_old.py"],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "src/f.py", "src/r.py", "tests/test_old.py",
+         *(f"src/m{i}.py" for i in range(len(verbs)))}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        *((f"src/m{i}.py", "modify") for i in range(len(verbs))),
+        ("tests/test_added.py", "create"),
+        ("tests/test_old.py", "modify"),
     ]
 
 

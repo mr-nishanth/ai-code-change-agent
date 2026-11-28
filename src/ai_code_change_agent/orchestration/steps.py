@@ -299,11 +299,13 @@ def dependency_preparation(profile: RepositoryProfile, toolchains: frozenset[str
 _PATH_TOKEN = re.compile(
     r"(?<![\w./~\\-])(?:\./)?([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10})"
 )
-# Whole verb forms that ask for a change (fixture, address and "covers the parser" are not).
+# Whole verb forms that ask for a change, third person included ("Updates src/a.py"); word
+# boundaries keep fixture and address out.
 _CHANGE_WORDS = re.compile(
-    r"\b(?:updat(?:e|ed|ing)|modif(?:y|ied|ying)|chang(?:e|ed|ing)|edit(?:ed|ing)?"
-    r"|extend(?:ed|ing)?|adjust(?:ed|ing)?|fix(?:ed|ing)?|add(?:ed|ing)?|refactor(?:ed|ing)?"
-    r"|rewr(?:ite|itten|iting|ote)|replac(?:e|ed|ing)|renam(?:e|ed|ing)|amend(?:ed|ing)?|cover)\b",
+    r"\b(?:updat(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|chang(?:e|es|ed|ing)|edit(?:s|ed|ing)?"
+    r"|extend(?:s|ed|ing)?|adjust(?:s|ed|ing)?|fix(?:es|ed|ing)?|add(?:s|ed|ing)?"
+    r"|refactor(?:s|ed|ing)?|rewr(?:ite|ites|itten|iting|ote)|replac(?:e|es|ed|ing)"
+    r"|renam(?:e|es|ed|ing)|amend(?:s|ed|ing)?|cover(?:s|ed|ing)?|creat(?:e|es|ed|ing))\b",
     re.IGNORECASE,
 )
 # Any of these makes the item ambiguous, so it adds nothing (a missed file only fails validation).
