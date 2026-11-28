@@ -63,7 +63,7 @@ uv run ai-code-change repositories list
 caffeinate -i uv run ai-code-change worker     # macOS: keep the machine awake; Ctrl+C stops it
 ```
 
-The worker prints a cost report per attempt and a session summary when it stops.
+The worker prints a cost report per attempt and a session summary when it stops. Each job it claims is logged as `job_claimed` with `job_id`, `kind`, `attempt` and `max_attempts` (never the payload).
 
 ## 7. Create a Story
 

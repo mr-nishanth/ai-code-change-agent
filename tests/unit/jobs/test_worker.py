@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from ai_code_change_agent.application.jira.errors import JiraRateLimitError
 from ai_code_change_agent.application.jobs.queue import (
@@ -81,6 +82,26 @@ async def test_success_completes_the_job() -> None:
     assert await worker(q, {"k.one": ok}).run_once() is not None
     assert len(seen) == 1 and len(q.completed) == 1 and q.failed == []
     assert await worker(q, {"k.one": ok}).run_once() is None  # nothing left
+
+
+async def test_a_claimed_job_is_logged_with_its_attempt_and_never_its_payload() -> None:
+    async def ok(j: Job) -> None:
+        return None
+
+    claimed = Job(uuid.uuid4(), "k.one", {"api_token": "s3cret-value", "story": "text"}, 2, 3)
+    q = MemoryQueue([claimed])
+    with capture_logs() as logs:
+        await worker(q, {"k.one": ok}).run_once()
+    (line,) = [e for e in logs if e["event"] == "job_claimed"]
+    assert line == {
+        "event": "job_claimed",
+        "log_level": "info",
+        "job_id": str(claimed.id),
+        "kind": "k.one",
+        "attempt": 2,
+        "max_attempts": 3,
+    }
+    assert "s3cret-value" not in repr(logs) and "story" not in repr(logs)
 
 
 @pytest.mark.parametrize(

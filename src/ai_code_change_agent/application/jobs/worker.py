@@ -147,6 +147,14 @@ class Worker:
         return job
 
     async def process(self, job: Job) -> None:
+        # identifiers only: the payload can hold Story text and is never logged
+        _log.info(
+            "job_claimed",
+            job_id=str(job.id),
+            kind=job.kind,
+            attempt=job.attempts,
+            max_attempts=job.max_attempts,
+        )
         handler = self._handlers.get(job.kind)
         if handler is None:
             await self._queue.fail(job.id, self.owner, "no_handler", retry_in_seconds=None)
