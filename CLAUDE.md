@@ -4,10 +4,11 @@ Follow [AGENTS.md](AGENTS.md). Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ```bash
 uv sync
-uv run pytest
+uv run pytest                                             # needs Floci up and bootstrapped
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
-uv run alembic upgrade head
+docker compose -f infra/docker-compose.yml up -d --wait   # Floci: DynamoDB, SQS, S3 on 127.0.0.1:4566
+sh infra/floci/init/bootstrap.sh                          # tables, queue + DLQ, bucket (idempotent)
 uv run uvicorn ai_code_change_agent.main:app --reload
 uv run ai-code-change worker
 ```

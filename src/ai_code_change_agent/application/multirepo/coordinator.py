@@ -48,7 +48,7 @@ REPORT_STALE_SECONDS = 300  # an IN_PROGRESS claim older than this belongs to a 
 
 
 class ReportRetryableError(Exception):
-    """Raised by the report job so the PostgreSQL job queue retries it with backoff."""
+    """Raised by the report job so the job queue retries it with backoff."""
 
 
 def report_marker(parent_id: uuid.UUID, report_round: int) -> str:
@@ -399,8 +399,14 @@ class Coordinator:
 
     # ---- child lifecycle --------------------------------------------------------------------
     async def child_finished(self, child_id: uuid.UUID, attempt: CodeChangeAttempt) -> None:
+        """Record the child's outcome and advance its parent. Idempotent: a duplicate
+        notification records nothing new and only re-advances the parent (which finishes and
+        reports it at most once), so a worker that died between the two steps is recovered."""
         child = await self._store.child(child_id)
-        if child is None or child.terminal:
+        if child is None:
+            return
+        if child.terminal:
+            await self.advance(child.parent_id)
             return
         fields: dict[str, Any] = {}
         scope = ArtifactScope(attempt.request_id, attempt.id)

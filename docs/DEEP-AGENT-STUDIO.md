@@ -28,7 +28,7 @@ deep-agent-ui (Vite + React, @langchain/react useStream)  ──SSE──▶  la
 - **No subagents:** the subagent panel stays empty, because this project has one Deep Agent and the `task` tool is disabled. The card UI (`useMessages` / `useToolCalls` scoped to a subagent) renders any graph that does delegate.
 - **Todos:** these come from `TodoListMiddleware`, which only the implementation phase has.
 - **Cost:** computed from provider-reported `usage_metadata` and priced by the project's single price table through `POST /studio/cost`. This is LLM API cost only. Studio runs are **not** written to the worker's `llm_usage_records` ledger.
-- **Scope:** the studio is not part of the Jira → draft-PR pipeline. It has no Jira, GitHub or database access.
+- **Scope:** the studio is not part of the Jira → draft-PR pipeline. It has no Jira or GitHub access. It reads (never writes) the pipeline's DynamoDB tables and S3 bucket through the application's ports (`studio/stores.py`); it runs no SQL.
 
 ## History
 
@@ -39,10 +39,10 @@ The **History** sidebar (toggled in the header) has two tabs. Both are read-only
   - Clicking a run reopens it: transcript, todos, structured result and sandbox files.
   - The data comes from `GET /studio/threads`, which reads the Agent Server's own thread API.
 - **Jira pipeline:**
-  - It lists the worker's attempts from the database: issue, attempt number, repository, status and failure code.
-  - Each attempt shows its cost from `llm_usage_records`, broken down by stage, with token totals and models, plus a link to the draft PR when one exists.
+  - It lists the worker's attempts, newest first, from the DynamoDB attempt listing (GSI2 `LIST#ATTEMPT`): issue, attempt number, repository, status and failure code.
+  - Each attempt shows its cost from the usage ledger (`CostQuery`), broken down by stage, with token totals and models, plus a link to the draft PR when one exists (read from the attempt's `delivery_result` artifact through `ArtifactStore`, S3).
   - Attempts that ran before cost tracking existed show `n/a`, not $0.
-  - The data comes from `GET /studio/attempts`. It needs `DATABASE_URL`; without it the tab shows an error and the rest of the studio still works.
+  - The data comes from `GET /studio/attempts`. It needs the `ACCA_` AWS settings (`ACCA_AWS_ENDPOINT_URL` locally, the table names and the bucket); when the stores are unreachable the tab shows an error and the rest of the studio still works.
 
 ## Live Jira pipeline view
 
@@ -54,8 +54,8 @@ Use History → Jira pipeline, then click an attempt → **Watch live** (or **Op
   - one tab per agent run (planning, implementation, correction) with the full transcript, tool calls, todos and the structured result;
   - the worker's live workspace files and diffs. These are visible only while a phase runs, because the worker deletes its workspace afterwards.
 - **How it works:**
-  - The worker checkpoints every agent step to PostgreSQL.
-  - `GET /studio/attempts/{id}/live` rebuilds each phase's state from those checkpoints with the same agent graph, read-only.
+  - The worker checkpoints every agent step to DynamoDB (`DynamoDBSaver`, table `ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME`). When a planning or implementation run starts, it also indexes the run's thread id under the attempt (`ATTEMPT#<aid>/THREAD#<thread_id>`), because the checkpoint table cannot be searched by thread prefix. The index is best effort: a failure to write it is logged and never fails the phase.
+  - `GET /studio/attempts/{id}/live` reads that index and rebuilds each phase's state from the checkpoints with the same agent graph, read-only (`aget_state` only).
   - The UI polls it every 3 s while the attempt is not finished, and the attempt list refreshes every 5 s, so new Stories appear on their own.
 - **Freshness:** updates arrive per agent step, not token by token, because the worker runs in its own process and doesn't stream to the UI. The worker is unaffected.
 

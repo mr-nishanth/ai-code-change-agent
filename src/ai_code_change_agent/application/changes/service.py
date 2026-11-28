@@ -1,13 +1,17 @@
 """Code change use cases: the only way attempts change state or receive approvals.
 
 Each method is one transaction: the attempt row is locked, the domain method decides, the request
-status projection is updated in the same transaction.
+status projection is updated in the same transaction. A mutation that loses an optimistic race
+(`ConcurrentModificationError`) is retried as a whole method in a new unit of work (bounded, full
+jitter; DYNAMODB-DATA-MODEL.md 5.1); genuine conflicts are not retried.
 """
 
+import asyncio
 import uuid
 from collections.abc import Callable
 
-from ai_code_change_agent.application.changes.ports import ChangeUnitOfWork
+from ai_code_change_agent.application.changes.ports import AttemptListing, ChangeUnitOfWork
+from ai_code_change_agent.application.retry import Sleep, retry_concurrent
 from ai_code_change_agent.domain.changes.errors import (
     ActiveAttemptError,
     ChangeNotFoundError,
@@ -27,9 +31,12 @@ S = AttemptStatus
 
 
 class CodeChangeService:
-    def __init__(self, uow: UowFactory, *, max_repairs: int = 1) -> None:
+    def __init__(
+        self, uow: UowFactory, *, max_repairs: int = 1, sleep: Sleep = asyncio.sleep
+    ) -> None:
         self._uow = uow
         self._max_repairs = max_repairs
+        self._sleep = sleep
 
     async def get_request(self, request_id: uuid.UUID) -> CodeChangeRequest:
         async with self._uow() as uow:
@@ -49,6 +56,32 @@ class CodeChangeService:
         async with self._uow() as uow:
             return await uow.store.list_approvals(attempt_id)
 
+    async def recent_attempts(self, limit: int) -> list[AttemptListing]:
+        """Newest first, at most `limit` (studio listing, eventually consistent)."""
+        async with self._uow() as uow:
+            return await uow.store.list_recent_attempts(limit)
+
+    async def attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing:
+        async with self._uow() as uow:
+            listing = await uow.store.get_attempt_listing(attempt_id)
+        if listing is None:
+            raise ChangeNotFoundError("attempt_not_found")
+        return listing
+
+    @retry_concurrent
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        """Index an agent run's checkpoint thread (`attempt:<aid>:...`) under its attempt."""
+        if not thread_id.startswith(f"attempt:{attempt_id}:"):
+            raise ValueError("thread id does not belong to the attempt")
+        async with self._uow() as uow:
+            await uow.store.record_agent_thread(attempt_id, thread_id)
+            await uow.commit()
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        async with self._uow() as uow:
+            return await uow.store.agent_threads(attempt_id)
+
+    @retry_concurrent
     async def assign_repository(
         self, request_id: uuid.UUID, repository_id: uuid.UUID, profile_version_id: uuid.UUID
     ) -> CodeChangeRequest:
@@ -81,6 +114,7 @@ class CodeChangeService:
             await uow.commit()
             return req
 
+    @retry_concurrent
     async def start_attempt(self, request_id: uuid.UUID) -> CodeChangeAttempt:
         """A new attempt, or the active one (idempotent: a re-delivered intake never adds one)."""
         async with self._uow() as uow:
@@ -105,6 +139,7 @@ class CodeChangeService:
             await uow.commit()
             return attempt
 
+    @retry_concurrent
     async def start_repository_attempt(
         self, request_id: uuid.UUID, repository_id: uuid.UUID, profile_version_id: uuid.UUID
     ) -> CodeChangeAttempt:
@@ -131,6 +166,7 @@ class CodeChangeService:
             await uow.commit()
             return attempt
 
+    @retry_concurrent
     async def _mutate(
         self,
         attempt_id: uuid.UUID,
@@ -189,6 +225,7 @@ class CodeChangeService:
     ) -> CodeChangeAttempt:
         return await self._mutate(attempt_id, lambda a, _: a.record_manifest(ref, sha256))
 
+    @retry_concurrent
     async def decide(
         self,
         attempt_id: uuid.UUID,

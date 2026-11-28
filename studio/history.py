@@ -2,38 +2,35 @@
 
 - Studio threads: read from this Agent Server's own thread API; cost is priced from the
   provider-reported usage on each AI message (same rules as the worker's ledger).
-- Jira pipeline attempts: read from the project database (attempts, usage ledger) and the
-  attempt's delivery_result artifact (draft PR URL). Nothing is written."""
+- Jira pipeline attempts: read through the application's ports (`studio.stores`): the attempt
+  listing (S1), request and repository (C1, R4), the usage ledger (`CostQuery`, U2) and the
+  attempt's delivery_result artifact (`ArtifactStore`, S4) for the draft PR URL. Nothing is
+  written."""
 
+import asyncio
 import json
+import uuid
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Request
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
 
+from ai_code_change_agent.application.artifacts.errors import ArtifactError
+from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
+from ai_code_change_agent.application.artifacts.ports import ArtifactStore
+from ai_code_change_agent.application.changes.ports import AttemptListing
 from ai_code_change_agent.application.costs.pricing import PriceTable, TokenUsage
-from ai_code_change_agent.persistence.session import create_engine
+from ai_code_change_agent.application.costs.report import CostRow
+from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
+from studio.stores import StudioStores, stores
 from studio.workspaces import settings
 
 router = APIRouter()
 _prices = PriceTable()
-_engine: AsyncEngine | None = None
-
-
-def engine() -> AsyncEngine:
-    """The project database (read-only use)."""
-    global _engine
-    url = settings().database_url
-    if url is None:
-        raise RuntimeError("DATABASE_URL not configured")
-    if _engine is None:
-        _engine = create_engine(url.get_secret_value())
-    return _engine
+MAX_ATTEMPTS = 200
 
 
 def usage_of_message(msg: dict[str, Any]) -> tuple[str, TokenUsage] | None:
@@ -125,76 +122,59 @@ async def threads(request: Request, limit: int = 50) -> dict[str, Any]:
     }
 
 
-_ATTEMPTS = text(
-    """
-SELECT a.id, a.number, a.status, a.failure_code, a.repair_count, a.created_at, a.updated_at,
-       r.jira_issue_key, repo.repository_key
-FROM code_change_attempts a
-JOIN code_change_requests r ON r.id = a.request_id
-JOIN repositories repo ON repo.id = a.repository_id
-ORDER BY a.created_at DESC
-LIMIT :limit
-"""
-)
-_USAGE = text(
-    """
-SELECT attempt_id, stage, model, input_tokens, output_tokens, cache_write_5m_tokens,
-       cache_write_1h_tokens, cache_read_tokens, cost_usd
-FROM llm_usage_records WHERE attempt_id = ANY(:ids)
-"""
-)
+async def attempt_names(
+    st: StudioStores, attempts: Iterable[CodeChangeAttempt]
+) -> tuple[dict[uuid.UUID, str], dict[uuid.UUID, str]]:
+    """Jira issue key per request (C1) and repository key per repository (R4)."""
+    attempts = list(attempts)
+    request_ids = list(dict.fromkeys(a.request_id for a in attempts))
+    requests = await asyncio.gather(*(st.changes.get_request(r) for r in request_ids))
+    issues = {r.id: r.jira_issue_key for r in requests}
+    repositories: dict[uuid.UUID, str] = {}
+    async with st.registry() as uow:
+        for repository_id in dict.fromkeys(a.repository_id for a in attempts):
+            repo = await uow.store.get_repository_by_id(repository_id)
+            if repo is not None:
+                repositories[repository_id] = repo.repository_key
+    return issues, repositories
 
 
-def _pr_url(request_id: str | None, attempt_id: str) -> str | None:
-    root = settings().artifact_root
-    if not root or not request_id:
-        return None
-    folder = Path(root) / request_id / attempt_id
-    if not folder.is_dir() or folder.is_symlink():
-        return None
-    for meta_path in folder.glob("*.meta.json"):
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if meta.get("kind") != "delivery_result":
+def attempt_header(
+    listing: AttemptListing, issues: dict[uuid.UUID, str], repositories: dict[uuid.UUID, str]
+) -> dict[str, Any]:
+    a = listing.attempt
+    return {
+        "attempt_id": str(a.id),
+        "issue": issues.get(a.request_id),
+        "number": a.number,
+        "repository": repositories.get(a.repository_id),
+        "status": a.status.value,
+        "failure_code": a.failure_code,
+        "repairs": a.repair_count,
+        "created_at": listing.created_at.isoformat(),
+        "updated_at": listing.updated_at.isoformat(),
+    }
+
+
+async def pr_url(artifacts: ArtifactStore, attempt: CodeChangeAttempt) -> str | None:
+    """The draft PR link from the attempt's newest delivery_result artifact (re-hashed on read)."""
+    scope = ArtifactScope(attempt.request_id, attempt.id)
+    try:
+        metas = await artifacts.list(scope)
+        for meta in sorted(metas, key=lambda m: m.created_at, reverse=True):
+            if meta.kind is not ArtifactKind.DELIVERY_RESULT:
                 continue
-            blob = json.loads((folder / f"{meta['id']}.blob").read_text(encoding="utf-8"))
-            url = blob.get("pr_url")
+            blob = json.loads(await artifacts.get(scope, meta.id))
+            url = blob.get("pr_url") if isinstance(blob, dict) else None
             if isinstance(url, str) and url.startswith("https://github.com/"):
                 return url
-        except (OSError, ValueError, KeyError):
-            continue
+    except (ArtifactError, ValueError):
+        return None
     return None
 
 
-@router.get("/studio/attempts")
-async def attempts(limit: int = 50) -> dict[str, Any]:
-    if settings().database_url is None:
-        return {"attempts": [], "error": "DATABASE_URL not configured"}
-    try:
-        async with engine().connect() as conn:
-            rows = (
-                (await conn.execute(_ATTEMPTS, {"limit": max(1, min(limit, 200))})).mappings().all()
-            )
-            ids = [r["id"] for r in rows]
-            usage = (await conn.execute(_USAGE, {"ids": ids})).mappings().all() if ids else []
-            req = (
-                (
-                    await conn.execute(
-                        text(
-                            "SELECT id, request_id FROM code_change_attempts WHERE id = ANY(:ids)"
-                        ),
-                        {"ids": ids},
-                    )
-                )
-                .mappings()
-                .all()
-                if ids
-                else []
-            )
-    except Exception as exc:  # the studio must work without the pipeline database
-        return {"attempts": [], "error": f"database unavailable: {type(exc).__name__}"}
-    request_of = {str(r["id"]): str(r["request_id"]) for r in req}
-    per: dict[str, dict[str, Any]] = defaultdict(
+def _usage_stats(rows: Sequence[CostRow]) -> dict[uuid.UUID, dict[str, Any]]:
+    per: dict[uuid.UUID, dict[str, Any]] = defaultdict(
         lambda: {
             "calls": 0,
             "unknown": 0,
@@ -205,37 +185,41 @@ async def attempts(limit: int = 50) -> dict[str, Any]:
             "models": set(),
         }
     )
-    for u in usage:
-        p = per[str(u["attempt_id"])]
+    for row in rows:
+        record = row.record
+        if record.attempt_id is None:
+            continue
+        p = per[record.attempt_id]
         p["calls"] += 1
-        p["models"].add(u["model"])
-        if u["input_tokens"] is None or u["cost_usd"] is None:
+        p["models"].add(record.model)
+        if record.usage is None or record.cost_usd is None:
             p["unknown"] += 1
             continue
-        p["cost"] += u["cost_usd"]
-        p["stages"][u["stage"]] += u["cost_usd"]
-        p["in"] += (
-            u["input_tokens"]
-            + (u["cache_read_tokens"] or 0)
-            + (u["cache_write_5m_tokens"] or 0)
-            + (u["cache_write_1h_tokens"] or 0)
-        )
-        p["out"] += u["output_tokens"]
+        p["cost"] += record.cost_usd
+        p["stages"][record.stage] += record.cost_usd
+        p["in"] += record.usage.prompt_tokens
+        p["out"] += record.usage.output_tokens
+    return per
+
+
+@router.get("/studio/attempts")
+async def attempts(limit: int = 50) -> dict[str, Any]:
+    try:
+        st = stores()
+        listings = await st.changes.recent_attempts(max(1, min(limit, MAX_ATTEMPTS)))
+        found = [x.attempt for x in listings]
+        issues, repositories = await attempt_names(st, found)
+        usage = await st.costs.rows(attempt_ids=[a.id for a in found]) if found else []
+        links = await asyncio.gather(*(pr_url(st.artifacts, a) for a in found))
+    except Exception as exc:  # the studio must work without the pipeline stores
+        return {"attempts": [], "error": f"store unavailable: {type(exc).__name__}"}
+    per = _usage_stats(usage)
     out = []
-    for r in rows:
-        aid = str(r["id"])
-        stats = per.get(aid)
+    for listing, link in zip(listings, links, strict=True):
+        stats = per.get(listing.attempt.id)
         out.append(
             {
-                "attempt_id": aid,
-                "issue": r["jira_issue_key"],
-                "number": r["number"],
-                "repository": r["repository_key"],
-                "status": r["status"],
-                "failure_code": r["failure_code"],
-                "repairs": r["repair_count"],
-                "created_at": r["created_at"].isoformat(),
-                "updated_at": r["updated_at"].isoformat(),
+                **attempt_header(listing, issues, repositories),
                 "calls": stats["calls"] if stats else 0,
                 "unknown_usage_calls": stats["unknown"] if stats else 0,
                 "tokens_in": stats["in"] if stats else 0,
@@ -244,7 +228,7 @@ async def attempts(limit: int = 50) -> dict[str, Any]:
                 "cost_usd": f"{stats['cost']:.6f}" if stats else None,
                 "stage_costs": {k: f"{v:.6f}" for k, v in stats["stages"].items()} if stats else {},
                 "models": sorted(stats["models"]) if stats else [],
-                "pr_url": _pr_url(request_of.get(aid), aid),
+                "pr_url": link,
             }
         )
     return {"attempts": out, "pricing_version": _prices.version}

@@ -41,7 +41,7 @@ Configure one Jira webhook that sends Story creation events to the API.
 3. Create a Story in `KAN`.
 4. Expect one row in `jira_deliveries` and `code_change_requests`, and a `code_change.intake` job in `jobs`.
 
-**Not yet verified with real Jira:** no real Jira delivery has reached either project. Webhook intake has been verified with unit tests, Postgres integration tests and a local HTTP check (an unsigned request is rejected with 401).
+**Not yet verified with real Jira:** no real Jira delivery has reached either project. Webhook intake has been verified with unit tests, database integration tests (PostgreSQL before ADR-015, DynamoDB on Floci since) and a local HTTP check (an unsigned request is rejected with 401).
 
 ## Reporting (optional)
 

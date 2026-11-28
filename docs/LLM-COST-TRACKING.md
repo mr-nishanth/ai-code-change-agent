@@ -1,6 +1,6 @@
 # LLM API usage and cost tracking
 
-Every model call made by the coding agent is captured and priced. The worker prints the cost in the terminal when an attempt finishes or crashes, and prints a session summary when it stops. The amounts are **LLM API cost only**: Docker, the database, GitHub, Jira and servers are not measured.
+Every model call made by the coding agent is captured and priced. The worker prints the cost in the terminal when an attempt finishes or crashes, and prints a session summary when it stops. The amounts are **LLM API cost only**: Docker, DynamoDB, SQS, S3, GitHub, Jira and servers are not measured (DynamoDB request units are estimated in [DYNAMODB-DATA-MODEL.md](aws/DYNAMODB-DATA-MODEL.md) section 13).
 
 ## Provider and model
 
@@ -41,8 +41,8 @@ A local, untracked script under `var/` is run by hand; it makes real model calls
 
 ### Persistence and idempotency
 
-- **Table:** `llm_usage_records`, created by migration `0002`. It is append-only: a trigger rejects `UPDATE` and `DELETE`.
-- **Unique keys:** the call id (primary key) and the provider message id. A replayed insert or a replayed response is therefore stored once.
+- **Store:** usage items in the DynamoDB application table (`persistence/dynamodb/usage_store.py`), written once with a condition and never updated or deleted; reports query them by attempt and by Story (GSI1).
+- **Unique keys:** the call id and the provider message id each have a uniqueness guard item written in the same transaction as the record. A replayed insert or a replayed response is therefore stored once.
 - **Retries:**
   - A LangGraph node that really re-runs after a crash makes new provider calls. These are billed, so they are recorded.
   - Retries inside the Anthropic SDK (`LLM_MAX_RETRIES`) are not visible to the callback. Only the final response is recorded, so a retried request that was billed is missing from the totals.
@@ -83,7 +83,7 @@ call_cost = input x input_rate + output x output_rate + cache_write_5m x w5 + ca
   - per task: this session's cost and the cumulative task cost;
   - per attempt: its cost;
   - the session total.
-- **Source of the numbers:** both reports are computed from the database, so a restarted worker reports correct cumulative totals.
+- **Source of the numbers:** both reports are computed from the DynamoDB ledger (strongly consistent reads), so a restarted worker reports correct cumulative totals.
 - **On demand:** `uv run ai-code-change costs --issue KAN-7 [--attempt ID] [--session ID]` prints the same reports.
 - **Incomplete costs:** missing usage is printed as `at least $X (INCOMPLETE: n call(s) without usage)`, never as zero.
 
@@ -91,6 +91,16 @@ call_cost = input x input_rate + output x output_rate + cache_write_5m x w5 + ca
 
 - **Pricing:** Bedrock is partner-priced, and its model ids (`anthropic.…`, inference profiles) are not in the built-in table. Until you set `LLM_PRICING_FILE` with your Bedrock rates and model ids, Bedrock calls are reported as **unknown cost**, never $0.
 - **Usage capture:** comes from LangChain's normalised `usage_metadata`, the fallback path described under Capture.
+
+## Bedrock through Floci (local only): provider `bedrock-floci`
+
+With `LLM_PROVIDER=bedrock` and `ACCA_BEDROCK_ENDPOINT_URL` (development and test only), `ChatBedrockConverse` talks to the Floci Bedrock Runtime, whose `proxy` backend forwards to Anthropic's OpenAI-compatible endpoint ([ADR-015](decisions/ADR-015-dynamodb-sqs-s3-persistence.md)). That is a real, paid Anthropic call.
+
+- **Ledger label:** rows are recorded with provider `bedrock-floci` (`Settings.llm_ledger_provider`), and the cost report shows that label, so they are never mistaken for real Bedrock spend. Real Bedrock keeps `bedrock`.
+- **Usage:** input and output tokens only; the OpenAI-compatible path reports no cache tokens, so prompt caching neither shows up nor is billed as cached.
+- **Pricing:** by the configured (Bedrock-style) model id, like real Bedrock: unknown cost unless `LLM_PRICING_FILE` prices that id. The budget guard uses the matching Claude list price.
+- **Canary (2026-11-27, owner-approved):** 5 calls with `claude-haiku-5-5` through a throwaway Floci (simple reply, tool call, tool-result round trip, two-turn conversation, structured output): all passed, 1,411 input + 140 output = 1,551 tokens, computed cost $0.0002111 (cap $0.10); the 5 ledger rows (provider `bedrock-floci`) matched the token counts. Provider-side spend was not checked against the Anthropic console.
+- **Not verified:** streaming (`ConverseStream`; the agent never streams), prompt caching, stop-reason and error/throttle mapping, and real Bedrock model ids (the canary's `us.anthropic.claude-haiku-5-5-v1:0` was only a proxy mapping key).
 
 ## Limitations
 

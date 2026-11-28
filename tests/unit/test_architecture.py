@@ -32,8 +32,15 @@ def where(root_module: str) -> set[str]:
 def test_sdk_imports_are_confined() -> None:
     assert where("deepagents") <= {"agents/coding/agent.py", "execution/docker/sandbox.py"}
     assert where("langchain_anthropic") == {"providers/llm/factory.py"}
-    for sdk in ("langchain_aws", "boto3", "botocore"):
-        assert where(sdk) <= {"providers/llm/factory.py"}, sdk
+    assert where("langchain_aws") <= {"providers/llm/factory.py"}
+    for sdk in ("boto3", "botocore"):
+        outside = {
+            p
+            for p in where(sdk)
+            if not p.startswith(("integrations/aws/", "persistence/dynamodb/"))
+        }
+        assert outside <= {"providers/llm/factory.py"}, sdk
+    assert where("langgraph_checkpoint_aws") <= {"orchestration/langgraph/checkpointer.py"}
     assert {p for p in where("langgraph") if not p.startswith("orchestration/")} <= {
         "agents/coding/agent.py"
     }
@@ -41,6 +48,23 @@ def test_sdk_imports_are_confined() -> None:
         "integrations/github/authentication.py",
         "integrations/github/credentials.py",
     }
+
+
+def test_nothing_imports_a_sql_driver_orm_or_migration_tool() -> None:
+    """DynamoDB is the only application database: no path to PostgreSQL in src or studio."""
+    banned = (
+        "sqlalchemy",
+        "psycopg",
+        "psycopg2",
+        "asyncpg",
+        "alembic",
+        "langgraph.checkpoint.postgres",
+    )
+    sources = [*files(), *sorted((ROOT / "studio").rglob("*.py")), *(ROOT / "scripts").glob("*.py")]
+    assert len(sources) > 50 and any(p.parent.name == "studio" for p in sources)
+    for p in sources:
+        for name in imports(p):
+            assert not any(name == b or name.startswith(b + ".") for b in banned), (p, name)
 
 
 def test_there_is_exactly_one_agent_and_it_holds_no_credentials() -> None:

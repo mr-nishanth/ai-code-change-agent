@@ -1,5 +1,6 @@
 """Deep Agent studio (dev-only Agent Server routes): path confinement and pricing."""
 
+import uuid
 from pathlib import Path
 
 import pytest
@@ -92,3 +93,53 @@ def test_worker_thread_ids_map_to_pipeline_stages() -> None:
     assert _phase(f"attempt:{a}:implementation:1:223c96b3")["stage"] == "correction"
     assert _THREAD.fullmatch(f"attempt:{a}:planning:6cfe6af9")
     assert not _THREAD.fullmatch(f"attempt:{a}")  # the parent workflow thread is not an agent run
+
+
+def test_attempt_history_reports_an_unavailable_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    import studio.history
+
+    def unavailable() -> None:
+        raise RuntimeError("no endpoint")
+
+    monkeypatch.setattr(studio.history, "stores", unavailable)
+    body = TestClient(app).get("/studio/attempts").json()
+    assert body == {"attempts": [], "error": "store unavailable: RuntimeError"}
+
+
+async def test_pr_link_skips_unreadable_delivery_results() -> None:
+    from datetime import UTC, datetime
+
+    from studio.history import pr_url
+
+    from ai_code_change_agent.application.artifacts.errors import ArtifactIntegrityError
+    from ai_code_change_agent.application.artifacts.models import (
+        ArtifactKind,
+        ArtifactMeta,
+        ArtifactScope,
+    )
+    from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
+
+    attempt = CodeChangeAttempt(uuid.uuid4(), uuid.uuid4(), 1, uuid.uuid4(), uuid.uuid4())
+    scope = ArtifactScope(attempt.request_id, attempt.id)
+
+    def meta(art: str, kind: ArtifactKind) -> ArtifactMeta:
+        return ArtifactMeta(art, kind, scope, "0" * 64, 1, datetime.now(UTC), "", 0)
+
+    class Store:
+        def __init__(self, blobs: dict[str, bytes | Exception]) -> None:
+            self.blobs = blobs
+
+        async def list(self, _: ArtifactScope) -> list[ArtifactMeta]:
+            return [meta(k, ArtifactKind.DELIVERY_RESULT) for k in self.blobs]
+
+        async def get(self, _: ArtifactScope, art: str) -> bytes:
+            blob = self.blobs[art]
+            if isinstance(blob, Exception):
+                raise blob
+            return blob
+
+    assert await pr_url(Store({"a": b'{"pr_url": "http://evil/x"}'}), attempt) is None  # type: ignore[arg-type]
+    assert await pr_url(Store({"a": b"[1]"}), attempt) is None  # type: ignore[arg-type]
+    assert await pr_url(Store({"a": b"not json"}), attempt) is None  # type: ignore[arg-type]
+    broken = Store({"a": ArtifactIntegrityError("x")})
+    assert await pr_url(broken, attempt) is None  # type: ignore[arg-type]

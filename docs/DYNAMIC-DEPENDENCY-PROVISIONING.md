@@ -192,7 +192,7 @@ python -m pip check
 4. **Workflow:**
    - a `prepare_dependencies` step after PLAN approval;
    - replace the blanket block in `steps.dependency_preparation` with "bundle ready or BLOCKED";
-   - record `dependency_lock_sha256` and the image digest on the attempt (Alembic migration, forward-only).
+   - record `dependency_lock_sha256` and the image digest on the attempt (then a schema migration; since ADR-015 attributes of the attempt item).
 5. **Sandbox and validation:**
    - optional read-only `/deps` mount in `sandbox_run_argv` and the validation runner;
    - an offline install command in the command policy (`pip install --no-index ...`, network none).

@@ -1,9 +1,14 @@
-"""Composition root: the only place that wires adapters to ports. Built once per process."""
+"""Composition root: the only place that wires adapters to ports. Built once per process.
+
+Storage is DynamoDB (application table and checkpoint table), SQS (the job queue) and S3
+(artifacts and offloaded checkpoints), all through one `AwsClients` per process. The API builds
+only the webhook repository and its readiness probe on DynamoDB; it never creates an SQS or S3
+client."""
 
 import contextlib
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -11,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import BaseTool
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ai_code_change_agent.agents.coding.agent import CodingAgent
 from ai_code_change_agent.agents.coding.configuration import CodingAgentConfig
@@ -19,14 +23,16 @@ from ai_code_change_agent.agents.coding.tools import build_reference_tool, build
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.costs.pricing import PriceTable
-from ai_code_change_agent.application.costs.report import totals
+from ai_code_change_agent.application.costs.report import CostQuery, totals
 from ai_code_change_agent.application.costs.service import CostReporter
 from ai_code_change_agent.application.costs.usage import UsageTracker
 from ai_code_change_agent.application.git_providers.baseline import BaselineReaders
 from ai_code_change_agent.application.git_providers.delivery import DeliveryPublishers
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
+from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.jobs.worker import Worker
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
+from ai_code_change_agent.application.multirepo.models import MultiRepoStore
 from ai_code_change_agent.application.references.ports import SearchResult
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
 from ai_code_change_agent.application.repositories.profile_reader import ProfileReader
@@ -40,13 +46,14 @@ from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.core.tracing import configure_tracing, flush_traces
 from ai_code_change_agent.domain.repositories.command_policy import CommandPolicy
 from ai_code_change_agent.domain.webhooks.policy import ScopePolicy
-from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.execution.docker.dependencies import DockerDependencyPreparer
 from ai_code_change_agent.execution.docker.metadata_verifier import MetadataVerifier
 from ai_code_change_agent.execution.docker.process import SubprocessRunner
 from ai_code_change_agent.execution.docker.resolver_network import ResolverEgress, egress_hosts
 from ai_code_change_agent.execution.docker.runtime import ContainerLimits, DockerWorkspaceRuntime
 from ai_code_change_agent.execution.docker.sandbox import SandboxLimits, SandboxManager
+from ai_code_change_agent.execution.s3_artifacts import S3ArtifactStore
+from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.integrations.github.authentication import GitHubAppAuth
 from ai_code_change_agent.integrations.github.baseline import PROVIDER_KEY as GITHUB_KEY
 from ai_code_change_agent.integrations.github.baseline import GitHubBaselineReader
@@ -71,44 +78,87 @@ from ai_code_change_agent.orchestration.intake import (
     ParentReportHandler,
     ResumeHandler,
 )
-from ai_code_change_agent.orchestration.langgraph.checkpointer import postgres_checkpointer
+from ai_code_change_agent.orchestration.langgraph.checkpointer import dynamodb_checkpointer
 from ai_code_change_agent.orchestration.langgraph.graph import build_graph
 from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps, StepDependencies
-from ai_code_change_agent.persistence.repositories.change_store import SqlChangeUnitOfWork
-from ai_code_change_agent.persistence.repositories.job_queue import PostgresJobQueue
-from ai_code_change_agent.persistence.repositories.multirepo_store import PostgresMultiRepoStore
-from ai_code_change_agent.persistence.repositories.registry_store import (
-    SqlAlchemyRegistryUnitOfWork,
-)
-from ai_code_change_agent.persistence.repositories.usage_store import PostgresUsageStore
-from ai_code_change_agent.persistence.repositories.webhook_repository import (
-    SqlAlchemyWebhookRepository,
-)
-from ai_code_change_agent.persistence.session import create_engine, create_session_factory
+from ai_code_change_agent.persistence.dynamodb import PersistenceError, RetryPolicy, Table
+from ai_code_change_agent.persistence.dynamodb.change_store import DynamoChangeUnitOfWork
+from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
+from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
+from ai_code_change_agent.persistence.dynamodb.registry_store import DynamoRegistryUnitOfWork
+from ai_code_change_agent.persistence.dynamodb.usage_store import DynamoUsageStore
+from ai_code_change_agent.persistence.dynamodb.webhook_repository import DynamoWebhookRepository
 from ai_code_change_agent.providers.llm.factory import build_chat_model
 
 _log = get_logger(__name__)
 
 
-def require_database(settings: Settings) -> str:
-    if settings.database_url is None:
-        msg = "DATABASE_URL is required"
-        raise ConfigurationError(msg)
-    return settings.database_url.get_secret_value()
+# ---- storage --------------------------------------------------------------------------------
+def app_table(settings: Settings, aws: AwsClients) -> Table:
+    """The application table (ACCA_DYNAMODB_TABLE_NAME)."""
+    return Table(aws.dynamodb, settings.dynamodb_table_name)
+
+
+ReadinessProbe = Callable[[], Awaitable[bool]]
+
+
+def build_readiness_probe(settings: Settings, aws: AwsClients) -> ReadinessProbe:
+    """True when `DescribeTable` reports the application table ACTIVE. The probe has its own
+    DynamoDB client bounded by READINESS_TIMEOUT_SECONDS; a failure is `PersistenceError` (a code,
+    never driver text) or a timeout, which the health route turns into 503."""
+    table = Table(
+        aws.dynamodb_probe(settings.readiness_timeout_seconds), settings.dynamodb_table_name
+    )
+
+    async def probe() -> bool:
+        return await table.status() == "ACTIVE"
+
+    return probe
+
+
+async def require_tables(settings: Settings, aws: AwsClients) -> None:
+    """Fail fast when the application or checkpoint table does not exist or is not ACTIVE."""
+    for name in (settings.dynamodb_table_name, settings.dynamodb_checkpoint_table_name):
+        try:
+            status = await Table(aws.dynamodb, name).status()
+        except PersistenceError as exc:
+            status = str(exc)
+        if status != "ACTIVE":
+            msg = f"DynamoDB table {name} is not available ({status}); run the Floci bootstrap"
+            raise ConfigurationError(msg)
+
+
+def build_job_queue(settings: Settings, aws: AwsClients) -> DynamoSqsJobQueue:
+    """The job queue: job items (and their outbox entry) in the table, delivery through SQS. The
+    lease renewal (J4) uses its own bounded clients and a single attempt (`heartbeat_config`), so
+    a renewal the worker abandoned at its margin cannot keep running for minutes."""
+    return DynamoSqsJobQueue(
+        app_table(settings, aws),
+        aws.sqs,
+        aws.queue_url,
+        heartbeat_table=Table(
+            aws.dynamodb_heartbeat, settings.dynamodb_table_name, retry=RetryPolicy(attempts=1)
+        ),
+        heartbeat_sqs=aws.sqs_heartbeat,
+    )
+
+
+def build_usage_store(settings: Settings, aws: AwsClients) -> DynamoUsageStore:
+    return DynamoUsageStore(app_table(settings, aws))
 
 
 # ---- Jira -----------------------------------------------------------------------------------
-def build_webhook_service(
-    settings: Settings, session_factory: async_sessionmaker[AsyncSession]
-) -> ReceiveJiraWebhook:
+def build_webhook_service(settings: Settings, aws: AwsClients) -> ReceiveJiraWebhook:
     if settings.jira_webhook_secret is None:
         msg = "JIRA_WEBHOOK_SECRET is required for the webhook"
         raise ConfigurationError(msg)
     return ReceiveJiraWebhook(
         verifier=JiraCloudSignatureVerifier(settings.jira_webhook_secret.get_secret_value()),
-        repository=SqlAlchemyWebhookRepository(
-            session_factory, job_max_attempts=settings.job_max_attempts
+        repository=DynamoWebhookRepository(
+            app_table(settings, aws),
+            job_max_attempts=settings.job_max_attempts,
+            delivery_retention_days=settings.jira_delivery_retention_days,
         ),
         policy=ScopePolicy(
             supported_event=settings.jira_webhook_event,
@@ -163,24 +213,20 @@ def build_jira_reporter(settings: Settings) -> JiraOutcomeReporter:
 
 
 # ---- registry and GitHub ------------------------------------------------------------------
-def registry_uow_factory(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> Callable[[], RegistryUnitOfWork]:
-    return lambda: SqlAlchemyRegistryUnitOfWork(session_factory)
+def registry_uow_factory(settings: Settings, aws: AwsClients) -> Callable[[], RegistryUnitOfWork]:
+    table = app_table(settings, aws)
+    return lambda: DynamoRegistryUnitOfWork(table)
 
 
 def build_registry_service(
-    session_factory: async_sessionmaker[AsyncSession],
-    providers: GitProviderRegistry | None = None,
+    settings: Settings, aws: AwsClients, providers: GitProviderRegistry | None = None
 ) -> RepositoryRegistryService:
-    return RepositoryRegistryService(registry_uow_factory(session_factory), providers=providers)
+    return RepositoryRegistryService(registry_uow_factory(settings, aws), providers=providers)
 
 
-def build_repository_resolver(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> RepositoryResolver:
+def build_repository_resolver(settings: Settings, aws: AwsClients) -> RepositoryResolver:
     return RepositoryResolver(
-        registry_uow_factory(session_factory), parsers=(GitHubReferenceParser(),)
+        registry_uow_factory(settings, aws), parsers=(GitHubReferenceParser(),)
     )
 
 
@@ -225,12 +271,11 @@ def build_delivery_publishers(
 
 
 # ---- execution ---------------------------------------------------------------------------
-def build_artifact_service(settings: Settings) -> ArtifactService:
-    if settings.artifact_root is None:
-        msg = "ARTIFACT_ROOT is required"
-        raise ConfigurationError(msg)
-    store = LocalFilesystemArtifactStore(
-        Path(settings.artifact_root), max_artifact_bytes=settings.artifact_max_bytes
+def build_artifact_service(settings: Settings, aws: AwsClients) -> ArtifactService:
+    """Artifacts in the S3 bucket (write-once, re-hashed on read). Workspaces and dependency
+    bundles stay on the local disk (WORKSPACE_ROOT, ARTIFACT_ROOT)."""
+    store = S3ArtifactStore(
+        aws.s3, settings.s3_bucket_name, max_artifact_bytes=settings.artifact_max_bytes
     )
     return ArtifactService(
         store,
@@ -396,12 +441,14 @@ def build_price_table(settings: Settings) -> PriceTable:
 
 
 def build_cost_reporter(
-    sessions: async_sessionmaker[AsyncSession],
+    query: CostQuery,
     settings: Settings,
     changes: CodeChangeService,
     session_id: uuid.UUID,
     write: Callable[[str], Any] = sys.stdout.write,
 ) -> CostReporter:
+    """Cost reports from the usage ledger `query` (any `CostQuery` adapter)."""
+
     async def status_of(attempt_id: uuid.UUID) -> tuple[str, bool]:
         attempt = await changes.get_attempt(attempt_id)
         return attempt.status.value, attempt.terminal
@@ -412,9 +459,9 @@ def build_cost_reporter(
             sys.stdout.flush()
 
     return CostReporter(
-        PostgresUsageStore(sessions),
+        query,
         build_price_table(settings),
-        provider=settings.llm_provider,
+        provider=settings.llm_ledger_provider,
         primary_model=settings.llm_model or "-",
         session_id=session_id,
         status_of=status_of,
@@ -422,19 +469,40 @@ def build_cost_reporter(
     )
 
 
-def build_change_service(
-    session_factory: async_sessionmaker[AsyncSession], settings: Settings
-) -> CodeChangeService:
+def build_change_service(settings: Settings, aws: AwsClients) -> CodeChangeService:
+    table = app_table(settings, aws)
     return CodeChangeService(
-        lambda: SqlChangeUnitOfWork(session_factory), max_repairs=settings.max_repair_attempts
+        lambda: DynamoChangeUnitOfWork(table), max_repairs=settings.max_repair_attempts
+    )
+
+
+# ---- API ------------------------------------------------------------------------------------
+@dataclass
+class ApiApp:
+    """What the API process needs: webhook intake (None when not configured) and readiness."""
+
+    webhook_service: ReceiveJiraWebhook | None
+    readiness: ReadinessProbe
+
+
+def build_api(settings: Settings, aws: AwsClients | None = None) -> ApiApp:
+    """DynamoDB only: the webhook repository writes the delivery, request and job (with its outbox
+    entry) in one transaction; the worker relays the job to SQS."""
+    clients = aws or AwsClients(settings)
+    return ApiApp(
+        webhook_service=(
+            build_webhook_service(settings, clients) if settings.jira_webhook_configured else None
+        ),
+        readiness=build_readiness_probe(settings, clients),
     )
 
 
 @asynccontextmanager
-async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
-    """Everything the worker needs, built once. Fails fast on missing configuration."""
+async def worker_app(settings: Settings, aws: AwsClients | None = None) -> AsyncIterator[WorkerApp]:
+    """Everything the worker needs, built once. Fails fast on missing configuration and on a
+    missing application or checkpoint table."""
     tracing = configure_tracing(settings)  # LangSmith: worker only, off unless configured
-    url = require_database(settings)
+    clients = aws or AwsClients(settings)
     jira = build_jira_reader(settings)
     if jira is None:
         msg = "JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN are required for the worker"
@@ -443,12 +511,12 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
     if auth is None:
         msg = "the GitHub App configuration is required for the worker"
         raise ConfigurationError(msg)
-    engine: AsyncEngine = create_engine(url)
-    sessions = create_session_factory(engine)
-    registry = registry_uow_factory(sessions)
-    changes = build_change_service(sessions, settings)
+    registry = registry_uow_factory(settings, clients)
+    changes = build_change_service(settings, clients)
     runtime = build_workspace_runtime(settings)
-    costs = build_cost_reporter(sessions, settings, changes, uuid.uuid4())
+    usage_store = build_usage_store(settings, clients)
+    queue = build_job_queue(settings, clients)
+    costs = build_cost_reporter(usage_store, settings, changes, uuid.uuid4())
     prices = build_price_table(settings)
     if settings.llm_model and not prices.knows(settings.llm_model):
         _log.warning(
@@ -458,18 +526,29 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             "phase budget uses the matching Claude list price when one exists",
         )
     usage = UsageTracker(
-        PostgresUsageStore(sessions),
+        usage_store,
         build_price_table(settings),
-        provider=settings.llm_provider,
+        provider=settings.llm_ledger_provider,
         model=settings.llm_model or "-",
         session_id=costs.session_id,
         phase_budget_usd=Decimal(str(settings.llm_max_cost_per_phase_usd)),
     )
-    async with postgres_checkpointer(url, settings.langgraph_checkpoint_schema) as saver:
-        artifacts = build_artifact_service(settings)
+    try:
+        await require_tables(settings, clients)
+        saver = dynamodb_checkpointer(clients, settings)
+        artifacts = build_artifact_service(settings, clients)
         reporter = build_jira_reporter(settings)
-        resolver = build_repository_resolver(sessions)
-        coordinator = build_coordinator(sessions, settings, changes, artifacts, resolver, reporter)
+        resolver = build_repository_resolver(settings, clients)
+        coordinator = build_coordinator(
+            settings,
+            store=DynamoMultiRepoStore(app_table(settings, clients)),
+            queue=queue,
+            usage=usage_store,
+            changes=changes,
+            artifacts=artifacts,
+            resolver=resolver,
+            reporter=reporter,
+        )
         deps = StepDependencies(
             changes=changes,
             registry_uow=registry,
@@ -505,7 +584,8 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
             multirepo=coordinator,
             toolchains=frozenset(execution_images(settings)),
         )
-        runner = WorkflowRunner(build_graph(CodeChangeSteps(deps), saver))
+        steps = CodeChangeSteps(deps)
+        runner = WorkflowRunner(build_graph(steps, saver))
         handlers: dict[str, Any] = {
             INTAKE: IntakeHandler(
                 changes=changes,
@@ -516,45 +596,54 @@ async def worker_app(settings: Settings) -> AsyncIterator[WorkerApp]:
                 reporter=deps.reporter,
                 coordinator=coordinator,
             ),
-            RESUME: ResumeHandler(costs.around(runner.resume)),
+            RESUME: ResumeHandler(
+                runner.resume,
+                changes=changes,
+                coordinator=coordinator,
+                report=steps.cleanup,  # the once-per-attempt Jira report (checkpoint_expired)
+                around=costs.around,
+            ),
             CHILD: ChildHandler(
                 coordinator=coordinator, changes=changes, start=costs.around(runner.start)
             ),
             PARENT_REPORT: ParentReportHandler(coordinator=coordinator),
         }
         worker = Worker(
-            PostgresJobQueue(sessions),
+            queue,
             handlers,
             lease_seconds=settings.job_lease_seconds,
             heartbeat_seconds=settings.job_heartbeat_seconds,
             concurrency=settings.max_concurrent_jobs,
+            relay_seconds=settings.job_relay_seconds,
+            sweep_seconds=settings.job_sweep_seconds,
         )
-        try:
-            yield WorkerApp(worker, runner, changes, costs)
-        finally:
-            await jira.aclose()
-            if tracing:
-                flush_traces()
-            await engine.dispose()
+        yield WorkerApp(worker, runner, changes, costs)
+    finally:
+        await jira.aclose()
+        if tracing:
+            flush_traces()
 
 
 def build_coordinator(
-    sessions: async_sessionmaker[AsyncSession],
     settings: Settings,
+    *,
+    store: MultiRepoStore,
+    queue: JobQueue,
+    usage: CostQuery,
     changes: CodeChangeService,
     artifacts: Any,
     resolver: RepositoryResolver,
     reporter: Any,
 ) -> Coordinator:
-    usage = PostgresUsageStore(sessions)
+    """The multi-repository coordinator over the given store, job queue and usage ledger."""
 
     async def cost_of_issue(issue_key: str) -> str:
         return totals(r.record for r in await usage.rows(issue_keys=[issue_key])).money()
 
     return Coordinator(
-        store=PostgresMultiRepoStore(sessions),
+        store=store,
         changes=changes,
-        queue=PostgresJobQueue(sessions),
+        queue=queue,
         artifacts=artifacts,
         resolver=resolver,
         reporter=reporter,

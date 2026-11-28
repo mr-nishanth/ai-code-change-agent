@@ -1,6 +1,6 @@
 # Configuration (environment contract)
 
-Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Settings). They are read from the environment or `.env`, with no prefix. `.env.example` lists every variable.
+Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Settings). They are read from the environment or `.env`, with no prefix, except the AWS settings, which carry `ACCA_` ([AWS services](#aws-services-dynamodb-sqs-s3)). `.env.example` lists every variable; `tests/unit/test_settings_docs.py` checks that every `ACCA_` setting appears in both files.
 
 - **Secrets** are `SecretStr` and never logged.
 - **The GitHub App private key** is referenced by absolute path only.
@@ -8,15 +8,15 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
   - partial GitHub App or Jira REST configuration is refused;
   - `GITHUB_PR_CREATE_ENABLED` and `JIRA_REPORTING_ENABLED` require their credentials;
   - `JOB_HEARTBEAT_SECONDS` must be at most half of `JOB_LEASE_SECONDS`;
-  - staging and production require `DATABASE_URL`, `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS` and `LLM_PROVIDER=bedrock`.
+  - `JOB_SWEEP_SECONDS` must be at least `JOB_RELAY_SECONDS`;
+  - staging and production require `JIRA_WEBHOOK_SECRET`, `JIRA_PROJECT_KEYS` and `LLM_PROVIDER=bedrock`, and refuse `ACCA_AWS_ENDPOINT_URL` and `ACCA_BEDROCK_ENDPOINT_URL`;
+  - development and test require `ACCA_AWS_ENDPOINT_URL` (the local Floci endpoint), staging and production must not set it (see [AWS services](#aws-services-dynamodb-sqs-s3)); both violations raise `ConfigurationError`.
 
 | Variable | Default | Secret | Used by |
 |---|---|---|---|
 | APP_ENV | development | | all (`development`, `test`, `staging`, `production`) |
 | APP_NAME, APP_HOST, APP_PORT | ai-code-change-agent, 127.0.0.1, 8000 | | API |
 | LOG_LEVEL, LOG_JSON | INFO, true | | all |
-| DATABASE_URL | - | yes (password) | API, worker, CLI, Alembic |
-| LANGGRAPH_CHECKPOINT_SCHEMA | langgraph | | worker |
 | JIRA_BASE_URL, JIRA_EMAIL | - | | worker (read, report) |
 | JIRA_API_TOKEN | - | **yes** | worker |
 | JIRA_WEBHOOK_SECRET | - | **yes** | API |
@@ -30,11 +30,12 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
 | GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID | - | | worker, CLI |
 | GITHUB_APP_PRIVATE_KEY_PATH | - | path to a secret | worker, CLI |
 | CODE_CHANGE_DELIVERY_ENABLED, GITHUB_PR_CREATE_ENABLED | false, false | | worker (both needed to publish) |
-| LLM_PROVIDER | anthropic | | worker. Two providers only: `anthropic` (Claude API, local development and tests) and `bedrock` (AWS Bedrock; **required** when APP_ENV is staging or production, which refuse `anthropic`) |
+| LLM_PROVIDER | anthropic | | worker. Two providers only: `anthropic` (Claude API, local development and tests) and `bedrock` (AWS Bedrock; **required** when APP_ENV is staging or production, which refuse `anthropic`). Locally `bedrock` can run through the Floci proxy with `ACCA_BEDROCK_ENDPOINT_URL` |
 | LLM_MODEL | - | | worker (Anthropic model id such as `claude-haiku-5-5`, or a Bedrock model / inference-profile id) |
 | ANTHROPIC_API_KEY | - | **yes** | worker (anthropic only) |
 | BEDROCK_REGION | - | | worker (bedrock only, e.g. `us-east-1`) |
-| BEDROCK_CREDENTIALS_PROFILE | - | | worker (bedrock only, optional). AWS credentials come from the worker's standard AWS chain (IAM role, profile or environment) and are never read from `.env` by Settings; the API container and sandboxes receive none |
+| BEDROCK_CREDENTIALS_PROFILE | - | | worker (bedrock only, optional). AWS credentials come from the worker's standard AWS chain (IAM role, profile or environment) and are never read from `.env` by Settings; the API container and sandboxes receive none. Refused together with `ACCA_BEDROCK_ENDPOINT_URL` |
+| ACCA_BEDROCK_ENDPOINT_URL | - | | worker (bedrock only; **development and test only**). The Floci Bedrock Runtime, whose `proxy` backend forwards Converse to Anthropic's OpenAI-compatible endpoint: `http://127.0.0.1:4566` from the host. Same guard as `ACCA_AWS_ENDPOINT_URL`; needs `LLM_PROVIDER=bedrock`; the client then uses the dummy credentials `test`/`test`. Unset, `bedrock` is real AWS Bedrock. Usage rows are recorded as provider `bedrock-floci`. A proxied call is a real, paid model call (owner authorisation) |
 | LLM_REQUEST_TIMEOUT_SECONDS, LLM_MAX_RETRIES, LLM_MAX_OUTPUT_TOKENS | 180, 2, 8192 | | worker |
 | DEEP_AGENT_RECURSION_LIMIT | 250 | | worker |
 | DEEP_AGENT_EXECUTE_TIMEOUT_SECONDS | 300 | | worker (per sandbox command) |
@@ -44,16 +45,46 @@ Settings are defined in `src/ai_code_change_agent/core/config.py` (Pydantic Sett
 | WORKSPACE_NETWORK_POLICY | none | | worker (only value) |
 | ARTIFACT_MAX_BYTES, ARTIFACT_MAX_ATTEMPT_BYTES | 5 MiB, 100 MiB | | worker |
 | MAX_CONCURRENT_JOBS, JOB_LEASE_SECONDS, JOB_HEARTBEAT_SECONDS, JOB_MAX_ATTEMPTS, MAX_REPAIR_ATTEMPTS | 2, 300, 60, 3, 1 | | worker, API (`JOB_MAX_ATTEMPTS`) |
+| JOB_RELAY_SECONDS, JOB_SWEEP_SECONDS | 30 (1..3600), 300 (10..86400) | | worker dispatcher: outbox relay (fallback for unsent jobs) and lost-message sweep; each tick is one GSI3 Query (docs/aws/DYNAMODB-DATA-MODEL.md 13) |
 
 Requested names that are **deliberately absent**, because nothing uses them:
 
-- `REDIS_URL` (decision C1).
+- `REDIS_URL`: there is no Redis (decision C1, kept by ADR-015).
 - `GITHUB_API_BASE_URL`: the API host is fixed in code (`https://api.github.com`), so configuration cannot redirect tokens.
 - `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_WEBHOOK_SECRET`: the App does not use OAuth or receive webhooks.
 - `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `OLLAMA_*` and `NVIDIA_*`: only Anthropic and Bedrock are supported (decision C5, amended 2026-11-26).
 - `DOCKER_HOST`: honoured from the process environment if set, never in settings.
 - `DEEP_AGENT_MAX_ITERATIONS`: the SDK's limit is the recursion limit.
-- `LANGGRAPH_CHECKPOINT_CONFIGURATION`: replaced by `LANGGRAPH_CHECKPOINT_SCHEMA`.
+- `LANGGRAPH_CHECKPOINT_CONFIGURATION`: checkpoints are configured by `ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME`, `ACCA_S3_BUCKET_NAME` and `ACCA_CHECKPOINT_TTL_DAYS`.
+
+
+## AWS services (DynamoDB, SQS, S3)
+
+These variables carry the `ACCA_` prefix so the standard `AWS_*` variables of a shell (`AWS_PROFILE`, `AWS_REGION`, `AWS_ENDPOINT_URL*`) never configure the application. Clients are built only in `integrations/aws/clients.py` (`AwsClients`: one `boto3` session, clients `dynamodb`, `sqs` and `s3` created on first use, `connect_timeout` 5 s, `read_timeout` 60 s, standard retry mode, `ignore_configured_endpoint_urls=True`). The API uses only DynamoDB (the application table); the worker and the CLI use all three ([ADR-015](decisions/ADR-015-dynamodb-sqs-s3-persistence.md)). Create the local resources with `sh infra/floci/init/bootstrap.sh`.
+
+| Variable | Default | Secret | Notes |
+|---|---|---|---|
+| ACCA_AWS_REGION | us-east-1 | | AWS region name |
+| ACCA_AWS_ENDPOINT_URL | - | | **Required in development and test**, refused in staging and production. Only `http://` on a loopback host (`127.0.0.1`, `localhost`, `[::1]`) or a single-label Docker host name, with an optional port and no path, query or credentials: host processes use `http://127.0.0.1:4566`, containers on the `acca-floci` network `http://acca-floci:4566`. Dotted names (for example `*.amazonaws.com`, `*.amazonaws.com.cn`, `*.api.aws`) are refused, so development and tests can never fall through to real AWS. With it set the clients use the static credentials `test`/`test` and never read the default credential chain, `AWS_PROFILE` or the AWS config files |
+| ACCA_DYNAMODB_TABLE_NAME | acca-local-app | | application table ([DYNAMODB-DATA-MODEL.md](aws/DYNAMODB-DATA-MODEL.md)); API, worker, CLI |
+| ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME | acca-local-checkpoints | | LangGraph checkpoint table (`DynamoDBSaver`); worker, Studio |
+| ACCA_SQS_JOB_QUEUE_NAME | acca-local-jobs | | job queue (standard queue; its URL is resolved once with `GetQueueUrl`) |
+| ACCA_S3_BUCKET_NAME | acca-local-artifacts | | artifact bucket: `artifacts/` (write-once attempt artifacts) and `checkpoints/` (checkpoint payloads over 358,400 bytes) |
+| ACCA_CHECKPOINT_TTL_DAYS | 30 (1..365) | | checkpoint retention: DynamoDB TTL and the S3 lifecycle rule for offloaded payloads. An attempt left at an approval gate longer than this cannot resume: approving it fails the attempt with `checkpoint_expired` (job DEAD with that code, active guard released, one Jira failure comment; a multi-repository child is reported in its parent's comment instead), so start a new attempt |
+| ACCA_JIRA_DELIVERY_RETENTION_DAYS | 30 (1..365) | | TTL of Jira delivery dedupe records (the Story guard is permanent) |
+
+Without an endpoint (staging and production) the clients use the process's default AWS credential chain (for example an IAM role). `JOB_LEASE_SECONDS` is capped at 3,600 s, below the SQS visibility-timeout limit of 43,200 s.
+
+Not settings (shell or Compose variables, never read by `Settings`):
+
+| Variable | Default | Used by |
+|---|---|---|
+| ACCA_FLOCI_ENDPOINT_URL | http://127.0.0.1:4566 | `tests/support/floci.py` and `infra/floci/init/*.sh` (loopback `http` only) |
+| ACCA_FLOCI_INIT_DIR, ACCA_FLOCI_HEALTHY | (set by the scripts) | internal to `infra/floci/init/` |
+| ACCA_DYNAMODB_RECREATE_ON_DRIFT | unset | `infra/floci/init/60-dynamodb.sh`: `1` deletes and recreates a local table whose indexes drifted from `infra/floci/schema` (its items are lost) |
+| ACCA_API_CONTAINER_NAME, ACCA_API_PORT | acca-api, 8000 | `compose.yaml`: container name and loopback host port of the API (for a second stack, e.g. `acca-verify-api` on 18000) |
+
+The Floci container itself is configured only with documented `FLOCI_*` variables in `infra/docker-compose.yml`.
 
 
 ## Automated pipeline
@@ -95,7 +126,7 @@ The worker exports exactly these variables at start-up (`core/tracing.py`), remo
 |---|---|---|
 | LLM_PRICING_FILE | - | optional absolute path to a JSON price list that overrides the built-in table (`application/costs/pricing.py`, version `anthropic-api-2026-11-25`) |
 
-Usage is always recorded to `llm_usage_records` (migration 0002). Reports are printed by the worker and by `ai-code-change costs`. See [LLM-COST-TRACKING.md](LLM-COST-TRACKING.md). Model escalation (`LLM_FALLBACK_*`) is not implemented.
+Usage is always recorded to the usage ledger in the DynamoDB application table (append-only items with uniqueness guards). Reports are printed by the worker and by `ai-code-change costs`. See [LLM-COST-TRACKING.md](LLM-COST-TRACKING.md). Model escalation (`LLM_FALLBACK_*`) is not implemented.
 
 
 ## Agent context and pacing

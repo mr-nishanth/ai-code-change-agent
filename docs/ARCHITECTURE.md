@@ -3,7 +3,9 @@
 **1 LangGraph workflow + 1 Deep Agent + 1 independent Python validation engine**, in one deployable Python application with two processes:
 
 - **API** (FastAPI): Jira webhook intake and health checks. It never runs agents.
-- **Worker**: a trusted host process that runs jobs, the workflow and the sandboxes.
+- **Worker**: a trusted host process that runs jobs, the workflow and the sandboxes, and the job dispatcher (outbox relay and lost-message sweep) as a loop of its own.
+
+Persistence is AWS-native ([ADR-015](decisions/ADR-015-dynamodb-sqs-s3-persistence.md)): DynamoDB, SQS and S3; locally the Floci emulator on the `acca-floci` network ([ADR-014](decisions/ADR-014-floci-local-aws-emulator.md)).
 
 ### Components
 
@@ -15,7 +17,7 @@
 | Execution sandbox | Python Docker image (`execution-python:0.2.0`) | Offline, hardened; runs **Python repositories only** |
 | Validation | Python, independent of the agent | Fresh offline container; runs the profile's Python commands |
 | Studio UI | React / TypeScript / Node.js (Vite) | Development UI to watch the agent; Node.js is a local development requirement only, not an execution toolchain |
-| Database | PostgreSQL | Requests, jobs, attempts, artifacts index, cost ledger |
+| Persistence | AWS DynamoDB, SQS, S3 (locally Floci) | DynamoDB: domain state, registry, job state and outbox, cost ledger, checkpoints; SQS (+ DLQ): job delivery; S3: artifacts and large checkpoint payloads |
 
 **Scope:** multi-repository means several registered **Python** repositories per Story (for example a backend API and a Python client, SDK or worker). Node.js, React/Next.js, Android, Kotlin/Java, Flutter and iOS/Swift repositories are out of scope.
 
@@ -25,15 +27,19 @@
 sequenceDiagram
     participant J as Jira
     participant API as API (FastAPI)
-    participant DB as PostgreSQL
+    participant DB as DynamoDB
+    participant Q as SQS
     participant W as Worker (host)
     participant G as LangGraph workflow
     participant A as Deep Agent (sandbox)
     participant V as Validation engine
     participant GH as GitHub App
     J->>API: POST /webhooks/jira (HMAC)
-    API->>DB: receipt + request + intake job (one transaction), 200 at once
-    W->>DB: claim job (SKIP LOCKED, lease, heartbeat)
+    API->>DB: receipt + request + intake job + outbox entry (one TransactWriteItems), 200 at once
+    W->>DB: relay - query outbox (GSI3), then send
+    W->>Q: SendMessage (job id only)
+    Q-->>W: ReceiveMessage (long poll, visibility = lease)
+    W->>DB: conditional claim (lease, heartbeat), DynamoDB decides ownership
     W->>J: read Story (REST, read-only)
     W->>DB: resolve repository via registry (no auto-registration)
     W->>G: start(attempt)
@@ -54,26 +60,29 @@ sequenceDiagram
 |---|---|
 | `api/`, `main.py` | Webhook route (`POST /webhooks/jira`), health, request ids |
 | `application/webhooks`, `domain/webhooks` | HMAC verification, scope policy, durable receipt, duplicate suppression |
-| `application/jobs`, `persistence/repositories/job_queue.py` | Durable job queue and worker (leases, heartbeat, retries, dead jobs) |
+| `application/jobs`, `persistence/dynamodb/job_queue.py` | Durable job queue and worker: DynamoDB job state and outbox, SQS delivery, relay and sweep (leases, heartbeat, retries, dead jobs) |
+| `persistence/dynamodb` | DynamoDB adapters for every store (conditions and transactions instead of constraints and triggers) |
+| `integrations/aws` | `AwsClients` (the only DynamoDB/SQS/S3 client factory, local endpoint guard), S3 error mapping |
 | `application/changes`, `domain/changes` | Requests, attempts, state machine, hash-bound approvals |
 | `application/repositories`, `domain/repositories`, `cli/` | Registry, profiles, command policy, resolver, operator CLI |
 | `integrations/jira` | Read-only REST client, issue mapping, ADF, webhook signature, outcome reporter |
 | `integrations/github` | App auth, baseline reader (pinned commit), reference parser, registration client, publisher |
-| `orchestration/langgraph` | The parent graph, state, nodes, routing, Postgres checkpointer, runner |
+| `orchestration/langgraph` | The parent graph, state, nodes, routing, DynamoDB checkpointer (`DynamoDBSaver` with S3 offload), runner |
 | `orchestration/steps.py` | Workflow steps (application services the nodes call) |
 | `agents/coding` | The one Deep Agent (`create_deep_agent`), prompts, schemas |
-| `execution/` | Workspace runtime, Docker sandbox backend (`BaseSandbox`), file safety, artifacts |
+| `execution/` | Workspace runtime, Docker sandbox backend (`BaseSandbox`), file safety, artifacts (`S3ArtifactStore`) |
 | `validation/` | Changeset rules, secret scan, fresh rebuild, profile commands, PR eligibility |
-| `providers/llm` | Chat model factory: Anthropic (local/test) or AWS Bedrock (staging/production) |
+| `providers/llm` | Chat model factory: Anthropic (local/test), Bedrock through the Floci proxy (local/test) or AWS Bedrock (staging/production) |
 
 ## Attempt states
 
 `PENDING -> PREPARING -> PLANNING -> AWAITING_PLAN_APPROVAL -> IMPLEMENTING -> VALIDATING -> AWAITING_FINAL_APPROVAL -> DELIVERING -> REPORTING -> COMPLETED`
 
 - A bounded repair loops `VALIDATING -> IMPLEMENTING`.
+- An attempt waiting at an approval gate can become `FAILED` only with `checkpoint_expired`: its LangGraph checkpoint expired (`ACCA_CHECKPOINT_TTL_DAYS`) before the approval, so it cannot resume.
 - Terminal states: `COMPLETED`, `BLOCKED`, `FAILED`, `CANCELLED`, `REJECTED`.
 - Every transition goes through the domain (`CodeChangeAttempt.transition`).
-- Database triggers keep:
+- Conditional writes and transactions in the DynamoDB adapters keep (as database triggers did before ADR-015):
   - the pinned base commit immutable;
   - approvals append-only;
   - attempts undeletable;
@@ -81,10 +90,11 @@ sequenceDiagram
 
 ## State and persistence
 
-- **Domain tables** (`public` schema) are the source of truth for decisions and status.
-- **LangGraph checkpoints** live in the `langgraph` schema. Thread id: `attempt:<id>`.
+- **The DynamoDB application table** (`ACCA_DYNAMODB_TABLE_NAME`) is the source of truth for decisions and status ([DYNAMODB-DATA-MODEL.md](aws/DYNAMODB-DATA-MODEL.md)). Reads that decide are strongly consistent.
+- **LangGraph checkpoints** live in the checkpoint table (`ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME`, `DynamoDBSaver`, consistent reads); payloads over 358,400 bytes are offloaded to `s3://<bucket>/checkpoints/`. Thread id: `attempt:<id>`.
+- **Jobs:** state in DynamoDB, delivery through SQS (standard queue + DLQ, at least once); the conditional claim decides ownership.
 - **The Deep Agent's runs** checkpoint under their own thread ids (`attempt:<id>:planning`, `attempt:<id>:implementation:<n>`). They do not share the parent's checkpoint.
-- **Artifacts** (plan, changeset, implementation report, validation report, manifest, delivery result) are scoped by request and attempt, hash-verified and redacted.
+- **Artifacts** (plan, changeset, implementation report, validation report, manifest, delivery result) are write-once S3 objects under `artifacts/<request>/<attempt>/`, re-hashed on read and redacted. Workspaces and dependency bundles stay on local disk.
 
 ## Why the agent cannot validate itself
 
@@ -104,7 +114,7 @@ The worker controls a container runtime, so it is privileged control plane. Opti
 2. A remote sandbox service, e.g. a microVM or Kubernetes sandbox backend, behind the same `SandboxStarter` protocol, so the worker needs no local daemon.
 3. A rootless Docker or Podman daemon per worker host.
 
-Do not mount the Docker socket into a general-purpose container, and never into a sandbox.
+Do not mount the Docker socket into a general-purpose container, and never into a sandbox. The one documented exception is the local, test-only Floci AWS emulator ([ADR-014](decisions/ADR-014-floci-local-aws-emulator.md)).
 
 ## Multi-repository Stories and research
 

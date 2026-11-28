@@ -1,6 +1,7 @@
 """A worker process that claims one queued job and is then SIGKILLed while holding its lease.
 
-Run as: python -m tests.support.job_crash_worker <database_url> <owner> <lease_seconds>
+Run as (DynamoDB + SQS on the local Floci emulator, explicit loopback endpoint, dummy credentials):
+    python -m tests.support.job_crash_worker dynamo <endpoint> <table> <queue_url> <owner> <lease>
 Prints the claimed job id, then dies without releasing anything (no finally blocks run).
 """
 
@@ -9,13 +10,20 @@ import os
 import signal
 import sys
 import time
-
-from ai_code_change_agent.persistence.repositories.job_queue import PostgresJobQueue
-from ai_code_change_agent.persistence.session import create_engine, create_session_factory
+from typing import Any
 
 
-async def main(url: str, owner: str, lease: int) -> None:
-    queue = PostgresJobQueue(create_session_factory(create_engine(url)))
+def _dynamo(endpoint: str, table: str, queue_url: str) -> Any:
+    from ai_code_change_agent.persistence.dynamodb import Table
+    from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
+    from tests.support.dynamo import local_clients
+    from tests.support.floci import require_loopback
+
+    aws = local_clients(require_loopback(endpoint))
+    return DynamoSqsJobQueue(Table(aws.dynamodb, table), aws.sqs, queue_url, receive_wait_seconds=5)
+
+
+async def main(queue: Any, owner: str, lease: int) -> None:
     job = await queue.claim(owner, lease)
     print(job.id if job else "none", flush=True)
     if job is not None:
@@ -25,4 +33,5 @@ async def main(url: str, owner: str, lease: int) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1], sys.argv[2], int(sys.argv[3])))
+    _, _, endpoint, table, queue_url, owner, lease = sys.argv  # argv[1] == "dynamo"
+    asyncio.run(main(_dynamo(endpoint, table, queue_url), owner, int(lease)))

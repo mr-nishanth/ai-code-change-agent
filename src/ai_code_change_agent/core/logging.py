@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 _SENSITIVE = re.compile(
-    r"(secret|token|password|passwd|authorization|signature|api[_-]?key|credential|database_url)",
+    r"(secret|token|password|passwd|authorization|signature|api[_-]?key|credential)",
     re.IGNORECASE,
 )
 REDACTED = "[REDACTED]"

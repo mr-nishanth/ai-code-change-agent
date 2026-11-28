@@ -69,7 +69,11 @@ from ai_code_change_agent.domain.dependencies.policy import (
 from ai_code_change_agent.domain.repositories.command_policy import CommandKind
 from ai_code_change_agent.domain.repositories.models import MappingStatus, RepositoryStatus
 from ai_code_change_agent.domain.repositories.profile import RepositoryProfile
-from ai_code_change_agent.orchestration.langgraph.ports import GateState, StepResult
+from ai_code_change_agent.orchestration.langgraph.ports import (
+    GateState,
+    StepResult,
+    checked_thread_id,
+)
 from ai_code_change_agent.validation.engine import ValidationEngine, ValidationInput
 from ai_code_change_agent.validation.git_inspector import (
     changed_paths,
@@ -308,6 +312,16 @@ class CodeChangeSteps:
         _log.warning("attempt_failed", attempt_id=str(attempt_id), code=code)
         return StepResult(a.status.value, failure_code=code)
 
+    async def _agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> str:
+        """The checked thread id of a new agent run, indexed under the attempt for the studio's live
+        view (L3). Best effort: the index is dev tooling, so a failure is logged, never fatal."""
+        thread_id = checked_thread_id(thread_id)
+        try:
+            await self._d.changes.record_agent_thread(attempt_id, thread_id)
+        except Exception as exc:
+            _log.warning("agent_thread_not_indexed", attempt_id=str(attempt_id), code=_code(exc))
+        return thread_id
+
     async def _story(self, a: CodeChangeAttempt) -> StoryContext:
         request = await self._d.changes.get_request(a.request_id)
         issue = await self._d.jira.get_issue(request.jira_issue_key)
@@ -444,7 +458,9 @@ class CodeChangeSteps:
                 plan = await self._d.agent.plan(
                     story,
                     sandbox,
-                    thread_id=f"attempt:{a.id}:planning:{uuid.uuid4().hex[:8]}",  # fresh per run
+                    thread_id=await self._agent_thread(  # fresh per run
+                        a.id, f"attempt:{a.id}:planning:{uuid.uuid4().hex[:8]}"
+                    ),
                     checkpointer=self._d.agent_checkpointer,
                 )
             await store_model(
@@ -600,9 +616,10 @@ class CodeChangeSteps:
                     plan,
                     sandbox,
                     feedback=feedback,
-                    thread_id=(
-                        f"attempt:{a.id}:implementation:{a.repair_count}:{uuid.uuid4().hex[:8]}"
-                    ),  # a re-run after a crash starts clean, not on stale history
+                    thread_id=await self._agent_thread(  # a re-run after a crash starts clean
+                        a.id,
+                        f"attempt:{a.id}:implementation:{a.repair_count}:{uuid.uuid4().hex[:8]}",
+                    ),
                     checkpointer=self._d.agent_checkpointer,
                 )
                 if sandbox.disk_limit_exceeded:

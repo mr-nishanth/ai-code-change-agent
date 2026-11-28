@@ -167,10 +167,18 @@ def test_usage_errors_exit_2() -> None:
     assert run(InMemoryRegistry(), "repositories")[0] == 2
 
 
-def test_missing_database_url_is_a_clear_error(capsys: pytest.CaptureFixture[str]) -> None:
-    err = io.StringIO()
-    assert main(["repositories", "list"], err_out=err) == 2
-    assert "DATABASE_URL is required" in err.getvalue()
+def test_a_missing_aws_endpoint_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ai_code_change_agent.core.config import get_settings
+
+    monkeypatch.delenv("ACCA_AWS_ENDPOINT_URL")
+    get_settings.cache_clear()
+    try:
+        err = io.StringIO()
+        assert main(["repositories", "list"], err_out=err) == 2
+    finally:
+        get_settings.cache_clear()
+    assert "requires ACCA_AWS_ENDPOINT_URL" in err.getvalue()
+    assert "DATABASE_URL" not in err.getvalue()
 
 
 def test_entry_point_is_declared() -> None:

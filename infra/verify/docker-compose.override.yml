@@ -1,0 +1,48 @@
+# Isolated verification stack (S2116 Task 19): a second Floci and the API on their own ports,
+# network and volume, next to (and never touching) a running local stack. Always use the fixed
+# project name and all three files, from the repository root:
+#
+#   docker compose -p acca-verify --project-directory . \
+#     -f compose.yaml -f infra/docker-compose.yml -f infra/verify/docker-compose.override.yml \
+#     up -d --wait floci
+#   ACCA_FLOCI_ENDPOINT_URL=http://127.0.0.1:4577 sh infra/floci/init/bootstrap.sh
+#   ACCA_API_CONTAINER_NAME=acca-verify-api ACCA_API_PORT=18000 JIRA_WEBHOOK_SECRET=<random> \
+#     JIRA_PROJECT_KEYS=SHOP docker compose -p acca-verify ... up -d --build --wait api
+#   docker compose -p acca-verify ... down -v --rmi local    # removes only this project
+#
+# Differences from the development stack:
+# - Floci: container acca-verify-floci on 127.0.0.1:4577 only (no RDS proxy ports), volume
+#   acca_verify_floci_data, network acca-verify, NO Docker socket and no web console sidecar, so it
+#   cannot start, see or remove any container (ECR/RDS/ECS/Lambda that need Docker are unavailable).
+# - API: network acca-verify only (it shares no network with any other stack, so no database or
+#   other service is reachable from it) and DynamoDB at http://acca-verify-floci:4566.
+# `!override` / `!reset` replace the lists and maps of the base files instead of merging them.
+services:
+  floci:
+    container_name: acca-verify-floci
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:4577:4566"
+    volumes: !override
+      - acca_verify_floci_data:/app/data
+    environment:
+      FLOCI_SERVICES_UI_ENABLED: "false" # Floci 2.5.0 docs/ui/index.md: no console sidecar
+      FLOCI_SERVICES_DOCKER_NETWORK: acca-verify
+    networks: !override [acca-verify]
+
+  api:
+    image: acca-verify-api:s2116-verify # explicit local tag for the build (removed by down --rmi local)
+    environment:
+      ACCA_AWS_ENDPOINT_URL: http://acca-verify-floci:4566
+    networks: !override [acca-verify]
+    depends_on:
+      floci:
+        condition: service_healthy
+
+networks: !override
+  acca-verify:
+    name: acca-verify
+
+volumes: !override
+  acca_verify_floci_data:
+    name: acca_verify_floci_data

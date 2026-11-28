@@ -9,19 +9,26 @@ import re
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from ai_code_change_agent.core.errors import ConfigurationError
 from ai_code_change_agent.core.reference_hosts import DEFAULT_SOURCES_FILE, load_reference_sources
 
 Environment = Literal["development", "test", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 _PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,31}")
-_SCHEMA = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+_AWS_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}")
+_DYNAMODB_TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
+_SQS_QUEUE = re.compile(r"[A-Za-z0-9_-]{1,80}")
+_S3_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+# A local AWS endpoint override (Floci): loopback, or a single-label Docker host (acca-floci).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DOCKER_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}(:[A-Za-z0-9._-]{1,128})?(@sha256:[0-9a-f]{64})?")
 _EMPTY_IS_UNSET = (
-    "database_url",
     "jira_base_url",
     "jira_email",
     "jira_api_token",
@@ -42,6 +49,8 @@ _EMPTY_IS_UNSET = (
     "workspace_root",
     "artifact_root",
     "workspace_image",
+    "aws_endpoint_url",
+    "bedrock_endpoint_url",
 )
 
 
@@ -65,9 +74,33 @@ class Settings(BaseSettings):
     log_json: bool = True
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
 
-    # ---- database ---------------------------------------------------------------------------
-    database_url: SecretStr | None = None
-    langgraph_checkpoint_schema: str = "langgraph"  # workflow state, separate from domain tables
+    # ---- AWS: DynamoDB, SQS and S3 (integrations/aws/clients.py) ------------------------------
+    # ACCA_-prefixed names so the standard AWS_* variables of a shell never configure the app.
+    # development/test must point at the local emulator (Floci); staging/production must not set
+    # an endpoint and use the default AWS credential chain of the process.
+    aws_region: str = Field(default="us-east-1", validation_alias="ACCA_AWS_REGION")
+    aws_endpoint_url: str | None = Field(default=None, validation_alias="ACCA_AWS_ENDPOINT_URL")
+    dynamodb_table_name: str = Field(
+        default="acca-local-app", validation_alias="ACCA_DYNAMODB_TABLE_NAME"
+    )
+    dynamodb_checkpoint_table_name: str = Field(
+        default="acca-local-checkpoints", validation_alias="ACCA_DYNAMODB_CHECKPOINT_TABLE_NAME"
+    )
+    sqs_job_queue_name: str = Field(
+        default="acca-local-jobs", validation_alias="ACCA_SQS_JOB_QUEUE_NAME"
+    )
+    s3_bucket_name: str = Field(
+        default="acca-local-artifacts", validation_alias="ACCA_S3_BUCKET_NAME"
+    )
+    # Retention (DynamoDB TTL; checkpoints also an S3 lifecycle rule on their offloaded payloads).
+    # Checkpoints are only needed to resume a paused attempt; a Jira delivery record only has to
+    # outlive Jira's redelivery window (hours) because the Story guard is permanent.
+    checkpoint_ttl_days: int = Field(
+        default=30, ge=1, le=365, validation_alias="ACCA_CHECKPOINT_TTL_DAYS"
+    )
+    jira_delivery_retention_days: int = Field(
+        default=30, ge=1, le=365, validation_alias="ACCA_JIRA_DELIVERY_RETENTION_DAYS"
+    )
 
     # ---- Jira (webhook intake, read-only REST, optional outcome comment) ---------------------
     jira_base_url: str | None = None
@@ -104,6 +137,13 @@ class Settings(BaseSettings):
     # environment); never from this file. An optional named profile selects one of them.
     bedrock_region: str | None = None
     bedrock_credentials_profile: str | None = None
+    # Local only (development/test): the Bedrock Runtime of the Floci emulator, whose `proxy`
+    # backend forwards Converse to an OpenAI-compatible endpoint. Same guard as
+    # ACCA_AWS_ENDPOINT_URL; the client then uses the dummy credentials test/test. Unset,
+    # LLM_PROVIDER=bedrock is real AWS Bedrock (the only option in staging/production).
+    bedrock_endpoint_url: str | None = Field(
+        default=None, validation_alias="ACCA_BEDROCK_ENDPOINT_URL"
+    )
     llm_request_timeout_seconds: float = Field(default=180.0, gt=0, le=1800)
     llm_max_retries: int = Field(default=2, ge=0, le=10)
     llm_max_output_tokens: int = Field(default=8192, ge=256, le=128_000)
@@ -183,9 +223,15 @@ class Settings(BaseSettings):
     # actor policy:automatic). manual: an operator decides with `ai-code-change changes approve`.
     workflow_approval_mode: Literal["automatic", "manual"] = "automatic"
     max_concurrent_jobs: int = Field(default=2, ge=1, le=32)
+    # at most 3,600 s, well under the SQS visibility-timeout cap of 43,200 s
     job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     job_heartbeat_seconds: int = Field(default=60, ge=5, le=1800)
     job_max_attempts: int = Field(default=3, ge=1, le=10)
+    # Dispatcher role of the worker: the outbox relay is only the fallback for a job whose direct
+    # send after commit failed (and for the API's intake jobs), the sweep only recovers lost
+    # messages; each tick is at least one GSI3 Query, so these intervals set the idle read cost.
+    job_relay_seconds: float = Field(default=30.0, ge=1, le=3600)
+    job_sweep_seconds: float = Field(default=300.0, ge=10, le=86_400)
     multi_repo_max_repositories: int = Field(default=5, ge=2, le=20)  # per Story
     max_repair_attempts: int = Field(default=1, ge=0, le=3)
 
@@ -227,6 +273,38 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
+    @field_validator("aws_region")
+    @classmethod
+    def _aws_region(cls, value: str) -> str:
+        if not _AWS_REGION.fullmatch(value):
+            msg = "ACCA_AWS_REGION must be an AWS region name such as us-east-1"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("dynamodb_table_name", "dynamodb_checkpoint_table_name")
+    @classmethod
+    def _table_name(cls, value: str) -> str:
+        if not _DYNAMODB_TABLE.fullmatch(value):
+            msg = "DynamoDB table names are 3-255 characters of A-Z, a-z, 0-9, '_', '-' and '.'"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("sqs_job_queue_name")
+    @classmethod
+    def _queue_name(cls, value: str) -> str:
+        if not _SQS_QUEUE.fullmatch(value):
+            msg = "ACCA_SQS_JOB_QUEUE_NAME must be a standard SQS queue name (1-80 of A-Za-z0-9_-)"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("s3_bucket_name")
+    @classmethod
+    def _bucket_name(cls, value: str) -> str:
+        if not _S3_BUCKET.fullmatch(value) or ".." in value:
+            msg = "ACCA_S3_BUCKET_NAME must be a lower-case S3 bucket name"
+            raise ValueError(msg)
+        return value
+
     @field_validator("bedrock_credentials_profile")
     @classmethod
     def _profile(cls, value: str | None) -> str | None:
@@ -261,14 +339,6 @@ class Settings(BaseSettings):
             msg = "DEPENDENCY_INDEX_URL must be an https:// package index URL without credentials"
             raise ValueError(msg)
         return value.rstrip("/")
-
-    @field_validator("langgraph_checkpoint_schema")
-    @classmethod
-    def _schema(cls, value: str) -> str:
-        if not _SCHEMA.fullmatch(value) or value == "public":
-            msg = "LANGGRAPH_CHECKPOINT_SCHEMA must be a lower-case schema name other than public"
-            raise ValueError(msg)
-        return value
 
     @model_validator(mode="after")
     def _coherent(self) -> "Settings":
@@ -308,6 +378,9 @@ class Settings(BaseSettings):
         if self.job_heartbeat_seconds * 2 > self.job_lease_seconds:
             msg = "JOB_HEARTBEAT_SECONDS must be at most half of JOB_LEASE_SECONDS"
             raise ValueError(msg)
+        if self.job_sweep_seconds < self.job_relay_seconds:
+            msg = "JOB_SWEEP_SECONDS must be at least JOB_RELAY_SECONDS"
+            raise ValueError(msg)
         if self.app_env in ("staging", "production"):
             if self.llm_provider != "bedrock":
                 msg = f"{self.app_env} requires LLM_PROVIDER=bedrock (anthropic is for local tests)"
@@ -315,7 +388,6 @@ class Settings(BaseSettings):
             missing = [
                 name
                 for name, ok in (
-                    ("DATABASE_URL", self.database_url is not None),
                     ("JIRA_WEBHOOK_SECRET", self.jira_webhook_secret is not None),
                     ("JIRA_PROJECT_KEYS", bool(self.jira_project_keys)),
                 )
@@ -324,7 +396,61 @@ class Settings(BaseSettings):
             if missing:
                 msg = f"{self.app_env} requires: {', '.join(missing)}"
                 raise ValueError(msg)
+        self._check_aws_endpoint()
+        self._check_bedrock_endpoint()
         return self
+
+    def _check_aws_endpoint(self) -> None:
+        """The local endpoint guard: an override only in development/test and only to Floci.
+
+        Raised as ConfigurationError (not a validation error) so no caller can mistake a refused
+        endpoint for a typo it may retry with defaults; real AWS is never a silent fallback."""
+        url = self.aws_endpoint_url
+        local = self.app_env in ("development", "test")
+        if url is None:
+            if local:
+                msg = (
+                    f"APP_ENV={self.app_env} requires ACCA_AWS_ENDPOINT_URL (the local Floci"
+                    " endpoint, e.g. http://127.0.0.1:4566); it never falls back to real AWS"
+                )
+                raise ConfigurationError(msg)
+            return
+        if not local:
+            msg = f"APP_ENV={self.app_env} must not set ACCA_AWS_ENDPOINT_URL (real AWS only)"
+            raise ConfigurationError(msg)
+        if not _local_endpoint(url):
+            msg = (
+                "ACCA_AWS_ENDPOINT_URL must be http:// on a loopback host or a single-label"
+                " Docker host name (e.g. http://acca-floci:4566), without path or credentials"
+            )
+            raise ConfigurationError(msg)
+        self.aws_endpoint_url = url.rstrip("/")
+
+    def _check_bedrock_endpoint(self) -> None:
+        """The Floci Bedrock mode: the same local endpoint guard, bedrock only, dummy credentials
+        only (a named profile would mean real credentials sent to an emulator)."""
+        url = self.bedrock_endpoint_url
+        if url is None:
+            return
+        if self.app_env not in ("development", "test"):
+            msg = f"APP_ENV={self.app_env} must not set ACCA_BEDROCK_ENDPOINT_URL (real Bedrock)"
+            raise ConfigurationError(msg)
+        if self.llm_provider != "bedrock":
+            msg = "ACCA_BEDROCK_ENDPOINT_URL needs LLM_PROVIDER=bedrock"
+            raise ConfigurationError(msg)
+        if self.bedrock_credentials_profile is not None:
+            msg = (
+                "ACCA_BEDROCK_ENDPOINT_URL uses the dummy credentials test/test; unset"
+                " BEDROCK_CREDENTIALS_PROFILE"
+            )
+            raise ConfigurationError(msg)
+        if not _local_endpoint(url):
+            msg = (
+                "ACCA_BEDROCK_ENDPOINT_URL must be http:// on a loopback host or a single-label"
+                " Docker host name (e.g. http://acca-floci:4566), without path or credentials"
+            )
+            raise ConfigurationError(msg)
+        self.bedrock_endpoint_url = url.rstrip("/")
 
     # ---- derived --------------------------------------------------------------------------
     @property
@@ -354,10 +480,36 @@ class Settings(BaseSettings):
         )
 
     @property
+    def llm_ledger_provider(self) -> str:
+        """The provider recorded in the usage ledger: `bedrock-floci` for the local Floci proxy,
+        so its rows (input/output tokens only, no cache) are never mistaken for Bedrock spend."""
+        if self.llm_provider == "bedrock" and self.bedrock_endpoint_url is not None:
+            return "bedrock-floci"
+        return self.llm_provider
+
+    @property
     def llm_configured(self) -> bool:
         if self.llm_provider == "bedrock":
             return self.llm_model is not None and self.bedrock_region is not None
         return self.llm_model is not None and self.anthropic_api_key is not None
+
+
+def _local_endpoint(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+    return (
+        parts.scheme == "http"
+        and not parts.username
+        and not parts.password
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+        and (host in _LOOPBACK_HOSTS or (_DOCKER_HOST.fullmatch(host) is not None))
+    )
 
 
 @lru_cache

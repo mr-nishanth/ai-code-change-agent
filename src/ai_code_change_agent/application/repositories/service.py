@@ -1,5 +1,11 @@
-"""Registry use cases. Every mutation runs in one transaction together with its audit event."""
+"""Registry use cases. Every mutation runs in one transaction together with its audit event.
 
+A mutation that loses an optimistic race (`ConcurrentModificationError`: an item its unit of work
+read changed before it committed) is retried as a whole method, up to `RETRY_ATTEMPTS` times with
+full jitter; this reproduces waiting for the row lock (DYNAMODB-DATA-MODEL.md 5.1). Genuine
+conflicts (`alias_taken`, `repository_already_registered`, ...) are never retried."""
+
+import asyncio
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -10,6 +16,8 @@ from ai_code_change_agent.application.git_providers.ports import (
 )
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
 from ai_code_change_agent.application.repositories.validation import ProfileValidator
+from ai_code_change_agent.application.retry import RETRY_ATTEMPTS as RETRY_ATTEMPTS  # re-exported
+from ai_code_change_agent.application.retry import Sleep, retry_concurrent
 from ai_code_change_agent.domain.repositories.errors import (
     ConflictError,
     Finding,
@@ -43,8 +51,11 @@ class RepositoryRegistryService:
         uow_factory: UowFactory,
         validator: ProfileValidator | None = None,
         providers: GitProviderRegistry | None = None,
+        *,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._uow = uow_factory
+        self._sleep = sleep
         self._validator = validator or ProfileValidator()
         self._providers = providers or GitProviderRegistry()
 
@@ -90,6 +101,7 @@ class RepositoryRegistryService:
             owner=owner, name=name, access_reference=access_reference
         )
 
+    @retry_concurrent
     async def register_repository(
         self, new: NewRepository, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -142,6 +154,7 @@ class RepositoryRegistryService:
                 await uow.store.list_mappings(repository_id=repo.id),
             )
 
+    @retry_concurrent
     async def enable(
         self, key: str, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -165,6 +178,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return repo
 
+    @retry_concurrent
     async def disable(
         self, key: str, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -186,6 +200,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return repo
 
+    @retry_concurrent
     async def add_alias(
         self, key: str, alias: str, *, actor: str, correlation_id: str | None = None
     ) -> str:
@@ -208,6 +223,7 @@ class RepositoryRegistryService:
         return normalised
 
     # ---- profile versions ----------------------------------------------------------------
+    @retry_concurrent
     async def create_version(
         self, key: str, document: object, *, actor: str, correlation_id: str | None = None
     ) -> ProfileVersion:
@@ -257,6 +273,7 @@ class RepositoryRegistryService:
         self._validator.validate(version.content)
         return version
 
+    @retry_concurrent
     async def publish_version(
         self,
         key: str,
@@ -298,6 +315,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return version
 
+    @retry_concurrent
     async def activate_version(
         self, key: str, version_no: int, *, actor: str, correlation_id: str | None = None
     ) -> Repository:
@@ -322,6 +340,7 @@ class RepositoryRegistryService:
         return repo
 
     # ---- project mappings ----------------------------------------------------------------
+    @retry_concurrent
     async def map_project(
         self, project_key: str, key: str, *, actor: str, correlation_id: str | None = None
     ) -> ProjectMapping:
@@ -350,6 +369,7 @@ class RepositoryRegistryService:
             await uow.commit()
         return mapping
 
+    @retry_concurrent
     async def unmap_project(
         self, project_key: str, key: str, *, actor: str, correlation_id: str | None = None
     ) -> ProjectMapping:

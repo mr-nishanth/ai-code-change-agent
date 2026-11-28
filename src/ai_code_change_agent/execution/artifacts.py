@@ -157,7 +157,7 @@ class LocalFilesystemArtifactStore:
             redactions=redactions,
         )
         _write_new(directory / f"{meta.id}.blob", content)
-        _write_new(directory / f"{meta.id}.meta.json", self._encode(meta))
+        _write_new(directory / f"{meta.id}.meta.json", encode_meta(meta))
         return meta
 
     async def get(self, scope: ArtifactScope, artifact_id: str) -> bytes:
@@ -203,39 +203,50 @@ class LocalFilesystemArtifactStore:
     # ----- metadata -----------------------------------------------------------------------
     def _meta(self, scope: ArtifactScope, artifact_id: str) -> ArtifactMeta:
         self._check_id(artifact_id)
-        raw = _read_file(self._scope_dir(scope, create=False) / f"{artifact_id}.meta.json", 65_536)
-        try:
-            doc: dict[str, Any] = json.loads(raw)
-            meta = ArtifactMeta(
-                id=str(doc["id"]),
-                kind=ArtifactKind(doc["kind"]),
-                scope=ArtifactScope(uuid.UUID(doc["request_id"]), uuid.UUID(doc["attempt_id"])),
-                sha256=str(doc["sha256"]),
-                size=int(doc["size"]),
-                created_at=datetime.fromisoformat(doc["created_at"]),
-                redaction_version=str(doc["redaction_version"]),
-                redactions=int(doc["redactions"]),
-            )
-        except (ValueError, KeyError, TypeError) as exc:
-            raise ArtifactIntegrityError("artifact_metadata_invalid") from exc
-        if meta.id != artifact_id or meta.scope != scope:  # a copied or edited file
-            raise ArtifactNotFoundError
-        return meta
+        raw = _read_file(
+            self._scope_dir(scope, create=False) / f"{artifact_id}.meta.json", META_MAX_BYTES
+        )
+        return decode_meta(raw, scope, artifact_id)
 
-    @staticmethod
-    def _encode(meta: ArtifactMeta) -> bytes:
-        return json.dumps(
-            {
-                "id": meta.id,
-                "kind": meta.kind.value,
-                "request_id": str(meta.scope.request_id),
-                "attempt_id": str(meta.scope.attempt_id),
-                "sha256": meta.sha256,
-                "size": meta.size,
-                "created_at": meta.created_at.isoformat(),
-                "redaction_version": meta.redaction_version,
-                "redactions": meta.redactions,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("ascii")
+
+# ----- metadata document (shared with the S3 store) ------------------------------------------
+META_MAX_BYTES = 65_536
+
+
+def encode_meta(meta: ArtifactMeta) -> bytes:
+    return json.dumps(
+        {
+            "id": meta.id,
+            "kind": meta.kind.value,
+            "request_id": str(meta.scope.request_id),
+            "attempt_id": str(meta.scope.attempt_id),
+            "sha256": meta.sha256,
+            "size": meta.size,
+            "created_at": meta.created_at.isoformat(),
+            "redaction_version": meta.redaction_version,
+            "redactions": meta.redactions,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def decode_meta(raw: bytes, scope: ArtifactScope, artifact_id: str) -> ArtifactMeta:
+    """Parse a metadata document; it must name exactly this id and scope (else: not found)."""
+    try:
+        doc: dict[str, Any] = json.loads(raw)
+        meta = ArtifactMeta(
+            id=str(doc["id"]),
+            kind=ArtifactKind(doc["kind"]),
+            scope=ArtifactScope(uuid.UUID(doc["request_id"]), uuid.UUID(doc["attempt_id"])),
+            sha256=str(doc["sha256"]),
+            size=int(doc["size"]),
+            created_at=datetime.fromisoformat(doc["created_at"]),
+            redaction_version=str(doc["redaction_version"]),
+            redactions=int(doc["redactions"]),
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ArtifactIntegrityError("artifact_metadata_invalid") from exc
+    if meta.id != artifact_id or meta.scope != scope:  # a copied or edited document
+        raise ArtifactNotFoundError
+    return meta

@@ -4,6 +4,7 @@ Intake never trusts the webhook payload: it re-reads the Story from Jira, resolv
 repository deterministically through the registry (no automatic registration), assigns it,
 creates (or re-uses) the single active attempt and starts the parent workflow."""
 
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -28,7 +29,11 @@ from ai_code_change_agent.application.repositories.resolver import (
     RepositoryResolver,
     build_resolution_request,
 )
+from ai_code_change_agent.core.logging import get_logger
+from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.multirepo import DeclarationError, parse_story
+from ai_code_change_agent.domain.changes.states import AttemptStatus
+from ai_code_change_agent.orchestration.langgraph.runner import CheckpointExpiredError
 
 INTAKE = "code_change.intake"
 RESUME = "code_change.resume"
@@ -40,6 +45,7 @@ Launch = Callable[[uuid.UUID], Awaitable[Any]]
 # a truncated body, 408 Request Timeout, 425 Too Early): retried within the job's attempts.
 _TRANSIENT_RESPONSES = frozenset({"unexpected_content_type", "malformed_json"})
 _TRANSIENT_STATUSES = frozenset({408, 425})
+_log = get_logger("intake")
 
 
 def _transient(exc: JiraIntegrationError) -> bool:
@@ -201,12 +207,80 @@ class ParentReportHandler:
 
 
 class ResumeHandler:
-    def __init__(self, resume: Launch) -> None:
+    """Resumes an attempt after an approval. When the workflow's checkpoint has expired
+    (ACCA_CHECKPOINT_TTL_DAYS) the attempt cannot resume: it becomes FAILED with
+    `checkpoint_expired`, which releases its active guard, is reported to Jira through the
+    workflow's own once-per-attempt report (`report`, the cleanup step), and the job ends with
+    that code.
+
+    A multi-repository child that paused at a gate is finished here: once the resumed (or
+    expired) attempt is terminal the coordinator records the child and advances its parent, so
+    the parent never stays RUNNING after its last child. Children report only through the
+    parent's aggregated comment, including an old attempt that retry-child unlinked from its
+    child (its request still has the parent). `around` wraps the run (the cost report), so it
+    already sees the expired attempt as FAILED."""
+
+    def __init__(
+        self,
+        resume: Launch,
+        *,
+        changes: CodeChangeService | None = None,
+        coordinator: Coordinator | None = None,
+        report: Launch | None = None,
+        around: Callable[[Launch], Launch] | None = None,
+    ) -> None:
         self._resume = resume
+        self._changes = changes
+        self._coordinator = coordinator
+        self._report = report
+        self._run = (around or (lambda launch: launch))(self._resume_or_expire)
 
     async def __call__(self, job: Job) -> None:
         try:
             attempt_id = uuid.UUID(str(job.payload["attempt_id"]))
         except (KeyError, ValueError):
             raise JobFailedError("payload_invalid") from None
-        await self._resume(attempt_id)
+        try:
+            await self._run(attempt_id)
+        except CheckpointExpiredError as exc:
+            _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
+            if (
+                not await self._child_finished(attempt_id)
+                and self._report is not None
+                and not await self._of_multi_repo_request(attempt_id)
+            ):
+                await self._report(attempt_id)
+            raise JobFailedError(exc.code) from None
+        await self._child_finished(attempt_id)
+
+    async def _resume_or_expire(self, attempt_id: uuid.UUID) -> Any:
+        try:
+            return await self._resume(attempt_id)
+        except CheckpointExpiredError as exc:
+            if self._changes is not None:
+                with contextlib.suppress(InvalidTransitionError):  # already terminal
+                    await self._changes.transition(
+                        attempt_id, AttemptStatus.FAILED, failure_code=exc.code
+                    )
+            raise
+
+    async def _of_multi_repo_request(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt's request has a multi-repository parent. Covers an attempt no
+        child links any more (retry-child cleared the link): it was a child's, so it is reported
+        only through the parent's aggregated comment, never as a single-repository failure."""
+        if self._coordinator is None or self._changes is None:
+            return False
+        attempt = await self._changes.get_attempt(attempt_id)
+        return await self._coordinator.store.find_by_request(attempt.request_id) is not None
+
+    async def _child_finished(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt belongs to a multi-repository child (notified if terminal)."""
+        if self._coordinator is None or self._changes is None:
+            return False
+        child = await self._coordinator.store.child_by_attempt(attempt_id)
+        if child is None:
+            return False
+        attempt = await self._changes.get_attempt(attempt_id)
+        if attempt.terminal:  # still at a gate: nothing to record yet (manual approval)
+            await self._coordinator.child_finished(child.id, attempt)
+        return True

@@ -234,3 +234,29 @@ async def test_validation_can_route_back_to_implementation() -> None:
     steps = ScriptedSteps(outcomes)
     await WorkflowRunner(build_graph(steps, MemorySaver())).start(uuid.uuid4())
     assert steps.calls.count("implement") == 2 and steps.calls[-1] == "cleanup"
+
+
+async def test_each_agent_run_is_indexed_under_its_attempt(tmp_path: Any) -> None:
+    rig = await make_rig(tmp_path)
+    await rig.runner.start(rig.attempt_id)
+    await approve(rig, ApprovalGate.PLAN)
+    await rig.runner.resume(rig.attempt_id)
+    planning, implementation = rig.agent.threads
+    assert planning.startswith(f"attempt:{rig.attempt_id}:planning:")
+    assert implementation.startswith(f"attempt:{rig.attempt_id}:implementation:0:")
+    assert await rig.deps.changes.agent_threads(rig.attempt_id) == [planning, implementation]
+
+
+async def test_a_thread_index_failure_never_fails_the_phase(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await make_rig(tmp_path)
+
+    async def unavailable(*_: Any) -> None:
+        raise RuntimeError("index unavailable")
+
+    monkeypatch.setattr(rig.deps.changes, "record_agent_thread", unavailable)
+    await rig.runner.start(rig.attempt_id)
+    assert await status(rig) is S.AWAITING_PLAN_APPROVAL
+    assert len(rig.agent.threads) == 1
+    assert await rig.deps.changes.agent_threads(rig.attempt_id) == []

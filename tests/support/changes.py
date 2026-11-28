@@ -2,9 +2,11 @@
 
 import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Self
 
+from ai_code_change_agent.application.changes.ports import AttemptListing
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.domain.changes.errors import ChangeConflictError
 from ai_code_change_agent.domain.changes.models import (
@@ -19,6 +21,8 @@ class _State:
         self.requests: dict[uuid.UUID, CodeChangeRequest] = {}
         self.attempts: dict[uuid.UUID, CodeChangeAttempt] = {}
         self.approvals: list[Approval] = []
+        self.created: dict[uuid.UUID, datetime] = {}
+        self.threads: dict[uuid.UUID, list[str]] = {}
 
 
 class MemoryChangeStore:
@@ -46,6 +50,7 @@ class MemoryChangeStore:
 
     async def add_attempt(self, attempt: CodeChangeAttempt) -> None:
         self.s.attempts[attempt.id] = attempt
+        self.s.created[attempt.id] = datetime.now(UTC)
 
     async def update_attempt(self, attempt: CodeChangeAttempt, *, expected_version: int) -> None:
         if self.s.attempts[attempt.id].row_version != expected_version:
@@ -57,6 +62,26 @@ class MemoryChangeStore:
 
     async def list_approvals(self, attempt_id: uuid.UUID) -> list[Approval]:
         return [a for a in self.s.approvals if a.attempt_id == attempt_id]
+
+    async def get_attempt_listing(self, attempt_id: uuid.UUID) -> AttemptListing | None:
+        attempt = self.s.attempts.get(attempt_id)
+        if attempt is None:
+            return None
+        created = self.s.created.get(attempt_id, datetime.now(UTC))
+        return AttemptListing(attempt, created, created)
+
+    async def list_recent_attempts(self, limit: int) -> list[AttemptListing]:
+        listings = [await self.get_attempt_listing(a) for a in self.s.attempts]
+        found = [x for x in listings if x is not None]
+        return sorted(found, key=lambda x: x.created_at, reverse=True)[: max(limit, 0)]
+
+    async def record_agent_thread(self, attempt_id: uuid.UUID, thread_id: str) -> None:
+        runs = self.s.threads.setdefault(attempt_id, [])
+        if thread_id not in runs:
+            runs.append(thread_id)
+
+    async def agent_threads(self, attempt_id: uuid.UUID) -> list[str]:
+        return list(self.s.threads.get(attempt_id, []))
 
 
 class MemoryChangeUow:

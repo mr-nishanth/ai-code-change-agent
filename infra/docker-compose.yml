@@ -1,0 +1,62 @@
+# Local AWS emulator (Floci) for S2115 tests only. Never used by acca-api, the worker or the sandboxes.
+# Standalone project, separate network and volume: start it with
+#   docker compose -f infra/docker-compose.yml up -d
+# Clients use http://127.0.0.1:4566 with dummy credentials (test/test, us-east-1) only.
+# Floci is the only container in this repository with the Docker socket (see ADR-014); it needs it
+# to run Lambda, ECS, RDS and the ECR registry as sibling containers.
+name: acca-floci
+
+services:
+  floci:
+    image: floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+    container_name: acca-floci
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4566:4566" # AWS APIs and the ECR registry data plane
+      - "127.0.0.1:7001-7005:7001-7005" # RDS proxy ports (narrowed range)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - acca_floci_data:/app/data
+    environment:
+      FLOCI_DEFAULT_REGION: us-east-1
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+      FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE: "true" # RDS/ECR volumes go with their resource
+      # DynamoDB: journaled writes, one item file per table (docs/configuration/storage.md:72-74,
+      # docs/services/dynamodb.md "Item layout on disk"); an existing single-file store is migrated on start.
+      FLOCI_STORAGE_SERVICES_DYNAMODB_MODE: wal
+      FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT: per-table
+      # Web console sidecar (opened on demand at /_floci/ui): loopback only, pinned image (docs/ui/index.md).
+      FLOCI_SERVICES_UI_BIND_ADDRESS: "127.0.0.1"
+      FLOCI_SERVICES_UI_IMAGE: floci/floci-ui:0.7.0@sha256:90dcaa588f9b3cd3cb5ccc98559286574391001e46735b7be4373364d51f7dfe
+      FLOCI_SERVICES_DOCKER_NETWORK: acca-floci
+      FLOCI_SERVICES_RDS_PROXY_BASE_PORT: "7001"
+      FLOCI_SERVICES_RDS_PROXY_MAX_PORT: "7005"
+      FLOCI_SERVICES_RDS_ENDPOINT_HOST: localhost
+      FLOCI_SERVICES_ECR_URI_STYLE: path # Docker Engine 29 containerd image store
+      FLOCI_SERVICES_ECS_IMAGE_PULL_BEHAVIOR: prefer-cached
+      # Bedrock Runtime proxy (opt-in, local only; Floci 2.5.0 docs/services/bedrock-runtime.md:34-41).
+      # The default backend is `stub` (fixed reply, no model). With `proxy`, Converse and
+      # ConverseStream from ChatBedrockConverse (LLM_PROVIDER=bedrock, ACCA_BEDROCK_ENDPOINT_URL)
+      # are forwarded to Anthropic's OpenAI-compatible endpoint. That is a real, paid model call:
+      # it needs the owner's explicit authorisation. The key is read from the developer's shell at
+      # `up` time (export ANTHROPIC_API_KEY first) and never written to a committed file. Map each
+      # Bedrock model id the application uses to a Claude API model id.
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_BACKEND: proxy
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_URL: https://api.anthropic.com/v1
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_API_KEY: ${ANTHROPIC_API_KEY:?export ANTHROPIC_API_KEY in the shell}
+      # FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_MODEL_MAPPING: us.anthropic.claude-haiku-4-5-20251001-v1:0=claude-haiku-4-5
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"] # probes /_floci/init; the image has no curl
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks: [acca-floci]
+
+networks:
+  acca-floci:
+    name: acca-floci
+
+volumes:
+  acca_floci_data:
