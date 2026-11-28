@@ -21,6 +21,15 @@ def test_redacts_sensitive_keys() -> None:
     assert out["issue_key"] == "SHOP-1"
 
 
+@pytest.mark.parametrize(
+    "key",
+    ["app_secret", "api_token", "PASSWORD", "passwd", "Authorization", "x_signature", "api_key",
+     "api-key", "apikey", "aws_credentials"],
+)  # fmt: skip
+def test_every_sensitive_key_family_is_redacted(key: str) -> None:
+    assert redact_sensitive(None, "info", {key: "v"})[key] == REDACTED
+
+
 def test_emits_json_without_secret(capsys: pytest.CaptureFixture[str]) -> None:
     configure_logging("INFO", json_output=True)
     get_logger("t").info("hello", api_token="abc123", issue_key="SHOP-1")
