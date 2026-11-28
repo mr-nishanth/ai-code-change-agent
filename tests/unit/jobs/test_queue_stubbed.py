@@ -141,6 +141,32 @@ async def test_a_lost_heartbeat_returns_false_and_forgets_the_receipt(stubs: Stu
     assert await stubs.queue.complete(JID, "w1")  # no receipt left: no DeleteMessage call
 
 
+async def test_the_heartbeat_uses_only_the_renewal_clients() -> None:
+    main_ddb, main_sqs, beat_ddb, beat_sqs = (_client(s) for s in ("dynamodb", "sqs") * 2)
+    queue = DynamoSqsJobQueue(
+        Table(main_ddb, "s2116-app", retry=RetryPolicy(attempts=1)),
+        main_sqs,
+        URL,
+        clock=FixedClock(),
+        receive_wait_seconds=0,
+        heartbeat_table=Table(beat_ddb, "s2116-app", retry=RetryPolicy(attempts=1)),
+        heartbeat_sqs=beat_sqs,
+    )
+    with (
+        Stubber(main_ddb) as ddb,
+        Stubber(main_sqs) as sqs,
+        Stubber(beat_ddb) as beat,
+        Stubber(beat_sqs) as beat_q,
+    ):
+        claimed(Stubs(queue, ddb, sqs))
+        assert await queue.claim("w1", 60) is not None
+        beat.add_response("update_item", {"Attributes": serialize_item(job_item())})
+        visibility(Stubs(queue, beat, beat_q), 60)
+        assert await queue.heartbeat(JID, "w1", 60)
+        for stub in (ddb, sqs, beat, beat_q):  # nothing went to the main clients
+            stub.assert_no_pending_responses()
+
+
 async def test_release_forgets_only_the_owners_receipt(stubs: Stubs) -> None:
     claimed(stubs)
     await stubs.queue.claim("w1", 60)

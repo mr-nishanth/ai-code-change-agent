@@ -82,7 +82,7 @@ from ai_code_change_agent.orchestration.langgraph.checkpointer import dynamodb_c
 from ai_code_change_agent.orchestration.langgraph.graph import build_graph
 from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps, StepDependencies
-from ai_code_change_agent.persistence.dynamodb import PersistenceError, Table
+from ai_code_change_agent.persistence.dynamodb import PersistenceError, RetryPolicy, Table
 from ai_code_change_agent.persistence.dynamodb.change_store import DynamoChangeUnitOfWork
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
 from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
@@ -130,8 +130,18 @@ async def require_tables(settings: Settings, aws: AwsClients) -> None:
 
 
 def build_job_queue(settings: Settings, aws: AwsClients) -> DynamoSqsJobQueue:
-    """The job queue: job items (and their outbox entry) in the table, delivery through SQS."""
-    return DynamoSqsJobQueue(app_table(settings, aws), aws.sqs, aws.queue_url)
+    """The job queue: job items (and their outbox entry) in the table, delivery through SQS. The
+    lease renewal (J4) uses its own bounded clients and a single attempt (`heartbeat_config`), so
+    a renewal the worker abandoned at its margin cannot keep running for minutes."""
+    return DynamoSqsJobQueue(
+        app_table(settings, aws),
+        aws.sqs,
+        aws.queue_url,
+        heartbeat_table=Table(
+            aws.dynamodb_heartbeat, settings.dynamodb_table_name, retry=RetryPolicy(attempts=1)
+        ),
+        heartbeat_sqs=aws.sqs_heartbeat,
+    )
 
 
 def build_usage_store(settings: Settings, aws: AwsClients) -> DynamoUsageStore:

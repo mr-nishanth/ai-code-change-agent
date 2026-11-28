@@ -77,7 +77,14 @@ def test_every_builder_wires_dynamodb_sqs_and_s3_from_aws_clients() -> None:
     assert build_repository_resolver(s, aws) is not None
     assert build_change_service(s, aws) is not None
     assert isinstance(build_usage_store(s, aws), DynamoUsageStore)
-    assert isinstance(build_job_queue(s, aws), DynamoSqsJobQueue)
+    queue = build_job_queue(s, aws)
+    assert isinstance(queue, DynamoSqsJobQueue)
+    assert queue._table._client is aws.dynamodb and queue._sqs is aws.sqs
+    # the lease renewal (J4): its own bounded clients, a single attempt, the same table
+    assert (
+        queue._beat_table._client is aws.dynamodb_heartbeat and queue._beat_sqs is aws.sqs_heartbeat
+    )
+    assert queue._beat_table.name == TABLE and queue._beat_table.retry.attempts == 1
     artifacts = build_artifact_service(s, aws)
     assert isinstance(artifacts._store, S3ArtifactStore)
     for client in (aws.dynamodb, aws.sqs, aws.s3):

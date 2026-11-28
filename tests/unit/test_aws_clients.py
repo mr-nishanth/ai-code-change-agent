@@ -10,12 +10,16 @@ import pytest
 from botocore.awsrequest import AWSResponse  # type: ignore[import-untyped]
 from botocore.stub import Stubber  # type: ignore[import-untyped]
 
+from ai_code_change_agent.application.jobs.worker import HEARTBEAT_MARGIN_SECONDS
 from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.integrations.aws import AwsClients
 from ai_code_change_agent.integrations.aws.clients import (
     CONNECT_TIMEOUT_SECONDS,
+    HEARTBEAT_CONNECT_TIMEOUT_SECONDS,
+    HEARTBEAT_READ_TIMEOUT_SECONDS,
     READ_TIMEOUT_SECONDS,
     client_config,
+    heartbeat_config,
 )
 
 LOCAL = "http://127.0.0.1:4566"
@@ -73,6 +77,25 @@ def test_local_clients_use_the_endpoint_region_and_static_credentials() -> None:
         "dynamodb",
         "sqs",
     }
+
+
+def test_the_lease_renewal_clients_are_bounded_by_the_heartbeat_margin() -> None:
+    """A renewal the worker abandoned at its margin keeps running in its thread: one attempt with
+    connect + read inside the margin ends it about one margin later, not read timeout x retries."""
+    assert (HEARTBEAT_CONNECT_TIMEOUT_SECONDS, HEARTBEAT_READ_TIMEOUT_SECONDS) == (2, 3)
+    assert HEARTBEAT_CONNECT_TIMEOUT_SECONDS + HEARTBEAT_READ_TIMEOUT_SECONDS <= (
+        HEARTBEAT_MARGIN_SECONDS
+    )
+    aws = AwsClients(local_settings())
+    for client, service in ((aws.dynamodb_heartbeat, "dynamodb"), (aws.sqs_heartbeat, "sqs")):
+        assert client.meta.service_model.service_name == service
+        assert client.meta.endpoint_url == LOCAL
+        config = client.meta.config
+        assert (config.connect_timeout, config.read_timeout) == (2, 3)
+        assert config.retries == {"mode": "standard", "total_max_attempts": 1}
+    assert aws.dynamodb_heartbeat is not aws.dynamodb and aws.sqs_heartbeat is not aws.sqs
+    assert aws.sqs.meta.config.read_timeout == READ_TIMEOUT_SECONDS  # the long poll is unchanged
+    assert heartbeat_config().ignore_configured_endpoint_urls is True
 
 
 def test_ambient_aws_profile_and_endpoint_are_ignored(

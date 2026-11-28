@@ -107,7 +107,10 @@ class DynamoSqsJobQueue:
 
     `queue_url` is the URL or a callable that returns it (`AwsClients.queue_url`, resolved on
     first use). `receive_wait_seconds` is the long-poll wait of one claim (0..20);
-    `sweep_grace_seconds` is how long a job may be overdue before the sweep re-sends it."""
+    `sweep_grace_seconds` is how long a job may be overdue before the sweep re-sends it.
+    `heartbeat_table` / `heartbeat_sqs` serve the lease renewal (J4) only, so its calls can be
+    bounded tighter than the rest (`AwsClients.dynamodb_heartbeat` / `sqs_heartbeat`); they
+    default to `table` and `sqs`."""
 
     def __init__(
         self,
@@ -119,6 +122,8 @@ class DynamoSqsJobQueue:
         receive_wait_seconds: int = MAX_RECEIVE_WAIT_SECONDS,
         sweep_grace_seconds: int = 300,
         retention_days: int = RETENTION_DAYS,
+        heartbeat_table: Table | None = None,
+        heartbeat_sqs: Any = None,
     ) -> None:
         if not 0 <= receive_wait_seconds <= MAX_RECEIVE_WAIT_SECONDS:
             raise ValueError("receive_wait_seconds must be 0..20")
@@ -126,6 +131,8 @@ class DynamoSqsJobQueue:
             raise ValueError("sweep_grace_seconds must not be negative")
         self._table = table
         self._sqs = sqs
+        self._beat_table = heartbeat_table or table
+        self._beat_sqs = heartbeat_sqs if heartbeat_sqs is not None else sqs
         self._queue_url = queue_url
         self._clock: Clock = clock or SystemClock()
         self._wait = receive_wait_seconds
@@ -147,9 +154,9 @@ class DynamoSqsJobQueue:
             raise PersistenceError(code)
         return self._queue_url
 
-    async def _sqs_call(self, operation: str, **request: Any) -> dict[str, Any]:
+    async def _sqs_call(self, operation: str, *, sqs: Any = None, **request: Any) -> dict[str, Any]:
         request["QueueUrl"] = await self._url()
-        method = getattr(self._sqs, operation)
+        method = getattr(self._sqs if sqs is None else sqs, operation)
         try:
             response: dict[str, Any] = await asyncio.to_thread(method, **request)
         except (ClientError, BotoCoreError) as exc:
@@ -158,9 +165,11 @@ class DynamoSqsJobQueue:
             return response
         raise PersistenceError(code)  # outside the except block: nothing from botocore is chained
 
-    async def _best_effort(self, operation: str, job_id: uuid.UUID, **request: Any) -> bool:
+    async def _best_effort(
+        self, operation: str, job_id: uuid.UUID, *, sqs: Any = None, **request: Any
+    ) -> bool:
         try:
-            await self._sqs_call(operation, **request)
+            await self._sqs_call(operation, sqs=sqs, **request)
         except PersistenceError as exc:
             _log.warning(
                 "job_sqs_call_failed", job_id=str(job_id), operation=operation, code=str(exc)
@@ -173,11 +182,14 @@ class DynamoSqsJobQueue:
             "send_message", job_id, MessageBody=json.dumps({"job_id": str(job_id)})
         )
 
-    async def _visibility(self, job_id: uuid.UUID, receipt: str | None, seconds: int) -> None:
+    async def _visibility(
+        self, job_id: uuid.UUID, receipt: str | None, seconds: int, *, sqs: Any = None
+    ) -> None:
         if receipt is not None:
             await self._best_effort(
                 "change_message_visibility",
                 job_id,
+                sqs=sqs,
                 ReceiptHandle=receipt,
                 VisibilityTimeout=max(0, min(MAX_VISIBILITY_SECONDS, seconds)),
             )
@@ -362,7 +374,7 @@ class DynamoSqsJobQueue:
     async def heartbeat(self, job_id: uuid.UUID, owner: str, lease_seconds: int) -> bool:
         now = self._clock.now()
         try:
-            await self._table.update(
+            await self._beat_table.update(
                 keys.job(job_id),
                 update="SET lease_expires_at = :lease, heartbeat_at = :now, " + _BUMP,
                 condition="#s = :running AND lease_owner = :owner AND lease_expires_at >= :now",
@@ -380,7 +392,9 @@ class DynamoSqsJobQueue:
         except _Stale:
             self._forget(job_id, owner)
             return False
-        await self._visibility(job_id, self._receipt(job_id, owner), lease_seconds)
+        await self._visibility(
+            job_id, self._receipt(job_id, owner), lease_seconds, sqs=self._beat_sqs
+        )
         return True
 
     async def complete(self, job_id: uuid.UUID, owner: str) -> bool:

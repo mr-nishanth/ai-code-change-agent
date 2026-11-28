@@ -26,6 +26,12 @@ from ai_code_change_agent.core.config import Settings
 CONNECT_TIMEOUT_SECONDS = 5
 # Above the SQS long-poll wait (ReceiveMessageWaitTimeSeconds=20) so a receive never times out.
 READ_TIMEOUT_SECONDS = 60
+# The job lease renewal (J4: UpdateItem, then ChangeMessageVisibility) has its own clients: one
+# attempt, connect + read within the worker's HEARTBEAT_MARGIN_SECONDS (5 s). The worker abandons a
+# renewal at the margin, but the call keeps running in its thread; with these bounds it ends (or
+# fails) within about one margin instead of read timeout x retries (minutes) later.
+HEARTBEAT_CONNECT_TIMEOUT_SECONDS = 2
+HEARTBEAT_READ_TIMEOUT_SECONDS = 3
 LOCAL_ACCESS_KEY_ID = "test"
 LOCAL_SECRET_ACCESS_KEY = "test"  # noqa: S105 - Floci's documented dummy credential
 
@@ -43,6 +49,17 @@ def client_config() -> Config:
         connect_timeout=CONNECT_TIMEOUT_SECONDS,
         read_timeout=READ_TIMEOUT_SECONDS,
         retries={"mode": "standard"},
+        ignore_configured_endpoint_urls=True,
+    )
+
+
+def heartbeat_config() -> Config:
+    """The lease renewal's clients: one attempt, bounded well inside the heartbeat margin (the
+    worker retries a failed renewal on its next beat, while the last one still covers it)."""
+    return Config(
+        connect_timeout=HEARTBEAT_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=HEARTBEAT_READ_TIMEOUT_SECONDS,
+        retries={"mode": "standard", "total_max_attempts": 1},
         ignore_configured_endpoint_urls=True,
     )
 
@@ -94,6 +111,17 @@ class AwsClients:
     @cached_property
     def s3(self) -> Any:
         return self._client("s3", client_config())
+
+    @cached_property
+    def dynamodb_heartbeat(self) -> Any:
+        """DynamoDB for the job lease renewal only (`heartbeat_config`)."""
+        return self._client("dynamodb", heartbeat_config())
+
+    @cached_property
+    def sqs_heartbeat(self) -> Any:
+        """SQS for the renewal's ChangeMessageVisibility only (`heartbeat_config`); never for
+        the long-poll receive, which needs READ_TIMEOUT_SECONDS."""
+        return self._client("sqs", heartbeat_config())
 
     def dynamodb_probe(self, timeout_seconds: float) -> Any:
         """A separate DynamoDB client for readiness probes (`probe_config`): a probe never waits
