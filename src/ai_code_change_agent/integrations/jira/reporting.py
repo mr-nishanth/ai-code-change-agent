@@ -49,16 +49,35 @@ class CommentResult:
     comment_id: str | None = None
     http_status: int | None = None
     error: str | None = None
+    retry_after: float | None = None  # seconds, from a 429/503 Retry-After header
 
 
 _PERMANENT_HTTP = frozenset({400, 401, 403, 404, 405, 410, 413, 422})
 _COMMENT_ID = re.compile(r"[0-9]{1,20}")
+_RETRY_AFTER_MAX = 3600.0
 
 
-def _classify(code: int) -> CommentResult:
+def _retry_after(response: httpx.Response | None) -> float | None:
+    """Retry-After in delta-seconds (the form Jira sends); anything else is ignored."""
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        seconds = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    if seconds is None or not 0 <= seconds <= _RETRY_AFTER_MAX:
+        return None
+    return seconds
+
+
+def _classify(code: int, response: httpx.Response | None = None) -> CommentResult:
     if code in _PERMANENT_HTTP:
         return CommentResult(CommentStatus.PERMANENT, http_status=code, error=f"http_{code}")
-    return CommentResult(CommentStatus.RETRYABLE, http_status=code, error=f"http_{code}")
+    return CommentResult(
+        CommentStatus.RETRYABLE,
+        http_status=code,
+        error=f"http_{code}",
+        retry_after=_retry_after(response),
+    )
 
 
 def _adf_text(node: Any) -> str:
@@ -89,6 +108,10 @@ class JiraOutcomeReporter:
 
     def __repr__(self) -> str:
         return f"JiraOutcomeReporter(enabled={self._enabled})"
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -128,7 +151,7 @@ class JiraOutcomeReporter:
         except httpx.HTTPError:
             return CommentResult(CommentStatus.RETRYABLE, error="transport_error")
         if response.status_code != 201:
-            return _classify(response.status_code)
+            return _classify(response.status_code, response)
         try:
             raw = response.json().get("id")
         except ValueError:
@@ -156,9 +179,12 @@ class JiraOutcomeReporter:
         except httpx.HTTPError:
             return CommentResult(CommentStatus.RETRYABLE, error="lookup_transport_error")
         if response.status_code != 200:
-            found = _classify(response.status_code)
+            found = _classify(response.status_code, response)
             return CommentResult(
-                found.status, http_status=found.http_status, error="lookup_" + str(found.error)
+                found.status,
+                http_status=found.http_status,
+                error="lookup_" + str(found.error),
+                retry_after=found.retry_after,
             )
         try:
             comments = response.json().get("comments") or []

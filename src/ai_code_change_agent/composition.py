@@ -29,6 +29,7 @@ from ai_code_change_agent.application.costs.usage import UsageTracker
 from ai_code_change_agent.application.git_providers.baseline import BaselineReaders
 from ai_code_change_agent.application.git_providers.delivery import DeliveryPublishers
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
+from ai_code_change_agent.application.jira.reports import DurableJiraReporter
 from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.jobs.worker import Worker
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
@@ -68,6 +69,7 @@ from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
 from ai_code_change_agent.integrations.jira.webhook import JiraCloudSignatureVerifier
 from ai_code_change_agent.integrations.web.fetcher import HttpReferenceFetcher
 from ai_code_change_agent.integrations.web.search import AnthropicDocumentSearch
+from ai_code_change_agent.orchestration.dead_jobs import AttemptRecovery
 from ai_code_change_agent.orchestration.intake import (
     CHILD,
     INTAKE,
@@ -84,6 +86,7 @@ from ai_code_change_agent.orchestration.langgraph.runner import WorkflowRunner
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps, StepDependencies
 from ai_code_change_agent.persistence.dynamodb import PersistenceError, RetryPolicy, Table
 from ai_code_change_agent.persistence.dynamodb.change_store import DynamoChangeUnitOfWork
+from ai_code_change_agent.persistence.dynamodb.jira_report_store import DynamoJiraReportStore
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
 from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
 from ai_code_change_agent.persistence.dynamodb.registry_store import DynamoRegistryUnitOfWork
@@ -537,7 +540,11 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
         await require_tables(settings, clients)
         saver = dynamodb_checkpointer(clients, settings)
         artifacts = build_artifact_service(settings, clients)
-        reporter = build_jira_reporter(settings)
+        # every app-posted comment is stored before it is posted and retried (durable reporting)
+        reporter = DurableJiraReporter(
+            build_jira_reporter(settings),
+            DynamoJiraReportStore(app_table(settings, clients)),
+        )
         resolver = build_repository_resolver(settings, clients)
         coordinator = build_coordinator(
             settings,
@@ -586,6 +593,10 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
         )
         steps = CodeChangeSteps(deps)
         runner = WorkflowRunner(build_graph(steps, saver))
+        # ends what a DEAD job leaves behind, whichever path recorded it DEAD
+        recovery = AttemptRecovery(
+            changes=changes, report=steps.cleanup, complete=steps.report, coordinator=coordinator
+        )
         intake = IntakeHandler(
             changes=changes,
             jira=jira,
@@ -594,6 +605,7 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
             repository_field_configured=settings.jira_repository_field is not None,
             reporter=deps.reporter,
             coordinator=coordinator,
+            recovery=recovery,
         )
         handlers: dict[str, Any] = {
             INTAKE: intake,
@@ -617,7 +629,12 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
             concurrency=settings.max_concurrent_jobs,
             relay_seconds=settings.job_relay_seconds,
             sweep_seconds=settings.job_sweep_seconds,
-            on_dead={INTAKE: intake.on_dead},
+            on_dead={
+                INTAKE: intake.on_dead,
+                RESUME: recovery.resume_dead,
+                CHILD: recovery.child_dead,
+            },
+            periodic=[("jira_report_retry", reporter.retry_due)],
         )
         yield WorkerApp(worker, runner, changes, costs)
     finally:

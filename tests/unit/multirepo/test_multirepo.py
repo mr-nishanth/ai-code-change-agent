@@ -250,7 +250,7 @@ class Reporter:
         self.lookups = 0
         self.lost_response = False  # Jira creates the comment but the response is lost
 
-    async def report(self, issue_key: str, text: str) -> str:
+    async def report(self, issue_key: str, text: str, *, report_id: str | None = None) -> str:
         self.texts.append((issue_key, text))
         return "POSTED"
 
@@ -376,7 +376,7 @@ async def test_a_blocked_multi_repository_intake_is_reported_once() -> None:
         def __init__(self) -> None:
             self.texts: list[str] = []
 
-        async def report(self, key: str, text: str) -> str:
+        async def report(self, key: str, text: str, *, report_id: str | None = None) -> str:
             self.texts.append(text)
             return "POSTED"
 

@@ -36,6 +36,7 @@ GSI_LIST_ATTEMPT = "LIST#ATTEMPT"
 GSI_LIST_REPOSITORY = "LIST#REPOSITORY"
 GSI_LIST_MAPPING = "LIST#MAPPING"
 GSI_LIST_AUDIT = "LIST#AUDIT"
+GSI_LIST_REPORT = "LIST#JIRAREPORT"
 GSI_DISPATCH = "DISPATCH"  # GSI3: outbox, the job's message was never sent
 GSI_SWEEP = "SWEEP"  # GSI3: non-terminal job whose message was sent; watched by the sweep
 GSI_DEAD = "DEADHOOK"  # GSI3: DEAD job whose kind's on_dead hook has not run yet
@@ -303,3 +304,7 @@ def jira_report(report_id: str) -> Key:
 
 def jira_report_gsi3(due_at: datetime, report_id: str) -> dict[str, str]:
     return {"GSI3PK": GSI_REPORT, "GSI3SK": _join(_ts(due_at), _last(report_id))}
+
+
+def jira_report_gsi2(created_at: datetime, report_id: str) -> dict[str, str]:
+    return {"GSI2PK": GSI_LIST_REPORT, "GSI2SK": _join(_ts(created_at), _last(report_id))}
