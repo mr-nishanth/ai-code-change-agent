@@ -36,6 +36,7 @@ from ai_code_change_agent.application.git_providers.delivery import (
     DeliveryRequest,
     DeliveryTarget,
 )
+from ai_code_change_agent.application.jira.comment_lines import safe_line
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jira.story import story_of
 from ai_code_change_agent.application.repositories.ports import RegistryUnitOfWork
@@ -988,7 +989,7 @@ class CodeChangeSteps:
             f"Repository: {await self._repository_name(a)}\n"
             f"Branch: {manifest.branch}\n"
             f"Draft PR: {result.pr_url}\n"
-            f"Summary: {plan.summary[:600]}\n"
+            f"Summary: {safe_line(plan.summary, 600)}\n"
             f"Tests and checks run by independent validation: {commands}\n"
             f"Validation outcome: PASSED. Attempt {a.number} ({a.id}).\n"
             "Review and merge are human decisions."
@@ -1080,9 +1081,7 @@ class CodeChangeSteps:
         plan = await load_verified(
             self._d.artifacts, self._scope(a), latest[0], latest[1], ImplementationPlan
         )
-        questions = "".join(
-            f"- {' '.join(q.split())[:300]}\n" for q in plan.clarification_questions[:10]
-        )
+        questions = "".join(f"- {safe_line(q, 300)}\n" for q in plan.clarification_questions[:10])
         return f"Questions to answer in the Story before a new attempt:\n{questions}"
 
     async def _validation_detail(self, a: CodeChangeAttempt) -> str:

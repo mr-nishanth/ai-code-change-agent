@@ -613,6 +613,39 @@ async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path:
     assert len(text) < 4000 and "- Q0 " in text
 
 
+# Stored plans are scanned as JSON, where an escaped quote hides this assignment from the
+# detector; the comment holds the decoded text, so it is scanned again before posting.
+_LEAK = 'the password: "hunter2-secret-value"'
+
+
+async def test_a_clarification_question_with_a_secret_is_withheld_from_jira(
+    tmp_path: Path,
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    ask = {**_ASK, "clarification_questions": [f"Is {_LEAK} still valid?", "Which region?"]}
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(ask)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert "hunter2" not in text and "- [withheld: possible secret]" in text
+    assert "- Which region?" in text
+
+
+async def test_a_plan_summary_with_a_secret_is_withheld_from_the_success_comment(
+    tmp_path: Path,
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    workflow.FakeAgent.plan_result = plan_with(summary=f"Greet politely; rotate {_LEAK}")
+    try:
+        assert await run(rig) is S.COMPLETED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert "hunter2" not in text and "Summary: [withheld: possible secret]" in text
+
+
 def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> None:
     plan = plan_with(
         findings=[
