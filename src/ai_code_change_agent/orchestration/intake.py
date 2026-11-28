@@ -155,7 +155,8 @@ class IntakeHandler:
         becomes BLOCKED (idempotent) before Jira is told, so a storage failure here retries the
         job without posting a comment. A request already BLOCKED when this run began was refused
         and reported by an earlier run (its lease expired before the job failed): no second
-        comment. Jira hears of a refusal at most once."""
+        comment. At most once, best effort: two overlapping runs after a lease expiry may both
+        post, and a Jira post that fails after the request is BLOCKED is not retried."""
         changed = await self._changes.refuse_request(request.id)
         first = changed or request.status != AttemptStatus.BLOCKED.value
         if first and text is not None and issue_key is not None and self._reporter is not None:
