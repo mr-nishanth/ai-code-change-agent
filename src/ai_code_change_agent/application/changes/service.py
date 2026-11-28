@@ -9,6 +9,7 @@ jitter; DYNAMODB-DATA-MODEL.md 5.1); genuine conflicts are not retried.
 import asyncio
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
 from ai_code_change_agent.application.changes.ports import AttemptListing, ChangeUnitOfWork
 from ai_code_change_agent.application.retry import Sleep, retry_concurrent
@@ -110,6 +111,23 @@ class CodeChangeService:
                 req.current_attempt_id,
                 req.status,
             )
+            await uow.store.update_request(req)
+            await uow.commit()
+            return req
+
+    @retry_concurrent
+    async def refuse_request(self, request_id: uuid.UUID) -> CodeChangeRequest:
+        """Intake refused the request (for example its repository is not registered): no attempt
+        will ever start from that intake job, so the status projection becomes the terminal
+        BLOCKED instead of staying RECEIVED. Only a request that never had an attempt changes,
+        and only once: a redelivered intake job writes nothing."""
+        async with self._uow() as uow:
+            req = await uow.store.lock_request(request_id)
+            if req is None:
+                raise ChangeNotFoundError("request_not_found")
+            if req.current_attempt_id is not None or req.status != "RECEIVED":
+                return req
+            req = replace(req, status=AttemptStatus.BLOCKED.value)
             await uow.store.update_request(req)
             await uow.commit()
             return req

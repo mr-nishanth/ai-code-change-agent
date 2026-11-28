@@ -69,7 +69,7 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 |---|---|---|---|---|
 | Jira delivery | `DELIVERY#<delivery_id>` | `DELIVERY` | - | `DELIVERY#5b2c...-webhook-17`. Written once with final `processing_result`, `request_id`; TTL `expires_at` (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30 days) |
 | Issue guard | `JIRAISSUE#<jira_issue_id>` | `GUARD` | - | `JIRAISSUE#10042` -> `request_id`. Unique Story |
-| Code change request | `REQ#<rid>` | `REQUEST` | GSI1 `ISSUEKEY#<jira_issue_key>` / `REQ#<created_at>#<rid>` | Status projection, assignment, `row_version` |
+| Code change request | `REQ#<rid>` | `REQUEST` | GSI1 `ISSUEKEY#<jira_issue_key>` / `REQ#<created_at>#<rid>` | Status projection, assignment, `row_version`. `status`: RECEIVED until the first attempt, then that attempt's status; BLOCKED when intake refused the request before any attempt |
 | Attempt | `REQ#<rid>` | `ATT#<aid>` | GSI2 `LIST#ATTEMPT` / `<created_at>#<aid>` | Same attributes as today, plus `request_id` |
 | Attempt pointer | `ATTEMPT#<aid>` | `PTR` | - | Immutable `request_id`, `number`. Cache forever in-process |
 | Agent thread index | `ATTEMPT#<aid>` | `THREAD#<thread_id>` | - | `THREAD#attempt:<aid>:planning:9f3a1c2e` (studio only) |

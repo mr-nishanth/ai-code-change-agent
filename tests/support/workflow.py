@@ -145,6 +145,16 @@ class FakeJira:
         raise NotImplementedError
 
 
+class UnregisteredRepositoryJira(FakeJira):
+    """A Story naming a repository the registry does not hold (`repository_unknown_repository`)."""
+
+    async def get_issue(self, issue_ref: str) -> JiraIssue:
+        issue = await super().get_issue(issue_ref)
+        return issue.model_copy(
+            update={"description": JiraRichText(text="Repository: not-registered\nSay goodbye")}
+        )
+
+
 class RecordingPublisher:
     def __init__(self) -> None:
         self.requests: list[DeliveryRequest] = []

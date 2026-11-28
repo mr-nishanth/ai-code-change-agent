@@ -83,7 +83,7 @@ class IntakeHandler:
         try:
             issue = await self._jira.get_issue(request.jira_issue_key)
         except JiraIssueNotFoundError:
-            raise JobFailedError("jira_issue_not_found") from None
+            raise await self._refused(request_id, "jira_issue_not_found") from None
         except JiraIntegrationError as exc:
             # Authentication, permission, a bad request or an unusable response will not fix
             # itself on a retry: dead at once, with the fixed code. Transient errors (429, 5xx
@@ -91,43 +91,39 @@ class IntakeHandler:
             if _transient(exc):
                 raise JobRetryableError(exc.code) from None
             if not exc.retryable:
-                raise JobFailedError(exc.code) from None
+                raise await self._refused(request_id, exc.code) from None
             raise
         if issue.project is None or issue.project.key != request.jira_project_key:
-            raise JobFailedError("jira_project_changed")
+            raise await self._refused(request_id, "jira_project_changed")
         story_text = f"{issue.summary or ''}\n{issue.description.text if issue.description else ''}"
         try:
             declarations = parse_story(story_text)
         except DeclarationError as exc:
-            await self._report_blocked(issue.key, f"invalid repository declarations: {exc}")
-            raise JobFailedError(exc.code) from None
+            text = _not_started(issue.key, f"invalid repository declarations: {exc}")
+            raise await self._refused(request_id, exc.code, issue.key, text) from None
         if len(declarations) > 1:
             if self._coordinator is None:
-                raise JobFailedError("multi_repository_disabled")
+                raise await self._refused(request_id, "multi_repository_disabled")
             try:
                 await self._coordinator.start(
                     request_id, issue.key, request.jira_project_key, declarations
                 )
             except MultiRepoBlockedError as exc:
-                if self._reporter is not None:
-                    await self._reporter.report(issue.key, exc.report)
-                raise JobFailedError(exc.code) from None
+                raise await self._refused(request_id, exc.code, issue.key, exc.report) from None
             return
         resolution = build_resolution_request(issue, REPOSITORY_FIELD if self._field else None)
         result = await self._resolver.resolve(resolution)
         if not result.resolved:
             code = f"repository_{result.outcome.value.lower()}"
-            if self._reporter is not None:
-                await self._reporter.report(
-                    issue.key,
-                    f"AI Code Change Agent could not start {issue.key}.\n"
-                    f"Reason: {code} ({result.detail}).\n"
-                    "Name the target repository in the description, for example "
-                    "'Repository: owner/name'. It must be granted to the GitHub App, registered, "
-                    "ACTIVE and mapped to this Jira project by an operator.\n"
-                    "Retryable: no, the cause must be fixed first.",
-                )
-            raise JobFailedError(code)
+            text = (
+                f"AI Code Change Agent could not start {issue.key}.\n"
+                f"Reason: {code} ({result.detail}).\n"
+                "Name the target repository in the description, for example "
+                "'Repository: owner/name'. It must be granted to the GitHub App, registered, "
+                "ACTIVE and mapped to this Jira project by an operator.\n"
+                "Retryable: no, the cause must be fixed first."
+            )
+            raise await self._refused(request_id, code, issue.key, text)
         assert result.repository_id and result.profile_version_id  # noqa: S101 - resolved
         await self._changes.assign_repository(
             request_id, result.repository_id, result.profile_version_id
@@ -135,13 +131,27 @@ class IntakeHandler:
         attempt = await self._changes.start_attempt(request_id)
         await self._start(attempt.id)
 
-    async def _report_blocked(self, issue_key: str, reason: str) -> None:
-        if self._reporter is not None:
-            await self._reporter.report(
-                issue_key,
-                f"AI Code Change Agent could not start {issue_key}.\nReason: {reason}.\n"
-                "Retryable: no, the cause must be fixed first.",
-            )
+    async def _refused(
+        self,
+        request_id: uuid.UUID,
+        code: str,
+        issue_key: str | None = None,
+        text: str | None = None,
+    ) -> JobFailedError:
+        """The intake job ends DEAD with `code`, so no attempt will start from it: the request
+        becomes BLOCKED (idempotent) before Jira is told, so a storage failure here retries the
+        job without posting a comment twice."""
+        await self._changes.refuse_request(request_id)
+        if text is not None and issue_key is not None and self._reporter is not None:
+            await self._reporter.report(issue_key, text)
+        return JobFailedError(code)
+
+
+def _not_started(issue_key: str, reason: str) -> str:
+    return (
+        f"AI Code Change Agent could not start {issue_key}.\nReason: {reason}.\n"
+        "Retryable: no, the cause must be fixed first."
+    )
 
 
 class ChildHandler:
