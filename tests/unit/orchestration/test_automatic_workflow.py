@@ -18,7 +18,12 @@ from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyErro
 from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.integrations.jira.authentication import BasicAuthenticator
 from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
-from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps, JiraReportDoc
+from ai_code_change_agent.orchestration.steps import (
+    AUTOMATIC_ACTOR,
+    CodeChangeSteps,
+    JiraReportDoc,
+    complete_plan_scope,
+)
 from tests.support import workflow
 from tests.support.changes import python_profile
 from tests.support.workflow import make_rig
@@ -561,3 +566,243 @@ async def test_the_story_frame_is_labelled_with_the_validated_request_key(tmp_pa
         (await rig.deps.changes.get_attempt(rig.attempt_id)).request_id
     )
     assert seen == [request.jira_issue_key] and "\n" not in seen[0]
+
+
+_ASK = {
+    "summary": "The Story does not define 'more robust'",
+    "needs_clarification": True,
+    "clarification_questions": [
+        "Which connector failures must be retried?",
+        "What is the maximum acceptable latency?",
+    ],
+}
+
+
+@pytest.mark.parametrize("mode", ["automatic", "manual"])
+async def test_a_story_that_needs_clarification_stops_before_implementation(
+    tmp_path: Path, mode: str
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode=mode)
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(_ASK)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.failure_code == "story_needs_clarification" and att.plan_sha256 is None
+    assert [s.writable for s in rig.sandboxes.started] == [False]  # planning only
+    assert rig.publisher.requests == []
+    assert await rig.deps.changes.approvals(rig.attempt_id) == []  # nothing to approve
+    assert ArtifactKind.IMPLEMENTATION_PLAN in await kinds(rig)  # kept for the record
+    ((key, text),) = rig.reporter.reports
+    assert key == "SHOP-1" and "story_needs_clarification" in text
+    assert "at the planning stage" in text and "Retryable: no" in text
+    assert "- Which connector failures must be retried?" in text
+    assert "- What is the maximum acceptable latency?" in text
+    assert "Summary: The Story does not define 'more robust'\n" in text
+
+
+async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    many = {
+        **_ASK,
+        "summary": "S " + "y" * 1900,
+        "clarification_questions": [f"Q{i} " + "x" * 1900 for i in range(10)],
+    }
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(many)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert len(text) < 4000 and "- Q0 " in text
+    assert "Summary: S yyy" in text and "y" * 299 not in text
+
+
+# Stored plans are scanned as JSON, where an escaped quote hides this assignment from the
+# detector; the comment holds the decoded text, so it is scanned again before posting.
+_LEAK = 'the password: "hunter2-secret-value"'
+
+
+async def test_a_clarification_question_with_a_secret_is_withheld_from_jira(
+    tmp_path: Path,
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    ask = {**_ASK, "clarification_questions": [f"Is {_LEAK} still valid?", "Which region?"]}
+    workflow.FakeAgent.plan_result = ImplementationPlan.model_validate(ask)
+    try:
+        assert await run(rig) is S.FAILED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert "hunter2" not in text and "- [withheld: possible secret]" in text
+    assert "- Which region?" in text
+
+
+async def test_a_plan_summary_with_a_secret_is_withheld_from_the_success_comment(
+    tmp_path: Path,
+) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic")
+    workflow.FakeAgent.plan_result = plan_with(summary=f"Greet politely; rotate {_LEAK}")
+    try:
+        assert await run(rig) is S.COMPLETED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    ((_, text),) = rig.reporter.reports
+    assert "hunter2" not in text and "Summary: [withheld: possible secret]" in text
+
+
+def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> None:
+    plan = plan_with(
+        findings=[
+            "tests/test_vehicles_api.py must be updated to cover the new field",
+            "app/config.py must not be changed",
+            "app/models.py defines the Vehicle model",  # no change wording: only context
+            ".github/workflows/ci.yml must be updated as well",  # protected: never added
+            "../outside.py must be updated",  # not a repository path: never added
+        ],
+        todo=["Extend `app/routes.py` with the new endpoint.", "Fix docs/missing.py"],
+        tests=[
+            "Update tests/test_greeting.py with a Goodbye case",
+            "Add tests/test_routes.py for the endpoint",
+            "tests/test_new_api.py",  # an exact entry is already allowed as a test path
+            "Document it in docs/notes.txt",  # neither an existing file nor a test module
+        ],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "tests/test_vehicles_api.py", "app/config.py", "app/models.py",
+         "app/routes.py", "tests/test_greeting.py", ".github/workflows/ci.yml",
+         "outside.py", "github/workflows/ci.yml"}  # what a stripped token would name
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("tests/test_vehicles_api.py", "modify"),
+        ("app/routes.py", "modify"),
+        ("tests/test_greeting.py", "modify"),
+        ("tests/test_routes.py", "create"),
+    ]
+    assert all("added by the platform" in c.purpose for c in done.changes[1:])
+    assert complete_plan_scope(done, existing) == done  # idempotent
+    assert complete_plan_scope(workflow.PLAN, frozenset(workflow.FILES)) == workflow.PLAN
+
+
+def test_a_path_token_is_taken_whole_or_not_at_all() -> None:
+    """A token whose start is unsafe (traversal, a dot directory, absolute, a backslash) is
+    dropped whole: its tail is never read as another repository path."""
+    plan = plan_with(
+        findings=[
+            "../outside.py must be updated",
+            ".github/workflows/ci.yml must be updated",
+            "/workspace/tests/test_x.py must be updated",
+            "a\\b.py must be updated",
+            "~/home.py must be updated",
+            "./app/models.py must be updated",  # an explicit ./ prefix names app/models.py
+        ],
+        tests=["Add /workspace/tests/test_y.py", "Add ../tests/test_z.py"],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "outside.py", "github/workflows/ci.yml", "workspace/tests/test_x.py",
+         "b.py", "home.py", "app/models.py"}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("app/models.py", "modify"),
+    ]
+
+
+def test_only_whole_change_verbs_without_a_negation_add_a_file() -> None:
+    plan = plan_with(
+        findings=[
+            "tests/conftest.py provides the fixture used by app/a.py",  # fixture is not fix
+            "app/b.py reads the address from settings",  # address is not add
+            "Avoid touching app/d.py while updating the routes",
+            "Keep app/e.py and update the callers",
+            "Preserve app/f.py when refactoring",
+            "Leave app/g.py alone and edit the view",
+            "app/h.py must remain as it is after the change",
+            "app/i.py stays as-is; adjust the template",
+            "app/j.py is read-only; fix the caller",
+            "app/k.py should not be modified",
+            "Don't rewrite app/l.py",
+            "Modifying app/p.py is required",
+            "app/q.py needs to be rewritten",
+        ],
+        tests=[
+            "Do not modify tests/test_old.py",
+            "Never change tests/test_keep.py",
+            "Update app/m.py to expose the hook",  # an existing non-test file: never from tests
+            "Update tests/helpers.py with a builder",  # not a test module
+            "Update tests/conftest.py with a fixture",
+            "tests/test_n.py documents it",  # no change wording
+            "Add tests/test_new.py",
+            "Do not add tests/test_never.py",
+        ],
+    )
+    existing = frozenset(
+        {"app/greeting.py", *(f"app/{c}.py" for c in "abdefghijklmpq"), "tests/conftest.py",
+         "tests/test_c.py", "tests/test_old.py", "tests/test_keep.py", "tests/helpers.py",
+         "tests/test_n.py"}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("app/p.py", "modify"),
+        ("app/q.py", "modify"),
+        ("tests/conftest.py", "modify"),
+        ("tests/test_new.py", "create"),
+    ]
+
+
+def test_third_person_change_verbs_add_the_file_too() -> None:
+    verbs = ["Updates", "Modifies", "Changes", "Edits", "Extends", "Adjusts", "Fixes", "Adds a case to",
+             "Refactors", "Rewrites", "Replaces", "Renames", "Amends", "Covers", "Creates"]  # fmt: skip
+    plan = plan_with(
+        todo=[f"{v} src/m{i}.py" for i, v in enumerate(verbs)]
+        + ["Provides the fixture in src/f.py", "Reads the address from src/r.py"],
+        tests=["Adds tests/test_added.py for the endpoint", "Updates tests/test_old.py"],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "src/f.py", "src/r.py", "tests/test_old.py",
+         *(f"src/m{i}.py" for i in range(len(verbs)))}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        *((f"src/m{i}.py", "modify") for i in range(len(verbs))),
+        ("tests/test_added.py", "create"),
+        ("tests/test_old.py", "modify"),
+    ]
+
+
+async def test_a_test_file_named_only_in_the_findings_may_be_changed(tmp_path: Path) -> None:
+    """Live campaign: the findings said a test file must be updated, the changes omitted it, the
+    agent edited it and validation failed the result as outside the approved plan."""
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    workflow.FakeAgent.plan_result = plan_with(findings=["README.md must be updated too"])
+    rig.agent.edits = [{"app/greeting.py": workflow.GOOD, "README.md": b"# Shop\nGoodbye\n"}]
+    try:
+        assert await run(rig) is S.COMPLETED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.plan_ref and att.plan_sha256
+    plan = await load_verified(
+        rig.artifacts,
+        CodeChangeSteps._scope(att),
+        att.plan_ref,
+        att.plan_sha256,
+        ImplementationPlan,
+    )
+    assert [c.path for c in plan.changes] == ["app/greeting.py", "README.md"]  # approved by hash
+
+
+async def test_the_jira_comment_says_which_files_were_outside_the_plan(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    rig.agent.edits = [{"app/greeting.py": workflow.GOOD, "app/extra.py": b"y = 2\n"}]
+    assert await run(rig) is S.FAILED
+    ((_, text),) = rig.reporter.reports
+    assert "Reason: validation_failed" in text
+    assert "plan_scope: outside the approved plan: app/extra.py" in text
+    assert "y = 2" not in text  # never file content or command output

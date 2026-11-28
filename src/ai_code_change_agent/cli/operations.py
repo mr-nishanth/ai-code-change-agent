@@ -11,12 +11,14 @@ import getpass
 import json
 import re
 import signal
+import sys
 import uuid
 from typing import TextIO
 
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
+from ai_code_change_agent.core.logging import configure_logging
 from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
 from ai_code_change_agent.orchestration.intake import RESUME
 
@@ -50,7 +52,10 @@ def _actor() -> str:
 
 
 async def _worker(once: bool) -> None:
-    async with worker_app(get_settings()) as app:
+    settings = get_settings()
+    # the API configures this in main.py; the worker is its own process and must do it too
+    configure_logging(settings.log_level, json_output=settings.log_json)  # redacts secret keys
+    async with worker_app(settings) as app:
         try:
             if once:
                 await app.worker.run_once()
@@ -123,8 +128,19 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
     )
 
 
+def _line_buffered_output() -> None:
+    """The worker is long-running and often redirected to a file: write every line as it is
+    printed instead of holding it in a block buffer (as PYTHONUNBUFFERED=1 would)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(Exception):  # a replaced stream that cannot be reconfigured
+                reconfigure(line_buffering=True)
+
+
 def run(args: argparse.Namespace, out: TextIO) -> int:
     if args.area == "worker":
+        _line_buffered_output()
         asyncio.run(_worker(args.once))
     elif args.area == "costs":
         asyncio.run(_costs(args, out))

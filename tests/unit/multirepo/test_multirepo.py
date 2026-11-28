@@ -604,12 +604,13 @@ def artifact_service(root: Path) -> ArtifactService:
 
 
 def make_real(
-    artifacts: ArtifactService,
+    artifacts: ArtifactService, max_repositories: int = 5
 ) -> tuple[Coordinator, MemStore, Queue, Reporter, AttemptChanges]:
     store, queue, reporter, changes = MemStore(), Queue(), Reporter(), AttemptChanges()
     coordinator = Coordinator(
         store=store, changes=changes, queue=queue, artifacts=artifacts,  # type: ignore[arg-type]
-        resolver=Resolver(), reporter=reporter, max_repositories=5, max_job_attempts=3,
+        resolver=Resolver(), reporter=reporter, max_repositories=max_repositories,
+        max_job_attempts=3,
     )  # fmt: skip
     return coordinator, store, queue, reporter, changes
 
@@ -832,6 +833,124 @@ async def test_only_contract_integrity_failures_withhold_the_retry_invitation(
         "before "
         f"retry-child {backend.id})" in text
     ) is not retryable
+
+
+async def fail_with_artifact(
+    coordinator: Coordinator,
+    store: MemStore,
+    changes: AttemptChanges,
+    artifacts: ArtifactService,
+    key: str,
+    code: str,
+    kind: ArtifactKind,
+    doc: dict[str, Any],
+) -> Child:
+    """A child whose attempt failed with `code` and left `doc` as its latest `kind` artifact."""
+    attempt = await begin(store, changes, key)
+    scope = ArtifactScope(attempt.request_id, attempt.id)
+    await artifacts.put(scope, kind, json.dumps(doc).encode())
+    attempt = replace(attempt, status=AttemptStatus.FAILED, failure_code=code)
+    changes.attempts[attempt.id] = attempt
+    await coordinator.child_finished(by_key(store, key).id, attempt)
+    return by_key(store, key)
+
+
+def entry(report: str, key: str) -> str:
+    return report.split(f". {key}", 1)[1].split("\n\n", 1)[0].split("\n2. ", 1)[0]
+
+
+async def test_a_child_story_that_needs_clarification_asks_for_the_story_to_be_edited(
+    tmp_path: Path,
+) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, _, reporter, changes = make_real(artifacts)
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(FAN))
+    plan = {
+        "summary": "The Story does not say which order states are shown",
+        "needs_clarification": True,
+        "clarification_questions": [
+            "Which order states must the API expose?",
+            'Is the password: "hunter2-secret-value" still valid?',
+            *(f"Q{i} " + "x" * 900 for i in range(8)),  # the schema allows ten
+        ],
+    }
+    child = await fail_with_artifact(
+        coordinator, store, changes, artifacts, "backend-api",
+        "story_needs_clarification", ArtifactKind.IMPLEMENTATION_PLAN, plan,
+    )  # fmt: skip
+    await finish(store, coordinator, "worker", ChildStatus.FAILED)
+    report = reporter.texts[-1][1]
+    text = entry(report, "backend-api")
+    assert "Reason: story_needs_clarification" in text and "Retryable: yes" not in text
+    assert (
+        "Retryable: after the Story is clarified (edit the Story to answer the questions below, "
+        f"then ai-code-change changes retry-child {child.id})" in text
+    )
+    assert "Summary: The Story does not say which order states are shown" in text
+    assert "- Which order states must the API expose?" in text
+    assert "- [withheld: possible secret]" in text and "hunter2" not in report
+    assert "x" * 301 not in text and len(text) < 3000  # bounded
+
+
+async def test_a_child_that_failed_validation_reports_the_bounded_validation_detail(
+    tmp_path: Path,
+) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, _, reporter, changes = make_real(artifacts)
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(FAN))
+    report_doc = {
+        "decision": "FAILED", "base_commit_sha": "a" * 40, "validation_policy": "v1",
+        "changeset_sha256": "b" * 64, "changed_files": [],
+        "checks": [
+            {"kind": "plan_scope", "status": "FAILED",
+             "detail": "outside the approved plan: app/extra.py"},
+            {"kind": "secrets", "status": "PASSED"},
+        ],
+        "commands": [
+            {"command_id": "test", "kind": "test", "status": "FAILED", "exit_code": 1,
+             "duration_ms": 5, "output_tail": "COMMAND OUTPUT NEVER POSTED"},
+        ],
+    }  # fmt: skip
+    await fail_with_artifact(
+        coordinator, store, changes, artifacts, "backend-api",
+        "validation_failed", ArtifactKind.VALIDATION_REPORT, report_doc,
+    )  # fmt: skip
+    await finish(store, coordinator, "worker", ChildStatus.FAILED)
+    report = reporter.texts[-1][1]
+    text = entry(report, "backend-api")
+    assert "Reason: validation_failed" in text and "Retryable: yes" in text
+    assert "Validation detail:" in text
+    assert "- plan_scope: outside the approved plan: app/extra.py" in text
+    assert "- command test: FAILED" in text
+    assert "COMMAND OUTPUT" not in report and "secrets:" not in text
+
+
+async def test_the_aggregated_comment_caps_the_detail_of_many_failed_children(
+    tmp_path: Path,
+) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, _, reporter, changes = make_real(artifacts, max_repositories=20)
+    story = "".join(f"Repository: acme/repo-{i}\n" for i in range(20))
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(story))
+    check = {"kind": "plan_scope", "status": "FAILED", "detail": "outside the plan: " + "p" * 480}
+    report_doc = {
+        "decision": "FAILED", "base_commit_sha": "a" * 40, "validation_policy": "v1",
+        "changeset_sha256": "b" * 64, "changed_files": [], "checks": [check] * 8, "commands": [],
+    }  # fmt: skip
+    for i in range(20):
+        await fail_with_artifact(
+            coordinator, store, changes, artifacts, f"repo-{i}",
+            "validation_failed", ArtifactKind.VALIDATION_REPORT, report_doc,
+        )  # fmt: skip
+    (report,) = [t for _, t in reporter.texts]
+    assert len(report) < 8000  # Jira's MAX_COMMENT, with room to spare
+    assert "   [... more detail omitted]" in report
+    for i in range(20):  # every child keeps its status, reason and retry line
+        assert "Reason: validation_failed" in entry(report, f"repo-{i}")
+    assert "Report ID:" in report or "Cross-Repository Result:" in report
+    for line in report.splitlines():  # whole lines only
+        if line.startswith("   - plan_scope:"):
+            assert line.endswith("p")
 
 
 async def test_a_contract_with_matching_provenance_is_accepted(tmp_path: Path) -> None:

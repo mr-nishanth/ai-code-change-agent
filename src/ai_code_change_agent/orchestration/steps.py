@@ -7,6 +7,7 @@ Workspaces never outlive a step: a sandbox is started for one phase and destroye
 
 import asyncio
 import hashlib
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -34,6 +35,11 @@ from ai_code_change_agent.application.git_providers.delivery import (
     DeliveryPublishers,
     DeliveryRequest,
     DeliveryTarget,
+)
+from ai_code_change_agent.application.jira.comment_lines import (
+    clarification_detail,
+    safe_line,
+    validation_detail,
 )
 from ai_code_change_agent.application.jira.ports import JiraIssueReader
 from ai_code_change_agent.application.jira.story import story_of
@@ -238,6 +244,7 @@ _STAGES = (
     ("delivery", "delivery"),
     ("publish", "delivery"),
     ("repository", "repository authorisation"),
+    ("story", "planning"),
 )
 
 
@@ -285,6 +292,83 @@ def dependency_preparation(profile: RepositoryProfile, toolchains: frozenset[str
     if any(c.network != "none" or c.kind is CommandKind.INSTALL for c in profile.commands):
         return "dependency_preparation_requires_network"
     return None
+
+
+# A token starts at a boundary (never inside ../x, .github/x, /abs/x, a\x or ~/x, so an unsafe
+# path is dropped whole, not read from its tail); only an explicit leading ./ is stripped.
+_PATH_TOKEN = re.compile(
+    r"(?<![\w./~\\-])(?:\./)?([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10})"
+)
+# Whole verb forms that ask for a change, third person included ("Updates src/a.py"); word
+# boundaries keep fixture and address out.
+_CHANGE_WORDS = re.compile(
+    r"\b(?:updat(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|chang(?:e|es|ed|ing)|edit(?:s|ed|ing)?"
+    r"|extend(?:s|ed|ing)?|adjust(?:s|ed|ing)?|fix(?:es|ed|ing)?|add(?:s|ed|ing)?"
+    r"|refactor(?:s|ed|ing)?|rewr(?:ite|ites|itten|iting|ote)|replac(?:e|es|ed|ing)"
+    r"|renam(?:e|es|ed|ing)|amend(?:s|ed|ing)?|cover(?:s|ed|ing)?|creat(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
+# Any of these makes the item ambiguous, so it adds nothing (a missed file only fails validation).
+_NEGATION = re.compile(
+    r"\b(?:no|not|never|without|unchanged|untouched|avoid(?:s|ed|ing)?|keep(?:s|ing)?|kept"
+    r"|preserv(?:e|es|ed|ing)|leav(?:e|es|ing)|remain(?:s|ed|ing)?|stay(?:s|ed|ing)?|as[- ]is"
+    r"|read[- ]only|do not|must not|should not)\b|n't\b",
+    re.IGNORECASE,
+)
+_NEW_TEST_FILE = re.compile(r"(?:[\w.-]+/)*(?:test_[\w.-]*|[\w.-]*_test)\.py")
+_TEST_MODULE = re.compile(r"(?:[\w.-]+/)*(?:test_[\w.-]*|[\w.-]*_test|conftest)\.py")
+
+
+def complete_plan_scope(plan: ImplementationPlan, existing: frozenset[str]) -> ImplementationPlan:
+    """Deterministic plan consistency at plan acceptance: a file the plan itself says must change
+    but leaves out of `changes` is added to them, so the approved scope matches the plan's own
+    words (independent validation enforces `changes` and exact `tests` entries only). Sources:
+    paths in `findings`, `todo` and `tests` items that say the file changes (a whole change verb
+    and no negation). Only safe, unprotected paths; an existing file is modified (from `tests`
+    only a test module or conftest.py), a new file only when `tests` names a test module; never a
+    deletion. The policy gate and validation
+    then treat the added entries like any other."""
+    planned = {c.path for c in plan.changes} | set(plan.tests)
+    added: list[dict[str, str]] = []
+
+    def add(path: str, operation: str, field: str) -> None:
+        if path not in planned and len(plan.changes) + len(added) < 100:
+            planned.add(path)
+            purpose = f"added by the platform: the plan's {field} names this file as changing"
+            added.append({"path": path, "operation": operation, "purpose": purpose})
+
+    def paths(text: str) -> list[str]:
+        found = []
+        for token in _PATH_TOKEN.findall(text):
+            try:
+                path = validate_relative_path(token.rstrip("."))
+            except Exception:  # noqa: S112 - not a repository path
+                continue
+            if not is_protected(path):
+                found.append(path)
+        return found
+
+    def asks_change(item: str) -> bool:
+        return bool(_CHANGE_WORDS.search(item)) and not _NEGATION.search(item)
+
+    for field in ("findings", "todo"):
+        for item in getattr(plan, field):
+            if asks_change(item):
+                for path in paths(item):
+                    if path in existing:
+                        add(path, "modify", field)
+    for item in filter(asks_change, plan.tests):
+        for path in paths(item):
+            if path in existing:
+                if _TEST_MODULE.fullmatch(path):
+                    add(path, "modify", "tests")
+            elif _NEW_TEST_FILE.fullmatch(path):
+                add(path, "create", "tests")
+    if not added:
+        return plan
+    data = plan.model_dump()
+    data["changes"] = [*data["changes"], *added]
+    return ImplementationPlan.model_validate(data)
 
 
 def _code(exc: BaseException) -> str:
@@ -463,6 +547,9 @@ class CodeChangeSteps:
                     ),
                     checkpointer=self._d.agent_checkpointer,
                 )
+                if not plan.needs_clarification:
+                    baseline = await self._d.runtime.manifest(handle, "baseline")
+                    plan = complete_plan_scope(plan, baseline.paths)
             await store_model(
                 self._d.artifacts,
                 self._scope(a),
@@ -472,6 +559,8 @@ class CodeChangeSteps:
             stored = await store_model(
                 self._d.artifacts, self._scope(a), ArtifactKind.IMPLEMENTATION_PLAN, plan
             )
+            if plan.needs_clarification:  # never approved or implemented, in either mode
+                return await self._fail(attempt_id, "story_needs_clarification")
             await self._d.changes.record_plan(attempt_id, stored.ref, stored.sha256)
             a = await self._d.changes.transition(attempt_id, S.AWAITING_PLAN_APPROVAL)
             return StepResult(a.status.value)
@@ -906,7 +995,7 @@ class CodeChangeSteps:
             f"Repository: {await self._repository_name(a)}\n"
             f"Branch: {manifest.branch}\n"
             f"Draft PR: {result.pr_url}\n"
-            f"Summary: {plan.summary[:600]}\n"
+            f"Summary: {safe_line(plan.summary, 600)}\n"
             f"Tests and checks run by independent validation: {commands}\n"
             f"Validation outcome: PASSED. Attempt {a.number} ({a.id}).\n"
             "Review and merge are human decisions."
@@ -939,20 +1028,37 @@ class CodeChangeSteps:
             for m in await self._d.artifacts.list(self._scope(a))
             if m.kind is ArtifactKind.AUTOMATIC_DECISION
         ]
-        if a.status is S.REJECTED and decisions:
+        stage = {
+            S.BLOCKED: "preparation",
+            S.REJECTED: "automatic policy gate",
+        }.get(a.status) or next((s for p, s in _STAGES if reason.startswith(p)), "workflow")
+        rejection = None
+        if a.status is S.REJECTED:
+            rejected = [
+                p
+                for p in await self._d.changes.approvals(a.id)
+                if p.decision is ApprovalDecision.REJECTED
+            ]
+            rejection = max(rejected, key=lambda p: p.decided_at, default=None)
+        operator = rejection is not None and rejection.actor != AUTOMATIC_ACTOR
+        if operator and rejection is not None:
+            # An operator's decision (changes reject): name the gate; the CLI records no reason.
+            subject = "plan" if rejection.gate is ApprovalGate.PLAN else "final change"
+            stage = f"{rejection.gate.value.lower()} approval gate"
+            reason = f"{subject} rejected by an operator (no rejection reason is recorded)"
+        elif a.status is S.REJECTED and decisions:
             latest = max(decisions, key=lambda m: (m.created_at, m.id))
             doc = await load_verified(
                 self._d.artifacts, self._scope(a), latest.id, latest.sha256, AutomaticDecisionDoc
             )
             reason = f"{doc.gate} policy rejected: " + "; ".join(doc.reasons)[:600]
-        stage = {
-            S.BLOCKED: "preparation",
-            S.REJECTED: "automatic policy gate",
-        }.get(a.status) or next((s for p, s in _STAGES if reason.startswith(p)), "workflow")
+            stage = f"automatic {doc.gate.lower()} policy gate"
         retryable = any(word in reason for word in _RETRYABLE)
         advice = (
             "yes, after the temporary cause is resolved"
             if retryable
+            else "no, an operator rejected this attempt"
+            if operator
             else "no, the cause must be fixed first"
         )
         request = await self._d.changes.get_request(a.request_id)
@@ -961,9 +1067,36 @@ class CodeChangeSteps:
             f"Repository: {await self._repository_name(a)}\n"
             f"Outcome: {a.status.value} at the {stage} stage (attempt {a.number}, {a.id}).\n"
             f"Reason: {reason}\n"
+            f"{await self._failure_detail(a)}"
             f"Retryable: {advice}.\n"
             "No pull request was created by this attempt."
         )
+
+    async def _failure_detail(self, a: CodeChangeAttempt) -> str:
+        """Bounded detail lines for the Jira comment: why independent validation failed (failed
+        checks with their fixed detail, commands that did not pass; never file content or command
+        output), or the planner's questions for a Story that needs clarification. Empty for every
+        other outcome."""
+        if (a.failure_code or "").startswith("validation"):
+            return await self._validation_detail(a)
+        if a.failure_code != "story_needs_clarification":
+            return ""
+        latest = await self._latest_optional(a, ArtifactKind.IMPLEMENTATION_PLAN)
+        if latest is None:
+            return ""
+        plan = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], ImplementationPlan
+        )
+        return clarification_detail(plan)
+
+    async def _validation_detail(self, a: CodeChangeAttempt) -> str:
+        latest = await self._latest_optional(a, ArtifactKind.VALIDATION_REPORT)
+        if latest is None:
+            return ""
+        report = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], ValidationReport
+        )
+        return validation_detail(report)
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
         """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either

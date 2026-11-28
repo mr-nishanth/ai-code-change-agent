@@ -15,11 +15,16 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ai_code_change_agent.agents.coding.schemas import ImplementationPlan
 from ai_code_change_agent.application.artifacts.hashing import load_verified, store_model
 from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.delivery.manifest import DeliveryManifest
 from ai_code_change_agent.application.errors import ArtifactIntegrityError
+from ai_code_change_agent.application.jira.comment_lines import (
+    clarification_detail,
+    validation_detail,
+)
 from ai_code_change_agent.application.jobs.queue import JobQueue
 from ai_code_change_agent.application.multirepo.models import (
     Child,
@@ -39,6 +44,7 @@ from ai_code_change_agent.domain.changes.multirepo import (
 )
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.domain.repositories.resolution import ResolutionRequest
+from ai_code_change_agent.validation.schemas import ValidationReport
 
 _log = get_logger(__name__)
 CHILD_JOB = "code_change.child"
@@ -70,6 +76,12 @@ _INTEGRITY_FAILURES = frozenset(
         "artifact_integrity_failed",
     }
 )
+_CHILD_DETAIL_CHARS = 2000  # one aggregated comment holds every child's detail
+# All children's detail together: Jira comments are cut at 8000 characters (MAX_COMMENT), and
+# the status, reason and retry lines of every child (at most ~350 characters each, up to 20
+# children) and the footer must always fit, so the detail gets what they leave.
+_COMMENT_CHARS = 7500
+_CHILD_LINES_CHARS = 350
 _RESULT_TEXT = {
     ParentStatus.COMPLETED: "all repository executions and required contracts completed.",
     ParentStatus.PARTIALLY_COMPLETED: "partially completed; successful PRs are kept.",
@@ -360,6 +372,7 @@ class Coordinator:
             "",
             "Repositories:",
         ]
+        budget: int | None = max(0, _COMMENT_CHARS - _CHILD_LINES_CHARS * len(children))
         for i, c in enumerate(sorted(children, key=lambda c: c.position), start=1):
             lines.append(f"{i}. {c.repository_key}" + (f" ({c.role})" if c.role else ""))
             lines.append(f"   Status: {c.status.value}")
@@ -378,7 +391,21 @@ class Coordinator:
                         "no (artifact integrity failure: an operator must investigate the "
                         f"artifact store before retry-child {c.id})"
                     )
+                if c.failure_code == "story_needs_clarification":
+                    retry = (
+                        "after the Story is clarified (edit the Story to answer the questions "
+                        f"below, then ai-code-change changes retry-child {c.id})"
+                    )
                 lines += [f"   Reason: {c.failure_code or '-'}", f"   Retryable: {retry}"]
+                for ln in await self._child_detail(c):  # whole lines, within the total budget
+                    if budget is not None and len(ln) + 4 <= budget:
+                        lines.append(f"   {ln}")
+                        budget -= len(ln) + 4
+                    else:
+                        if budget is not None:
+                            lines.append("   [... more detail omitted]")
+                        budget = None  # every later child's detail is omitted too
+                        break
             if c.contract_sha256:
                 lines.append(f"   Published contract: sha256 {c.contract_sha256[:12]}")
             if c.runs > 1:
@@ -396,6 +423,47 @@ class Coordinator:
         if marker is not None:
             lines.append(f"Report ID: {marker}")
         return "\n".join(lines)
+
+    async def _child_detail(self, c: Child) -> list[str]:
+        """Bounded, scanned detail lines of a failed child, from its attempt's latest artifact:
+        the planner's summary and questions for a Story that needs clarification, or why
+        validation failed. Best effort: a missing or unreadable artifact only omits the detail."""
+        code = c.failure_code or ""
+        clarify = code == "story_needs_clarification"
+        if (
+            c.attempt_id is None
+            or self._artifacts is None
+            or not (clarify or code.startswith("validation"))
+        ):
+            return []
+        kind = ArtifactKind.IMPLEMENTATION_PLAN if clarify else ArtifactKind.VALIDATION_REPORT
+        try:
+            scope = ArtifactScope(
+                (await self._changes.get_attempt(c.attempt_id)).request_id, c.attempt_id
+            )
+            metas = [m for m in await self._artifacts.list(scope) if m.kind is kind]
+            if not metas:
+                return []
+            latest = max(metas, key=lambda m: (m.created_at, m.id))
+            if clarify:
+                plan = await load_verified(
+                    self._artifacts, scope, latest.id, latest.sha256, ImplementationPlan
+                )
+                text = clarification_detail(plan)
+            else:
+                report = await load_verified(
+                    self._artifacts, scope, latest.id, latest.sha256, ValidationReport
+                )
+                text = validation_detail(report)
+        except Exception as exc:  # the report is still posted, without this child's detail
+            _log.warning("child_detail_unavailable", child_id=str(c.id), code=type(exc).__name__)
+            return []
+        out: list[str] = []
+        for line in text.splitlines():  # whole lines, at most _CHILD_DETAIL_CHARS per child
+            if sum(map(len, out)) + len(line) > _CHILD_DETAIL_CHARS:
+                break
+            out.append(line)
+        return out
 
     # ---- child lifecycle --------------------------------------------------------------------
     async def child_finished(self, child_id: uuid.UUID, attempt: CodeChangeAttempt) -> None:

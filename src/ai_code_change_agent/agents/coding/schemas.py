@@ -5,7 +5,7 @@ import json
 import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from ai_code_change_agent.application.workspaces.errors import UnsafePathError
 from ai_code_change_agent.application.workspaces.paths import validate_relative_path
@@ -63,7 +63,9 @@ def _requirements(value: object) -> object:
 
 class ImplementationPlan(BaseModel):
     """Output of the planning phase (read-only tools). Approved by its hash, by the automatic policy
-    gate or, in manual mode, by an operator."""
+    gate or, in manual mode, by an operator. A Story too vague to plan is answered with
+    `needs_clarification` and its questions instead of changes: the workflow then stops the attempt
+    (`story_needs_clarification`) before any approval or implementation."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -71,7 +73,7 @@ class ImplementationPlan(BaseModel):
     acceptance_criteria: StrList = Field(default_factory=list, max_length=50)
     findings: StrList = Field(default_factory=list, max_length=50)
     changes: Annotated[list[PlannedChange], BeforeValidator(_as_list)] = Field(
-        min_length=1, max_length=100
+        default_factory=list, max_length=100
     )
     tests: StrList = Field(default_factory=list, max_length=50)
     risks: StrList = Field(default_factory=list, max_length=50)
@@ -82,6 +84,18 @@ class ImplementationPlan(BaseModel):
     dependencies: Annotated[list[str], BeforeValidator(_requirements)] = Field(
         default_factory=list, max_length=30
     )
+    needs_clarification: bool = False
+    clarification_questions: StrList = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def _changes_or_questions(self) -> "ImplementationPlan":
+        if self.needs_clarification and not self.clarification_questions:
+            msg = "clarification_questions must list what the Story must answer"
+            raise ValueError(msg)
+        if not self.needs_clarification and not self.changes:
+            msg = "changes must list at least one file"
+            raise ValueError(msg)
+        return self
 
 
 class ImplementationReport(BaseModel):
