@@ -108,3 +108,19 @@ async def test_studio_reads_listings_and_agent_threads() -> None:
     assert await svc.agent_threads(att.id) == [thread]
     with pytest.raises(ValueError, match="does not belong"):
         await svc.record_agent_thread(att.id, "attempt:other:planning:00000000")
+
+
+async def test_a_refused_intake_blocks_only_a_request_that_never_started() -> None:
+    m = MemoryChanges()
+    svc = m.service()
+    req = m.add_request()
+    assert await svc.refuse_request(req.id) is True
+    assert await svc.refuse_request(req.id) is False  # a redelivered job: no change
+    assert (await svc.get_request(req.id)).status == "BLOCKED"
+    started = m.add_request(repository_id=uuid.uuid4(), profile_version_id=uuid.uuid4())
+    att = await svc.start_attempt(started.id)
+    assert await svc.refuse_request(started.id) is False  # the attempt owns the projection
+    kept = await svc.get_request(started.id)
+    assert kept.status == "PENDING" and kept.current_attempt_id == att.id
+    with pytest.raises(ChangeNotFoundError):
+        await svc.refuse_request(uuid.uuid4())

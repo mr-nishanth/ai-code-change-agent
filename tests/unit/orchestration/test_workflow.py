@@ -96,8 +96,33 @@ async def test_a_rejected_plan_ends_the_workflow(tmp_path: Any) -> None:
     assert [s.writable for s in rig.sandboxes.started] == [False]  # never implemented
     ((_, text),) = rig.reporter.reports
     assert "REJECTED at the plan approval gate" in text
-    assert "Reason: plan rejected by an operator" in text
+    assert "Reason: plan rejected by an operator (no rejection reason is recorded)\n" in text
     assert "automatic policy" not in text and "Reason: rejected\n" not in text
+    assert "Retryable: no, an operator rejected" in text
+
+
+@pytest.mark.parametrize(
+    ("reason", "shown"),
+    [("wrong module, use billing/", "wrong module, use billing/"),
+     ('the password: "hunter2-secret-value" was pasted', "[withheld: possible secret]")],
+    ids=["plain", "secret"],
+)  # fmt: skip
+async def test_an_operator_rejection_reason_is_shown_in_jira(
+    tmp_path: Any, reason: str, shown: str
+) -> None:
+    rig = await make_rig(tmp_path)
+    await rig.runner.start(rig.attempt_id)
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.plan_sha256 is not None
+    await rig.deps.changes.decide(
+        att.id, ApprovalGate.PLAN, att.plan_sha256, ApprovalDecision.REJECTED, "cli:op",
+        reason=reason,
+    )  # fmt: skip
+    await rig.runner.resume(rig.attempt_id)
+    ((_, text),) = rig.reporter.reports
+    assert "Reason: plan rejected by an operator\n" in text
+    assert f"Reason given by the operator: {shown}\n" in text
+    assert "hunter2" not in text and "no rejection reason is recorded" not in text
     assert "Retryable: no, an operator rejected" in text
 
 

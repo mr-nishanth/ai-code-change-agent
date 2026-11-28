@@ -42,7 +42,7 @@ from tests.support.github_repos import reader_rig
 from tests.support.jira_rest import make_client
 from tests.support.registry_fixtures import new_repo
 from tests.support.registry_memory import InMemoryRegistry
-from tests.support.workflow import FakeJira
+from tests.support.workflow import FakeJira, UnregisteredRepositoryJira
 
 
 async def registry() -> InMemoryRegistry:
@@ -105,6 +105,7 @@ async def test_intake_refuses_bad_payloads_unknown_repos_and_moved_issues() -> N
     other = changes.add_request(project="OPS", key="OPS-1")
     with pytest.raises(JobFailedError, match="jira_project_changed"):
         await handler(FakeJira())(job({"code_change_request_id": str(other.id)}))
+    assert (await changes.service().get_request(other.id)).status == "BLOCKED"
 
     class Missing(FakeJira):
         async def get_issue(self, issue_ref: str) -> Any:
@@ -113,6 +114,7 @@ async def test_intake_refuses_bad_payloads_unknown_repos_and_moved_issues() -> N
     req = changes.add_request()
     with pytest.raises(JobFailedError, match="jira_issue_not_found"):
         await handler(Missing())(job({"code_change_request_id": str(req.id)}))
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
     empty = IntakeHandler(
         changes=changes.service(),
         jira=FakeJira(),
@@ -316,16 +318,80 @@ async def test_an_unresolvable_repository_is_reported_to_jira_once() -> None:
     reporter = Reporter()
     handler = IntakeHandler(
         changes=changes.service(),
-        jira=FakeJira(),
+        jira=UnregisteredRepositoryJira(),
         resolver=RepositoryResolver(InMemoryRegistry().uow),
         start=start,
         repository_field_configured=False,
         reporter=reporter,
     )
-    with pytest.raises(JobFailedError, match="repository_"):
+    with pytest.raises(JobFailedError, match="repository_unknown_repository"):
         await handler(job({"code_change_request_id": str(req.id)}))
     ((key, text),) = reporter.reports
     assert key == req.jira_issue_key and "could not start" in text and "Retryable: no" in text
+    # the request is terminal, not RECEIVED forever; a redelivered job changes nothing more
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+    with pytest.raises(JobFailedError, match="repository_unknown_repository"):
+        await handler(job({"code_change_request_id": str(req.id)}))  # lease expired after report
+    blocked = await changes.service().get_request(req.id)
+    assert blocked.status == "BLOCKED" and blocked.current_attempt_id is None
+    assert len(reporter.reports) == 1  # already BLOCKED before the re-run: no second comment
+
+
+async def test_a_dead_intake_job_blocks_its_request_whatever_killed_it() -> None:
+    """A transient Jira error or an unexpected exception that used up the job's attempts ends it
+    DEAD outside the handler's own refusals: the worker's on_dead hook blocks the request."""
+    changes = MemoryChanges()
+    req = changes.add_request()
+    handler = IntakeHandler(
+        changes=changes.service(),
+        jira=FakeJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=_never_started(),
+        repository_field_configured=False,
+    )
+    await handler.on_dead(job({"code_change_request_id": str(req.id)}))
+    await handler.on_dead(job({"code_change_request_id": str(req.id)}))  # idempotent
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+    await handler.on_dead(job({}))  # a bad payload has no request to block
+
+
+async def test_a_refusal_that_cannot_be_recorded_is_retried_before_jira_hears_of_it() -> None:
+    """Blocking the request comes first: a storage failure there leaves the job retryable and
+    no comment posted, so the redelivered job reports once."""
+    changes = MemoryChanges()
+    req = changes.add_request()
+    reports: list[str] = []
+
+    class Reporter:
+        async def report(self, key: str, text: str) -> str:
+            reports.append(text)
+            return "POSTED"
+
+    service = changes.service()
+    real = service.refuse_request
+    calls = [0]
+
+    async def flaky(request_id: uuid.UUID) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise RuntimeError("storage down")
+        return await real(request_id)
+
+    service.refuse_request = flaky  # type: ignore[method-assign]
+    handler = IntakeHandler(
+        changes=service,
+        jira=UnregisteredRepositoryJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=_never_started(),
+        repository_field_configured=False,
+        reporter=Reporter(),
+    )
+    with pytest.raises(RuntimeError):
+        await handler(job({"code_change_request_id": str(req.id)}))
+    assert reports == [] and (await service.get_request(req.id)).status == "RECEIVED"
+    with pytest.raises(JobFailedError, match="repository_unknown_repository"):
+        await handler(job({"code_change_request_id": str(req.id)}))
+    assert len(reports) == 1 and (await service.get_request(req.id)).status == "BLOCKED"
 
 
 def test_the_worker_settings_default_to_the_automated_pipeline() -> None:

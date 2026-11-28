@@ -27,6 +27,12 @@ from ai_code_change_agent.domain.changes.states import TERMINAL, AttemptStatus, 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 ACTOR = re.compile(r"[a-z]{2,16}:[A-Za-z0-9_.@-]{1,64}")
+AUTOMATIC_ACTOR = "policy:automatic"  # the automatic approval mode's decisions, never an operator
+REASON_MAX = 500
+# One line of printable text: no C0/C1 controls, no zero-width, bidi-override or isolate marks and
+# no line or paragraph separators (they could reorder or hide text in a Jira comment).
+_UNSAFE = r"\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069\ufeff"
+REASON = re.compile(rf"[^{_UNSAFE}]{{1,{REASON_MAX}}}")
 S = AttemptStatus
 
 
@@ -50,12 +56,17 @@ class Approval:
     actor_verified: bool = False
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     decided_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    reason: str | None = None  # an operator's optional reason for a rejection (one line)
 
     def __post_init__(self) -> None:
         if not SHA256.fullmatch(self.artifact_sha256):
             raise ChangeValidationError("approval_hash_invalid")
         if not ACTOR.fullmatch(self.actor):
             raise ChangeValidationError("actor_invalid")
+        if self.reason is not None and (
+            self.decision is not ApprovalDecision.REJECTED or not REASON.fullmatch(self.reason)
+        ):
+            raise ChangeValidationError("reason_invalid")
 
 
 @dataclass(frozen=True)
@@ -179,7 +190,13 @@ class CodeChangeAttempt:
         )
 
     def decide(
-        self, gate: ApprovalGate, artifact_sha256: str, decision: ApprovalDecision, actor: str
+        self,
+        gate: ApprovalGate,
+        artifact_sha256: str,
+        decision: ApprovalDecision,
+        actor: str,
+        *,
+        reason: str | None = None,
     ) -> Approval:
         """An operator decision. Only for the gate the attempt is waiting at and only for the
         artifact it currently holds: a decision about any other hash is refused as stale."""
@@ -190,4 +207,4 @@ class CodeChangeAttempt:
             raise InvalidTransitionError("not_awaiting_this_approval")
         if artifact_sha256 != self._artifact(gate):
             raise StaleApprovalError("artifact_changed")
-        return Approval(self.id, gate, artifact_sha256, decision, actor)
+        return Approval(self.id, gate, artifact_sha256, decision, actor, reason=reason)

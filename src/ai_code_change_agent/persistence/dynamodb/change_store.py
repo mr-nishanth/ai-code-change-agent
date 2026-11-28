@@ -146,6 +146,7 @@ def _approval(item: Item) -> Approval:
         actor_verified=verified,
         id=decode_uuid(item.get("id"), "id"),
         decided_at=decode_timestamp(item.get("decided_at"), "decided_at"),
+        reason=_opt_str(item, "reason"),  # absent on approvals and on older rejections
     )
 
 
@@ -371,22 +372,21 @@ class DynamoChangeStore:
             raise ChangeNotFoundError("attempt_not_found")
         await self._u.get(keys.attempt(request_id, approval.attempt_id))
         key = keys.approval(request_id, approval.attempt_id, approval.decided_at, approval.id)
-        self._u.create(
-            {
-                **key.as_dict(),
-                "entity": "approval",
-                "id": str(approval.id),
-                "attempt_id": str(approval.attempt_id),
-                "request_id": str(request_id),
-                "gate": approval.gate.value,
-                "artifact_sha256": approval.artifact_sha256,
-                "decision": approval.decision.value,
-                "actor": approval.actor,
-                "actor_verified": approval.actor_verified,
-                "decided_at": encode_timestamp(approval.decided_at),
-            },
-            on_exists=ChangeConflictError("approval_exists"),
-        )
+        item: Item = {
+            **key.as_dict(),
+            "entity": "approval",
+            "id": str(approval.id),
+            "attempt_id": str(approval.attempt_id),
+            "request_id": str(request_id),
+            "gate": approval.gate.value,
+            "artifact_sha256": approval.artifact_sha256,
+            "decision": approval.decision.value,
+            "actor": approval.actor,
+            "actor_verified": approval.actor_verified,
+            "decided_at": encode_timestamp(approval.decided_at),
+        }
+        _set_optional(item, "reason", approval.reason)
+        self._u.create(item, on_exists=ChangeConflictError("approval_exists"))
 
     async def list_approvals(self, attempt_id: uuid.UUID) -> list[Approval]:
         """C10: ascending by `decided_at` (the sort key), consistent."""

@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from ai_code_change_agent.application.changes.service import CodeChangeService
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
+from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.domain.changes.errors import (
     ChangeConflictError,
     ConcurrentModificationError,
@@ -26,12 +28,15 @@ from ai_code_change_agent.domain.changes.models import (
     CodeChangeRequest,
 )
 from ai_code_change_agent.domain.changes.states import AttemptStatus as S
+from ai_code_change_agent.orchestration.intake import IntakeHandler
 from ai_code_change_agent.persistence.dynamodb import Table, keys
 from ai_code_change_agent.persistence.dynamodb.change_store import (
     AttemptPointers,
     DynamoChangeUnitOfWork,
     request_item,
 )
+from tests.support.registry_memory import InMemoryRegistry
+from tests.support.workflow import UnregisteredRepositoryJira
 
 pytestmark = [pytest.mark.floci, pytest.mark.integration]
 PLAN = "a" * 64
@@ -155,6 +160,60 @@ async def test_a_terminal_attempt_releases_its_guard_and_the_next_one_is_number_
     assert guard["attempt_id"] == str(second.id)
     assert (await svc.get_attempt(first.id)) == cancelled  # attempts are never deleted
     assert (await svc.get_request(rid)).current_attempt_id == second.id
+
+
+async def test_a_rejection_reason_round_trips_and_an_old_item_without_one_reads_none(
+    app_table: Table,
+) -> None:
+    svc, aid = await attempt_at_plan_approval(app_table)
+    rejection, _ = await svc.decide(
+        aid, ApprovalGate.PLAN, PLAN, ApprovalDecision.REJECTED, "cli:op", reason="wrong module"
+    )
+    (stored,) = await svc.approvals(aid)
+    assert stored == rejection and stored.reason == "wrong module"
+    rid = (await svc.get_attempt(aid)).request_id
+    (item,) = await collection(app_table, rid, keys.SK_APPROVAL)
+    assert item["reason"] == "wrong module"
+    # an approval written before the field existed (and every approval now) has no attribute
+    await app_table.update(
+        keys.approval(rid, aid, rejection.decided_at, rejection.id),
+        update="REMOVE #r",
+        names={"#r": "reason"},
+    )
+    (old,) = await svc.approvals(aid)
+    assert old.reason is None and old.id == rejection.id
+
+    svc2, aid2 = await attempt_at_plan_approval(app_table)
+    await svc2.decide(aid2, ApprovalGate.PLAN, PLAN, ApprovalDecision.APPROVED, "cli:op")
+    rid2 = (await svc2.get_attempt(aid2)).request_id
+    (approved,) = await collection(app_table, rid2, keys.SK_APPROVAL)
+    assert "reason" not in approved  # the approve path writes the same item as before
+
+
+async def test_a_refused_intake_leaves_the_request_item_blocked(app_table: Table) -> None:
+    """Intake of a Story whose repository is not registered: the job is DEAD with
+    `repository_unknown_repository` and the request item is terminal, not RECEIVED forever."""
+    svc = service(app_table)
+    rid = await seed_request(app_table)
+
+    async def never(_: uuid.UUID) -> None:  # pragma: no cover - never reached
+        raise AssertionError
+
+    handler = IntakeHandler(
+        changes=svc,
+        jira=UnregisteredRepositoryJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=never,
+        repository_field_configured=False,
+    )
+    intake = Job(uuid.uuid4(), "code_change.intake", {"code_change_request_id": str(rid)}, 1, 3)
+    for _ in range(2):  # the second run is a redelivery: same outcome, no further write
+        with pytest.raises(JobFailedError, match=r"^repository_unknown_repository$"):
+            await handler(intake)
+        item = await app_table.get(keys.request(rid), consistent=True)
+        assert item is not None
+        assert item["status"] == "BLOCKED" and item["row_version"] == 2
+        assert "current_attempt_id" not in item
 
 
 async def test_update_of_a_terminal_attempt_is_refused(app_table: Table) -> None:

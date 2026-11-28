@@ -26,6 +26,7 @@ from ai_code_change_agent.application.jobs.queue import (
     JobFailedError,
     JobQueue,
     JobRetryableError,
+    JobStatus,
 )
 from ai_code_change_agent.core.logging import get_logger
 
@@ -75,9 +76,13 @@ class Worker:
         relay_seconds: float = 30.0,
         sweep_seconds: float = 300.0,
         owner: str | None = None,
+        on_dead: Mapping[str, Handler] | None = None,
     ) -> None:
         self._queue = queue
         self._handlers = dict(handlers)
+        # per kind, run once when this worker records the job DEAD (a refusal or the last
+        # attempt), for example to end the request a dead intake job leaves behind
+        self._on_dead = dict(on_dead or {})
         self._lease = lease_seconds
         self._beat = heartbeat_seconds
         self._concurrency = concurrency
@@ -147,6 +152,14 @@ class Worker:
         return job
 
     async def process(self, job: Job) -> None:
+        # identifiers only: the payload can hold Story text and is never logged
+        _log.info(
+            "job_claimed",
+            job_id=str(job.id),
+            kind=job.kind,
+            attempt=job.attempts,
+            max_attempts=job.max_attempts,
+        )
         handler = self._handlers.get(job.kind)
         if handler is None:
             await self._queue.fail(job.id, self.owner, "no_handler", retry_in_seconds=None)
@@ -156,6 +169,15 @@ class Worker:
             await self._run(job, handler)
         finally:  # whatever happened, the job is out of this worker's hands
             self._queue.release(job.id, self.owner)
+
+    async def _dead(self, job: Job) -> None:
+        hook = self._on_dead.get(job.kind)
+        if hook is None:
+            return
+        try:
+            await hook(job)
+        except Exception as exc:  # the job is already DEAD; the hook never changes that
+            _log.warning("job_dead_hook_failed", job_id=str(job.id), kind=job.kind, code=_code(exc))
 
     async def _run(self, job: Job, handler: Handler) -> None:
         work = asyncio.create_task(handler(job))
@@ -174,8 +196,10 @@ class Worker:
             if await self._stop_beat(beat):
                 self._lease_lost(job)
                 return
-            await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
+            status = await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason=exc.code)
+            if status is JobStatus.DEAD:  # not when the store refused (another owner has it)
+                await self._dead(job)
             return
         except Exception as exc:  # retryable by default; the code never carries raw messages
             if await self._stop_beat(beat):
@@ -193,6 +217,8 @@ class Worker:
                 status=status.value,
                 attempts=job.attempts,
             )
+            if status is JobStatus.DEAD:
+                await self._dead(job)
             return
         finally:
             await self._stop_beat(beat)

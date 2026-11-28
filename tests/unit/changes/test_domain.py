@@ -132,3 +132,15 @@ def test_failure_and_blocked_need_a_code_and_artifacts_need_their_stage() -> Non
         attempt(status=S.VALIDATING).record_manifest("r", "nothex")
     with pytest.raises(ChangeValidationError):
         Approval(uuid.uuid4(), ApprovalGate.PLAN, "x", ApprovalDecision.APPROVED, OP)
+
+
+def test_a_rejection_may_carry_a_bounded_single_line_reason() -> None:
+    a = attempt(status=S.AWAITING_PLAN_APPROVAL, plan_sha256=A, base_commit_sha="c" * 40)
+    no = a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP, reason="wrong module")
+    assert no.reason == "wrong module"
+    assert a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP).reason is None
+    for bad in ("", "two\nlines", "x" * 501, "c1\x9fx", "rtl\u202ex", "zw\u200dx", "\u2069"):
+        with pytest.raises(ChangeValidationError, match="reason_invalid"):
+            a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP, reason=bad)
+    with pytest.raises(ChangeValidationError, match="reason_invalid"):  # approvals carry none
+        a.decide(ApprovalGate.PLAN, A, ApprovalDecision.APPROVED, OP, reason="fine")

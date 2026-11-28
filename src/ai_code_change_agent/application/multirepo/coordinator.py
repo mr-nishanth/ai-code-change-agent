@@ -23,6 +23,7 @@ from ai_code_change_agent.application.delivery.manifest import DeliveryManifest
 from ai_code_change_agent.application.errors import ArtifactIntegrityError
 from ai_code_change_agent.application.jira.comment_lines import (
     clarification_detail,
+    safe_line,
     validation_detail,
 )
 from ai_code_change_agent.application.jobs.queue import JobQueue
@@ -36,7 +37,11 @@ from ai_code_change_agent.application.multirepo.models import (
     ReportState,
 )
 from ai_code_change_agent.core.logging import get_logger
-from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
+from ai_code_change_agent.domain.changes.models import (
+    AUTOMATIC_ACTOR,
+    ApprovalDecision,
+    CodeChangeAttempt,
+)
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
     RepositoryDeclaration,
@@ -115,6 +120,17 @@ class MultiRepoBlockedError(Exception):
         self.report = report
 
 
+def _blocked_report(issue_key: str, problems: list[str]) -> str:
+    return (
+        f"AI Code Change Agent could not start {issue_key} (multi-repository).\n"
+        "Nothing was cloned, changed or published. Fix the Story or the registry:\n"
+        + "\n".join(f"- {p}" for p in problems)
+        + "\nEach repository must be granted to the Git host app, registered, ACTIVE and "
+        "mapped to this Jira project by an operator; dependencies must name declared "
+        "repositories and form no cycle.\nRetryable: no, the cause must be fixed first."
+    )
+
+
 def _short(ref: str) -> str:
     return ref.rsplit("/", 1)[-1].lower().replace("_", "-").removesuffix(".git")
 
@@ -157,8 +173,14 @@ class Coordinator:
     ) -> Parent:
         existing = await self._store.find_by_request(request_id)
         if existing is not None:  # a replayed intake never creates a second parent
-            await self.advance(existing[0].id)
-            return existing[0]
+            parent = existing[0]
+            if parent.status is ParentStatus.BLOCKED:  # refused again, with the stored problems
+                stored = [str(p) for p in parent.declaration.get("problems", [])]
+                raise MultiRepoBlockedError(
+                    "multi_repository_blocked", _blocked_report(issue_key, stored)
+                )
+            await self.advance(parent.id)
+            return parent
         declaration_doc: dict[str, Any] = {
             "repositories": [
                 {
@@ -210,15 +232,9 @@ class Coordinator:
             parent = Parent(uuid.uuid4(), request_id, ParentStatus.BLOCKED, declaration_doc)
             parent, _ = await self._store.create(parent, [])
             await self._store.set_request_status(request_id, "BLOCKED")
-            text = (
-                f"AI Code Change Agent could not start {issue_key} (multi-repository).\n"
-                "Nothing was cloned, changed or published. Fix the Story or the registry:\n"
-                + "\n".join(f"- {p}" for p in problems)
-                + "\nEach repository must be granted to the Git host app, registered, ACTIVE and "
-                "mapped to this Jira project by an operator; dependencies must name declared "
-                "repositories and form no cycle.\nRetryable: no, the cause must be fixed first."
+            raise MultiRepoBlockedError(
+                "multi_repository_blocked", _blocked_report(issue_key, problems)
             )
-            raise MultiRepoBlockedError("multi_repository_blocked", text)
         position = {key: i for i, key in enumerate(order)}
         parent = Parent(uuid.uuid4(), request_id, ParentStatus.RUNNING, declaration_doc)
         children = [
@@ -427,8 +443,11 @@ class Coordinator:
     async def _child_detail(self, c: Child) -> list[str]:
         """Bounded, scanned detail lines of a failed child, from its attempt's latest artifact:
         the planner's summary and questions for a Story that needs clarification, or why
-        validation failed. Best effort: a missing or unreadable artifact only omits the detail."""
+        validation failed, or the reason an operator gave for rejecting it. Best effort: a missing
+        or unreadable artifact only omits the detail."""
         code = c.failure_code or ""
+        if code == "rejected" and c.attempt_id is not None:
+            return await self._operator_reason(c)
         clarify = code == "story_needs_clarification"
         if (
             c.attempt_id is None
@@ -464,6 +483,20 @@ class Coordinator:
                 break
             out.append(line)
         return out
+
+    async def _operator_reason(self, c: Child) -> list[str]:
+        """The reason of the child's latest rejection (`changes reject --reason`), scanned."""
+        assert c.attempt_id is not None  # noqa: S101 - checked by the caller
+        try:
+            approvals = await self._changes.approvals(c.attempt_id)
+        except Exception as exc:  # the report is still posted, without this child's detail
+            _log.warning("child_detail_unavailable", child_id=str(c.id), code=type(exc).__name__)
+            return []
+        rejected = [a for a in approvals if a.decision is ApprovalDecision.REJECTED]
+        latest = max(rejected, key=lambda a: a.decided_at, default=None)
+        if latest is None or latest.actor == AUTOMATIC_ACTOR or not latest.reason:
+            return []  # as the single-repository comment: only an operator's own reason
+        return [f"Reason given by the operator: {safe_line(latest.reason, 300)}"]
 
     # ---- child lifecycle --------------------------------------------------------------------
     async def child_finished(self, child_id: uuid.UUID, attempt: CodeChangeAttempt) -> None:

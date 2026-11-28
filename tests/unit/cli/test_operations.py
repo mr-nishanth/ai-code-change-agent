@@ -60,13 +60,22 @@ class FakeChanges:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.decided: list[tuple[uuid.UUID, ApprovalGate, str, ApprovalDecision, str]] = []
+        self.reasons: list[str | None] = []
 
     async def decide(
-        self, aid: uuid.UUID, gate: ApprovalGate, sha: str, decision: ApprovalDecision, actor: str
+        self,
+        aid: uuid.UUID,
+        gate: ApprovalGate,
+        sha: str,
+        decision: ApprovalDecision,
+        actor: str,
+        *,
+        reason: str | None = None,
     ) -> tuple[Any, Any]:
         if self.error is not None:
             raise self.error
         self.decided.append((aid, gate, sha, decision, actor))
+        self.reasons.append(reason)
         status = SimpleNamespace(value="PLAN_APPROVED")
         return SimpleNamespace(id=uuid.UUID(int=7)), SimpleNamespace(id=aid, status=status)
 
@@ -105,6 +114,62 @@ def test_a_decision_wakes_the_workflow_through_the_dynamodb_job_queue(
     assert stores.queue.jobs == [
         (RESUME, {"attempt_id": str(aid)}, f"{RESUME}:{aid}:{uuid.UUID(int=7)}", 4)
     ]
+
+
+def test_a_rejection_records_the_operator_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    stores = FakeStores(FakeChanges())
+    use(monkeypatch, stores)
+    aid = str(uuid.uuid4())
+    sha = "f" * 64
+    assert run("changes", "reject", aid, "--gate", "PLAN", "--sha256", sha)[0] == 0
+    code, _, err = run(
+        "changes", "reject", aid, "--gate", "PLAN", "--sha256", sha, "--reason", "  wrong module  "
+    )
+    assert (code, err) == (0, "")
+    assert stores.changes.reasons == [None, "wrong module"]  # optional; surrounding space dropped
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["", "   ", "two\nlines", "tab\there", "x" * 501, "c1\x85control", "bidi\u202eoverride",
+     "zero\u200bwidth", "isolate\u2066x", "line\u2028separator", "para\u2029separator",
+     "mark\u200fx"],
+)  # fmt: skip
+def test_a_reason_that_is_empty_multi_line_or_too_long_is_refused(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], reason: str
+) -> None:
+    stores = FakeStores(FakeChanges())
+    use(monkeypatch, stores)
+    code, out, _ = run(
+        "changes", "reject", str(uuid.uuid4()), "--gate", "PLAN", "--sha256", "f" * 64,
+        "--reason", reason,
+    )  # fmt: skip
+    assert code == 2 and out == "" and "argument --reason" in capsys.readouterr().err  # argparse
+    assert stores.changes.decided == [] and stores.queue.jobs == []
+
+
+def test_a_reason_that_looks_like_a_secret_is_never_stored(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stores = FakeStores(FakeChanges())
+    use(monkeypatch, stores)
+    code, _, _ = run(
+        "changes", "reject", str(uuid.uuid4()), "--gate", "PLAN", "--sha256", "f" * 64,
+        "--reason", 'the password: "hunter2-secret-value"',
+    )  # fmt: skip
+    err = capsys.readouterr().err
+    assert code == 2 and "looks like a secret" in err and "hunter2" not in err
+    assert stores.changes.decided == []
+
+
+def test_approve_takes_no_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    stores = FakeStores(FakeChanges())
+    use(monkeypatch, stores)
+    code, _, _ = run(
+        "changes", "approve", str(uuid.uuid4()), "--gate", "PLAN", "--sha256", "f" * 64,
+        "--reason", "fine",
+    )  # fmt: skip
+    assert code == 2 and stores.changes.decided == []
 
 
 def test_a_refused_decision_enqueues_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -9,6 +9,7 @@ jitter; DYNAMODB-DATA-MODEL.md 5.1); genuine conflicts are not retried.
 import asyncio
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
 from ai_code_change_agent.application.changes.ports import AttemptListing, ChangeUnitOfWork
 from ai_code_change_agent.application.retry import Sleep, retry_concurrent
@@ -113,6 +114,22 @@ class CodeChangeService:
             await uow.store.update_request(req)
             await uow.commit()
             return req
+
+    @retry_concurrent
+    async def refuse_request(self, request_id: uuid.UUID) -> bool:
+        """Intake refused the request (for example its repository is not registered): no attempt
+        will start from this intake (it is never re-run), so the status projection becomes the
+        terminal BLOCKED instead of staying RECEIVED. Only a request that never had an attempt
+        changes, and only once: a redelivered intake job writes nothing. True when it changed."""
+        async with self._uow() as uow:
+            req = await uow.store.lock_request(request_id)
+            if req is None:
+                raise ChangeNotFoundError("request_not_found")
+            if req.current_attempt_id is not None or req.status != "RECEIVED":
+                return False
+            await uow.store.update_request(replace(req, status=AttemptStatus.BLOCKED.value))
+            await uow.commit()
+            return True
 
     @retry_concurrent
     async def start_attempt(self, request_id: uuid.UUID) -> CodeChangeAttempt:
@@ -233,6 +250,8 @@ class CodeChangeService:
         artifact_sha256: str,
         decision: ApprovalDecision,
         actor: str,
+        *,
+        reason: str | None = None,
     ) -> tuple[Approval, CodeChangeAttempt]:
         """Record an operator decision bound to the exact artifact hash. A rejection ends the
         attempt (REJECTED); an approval leaves the transition to the workflow, which re-checks
@@ -241,7 +260,7 @@ class CodeChangeService:
             attempt = await uow.store.lock_attempt(attempt_id)
             if attempt is None:
                 raise ChangeNotFoundError("attempt_not_found")
-            approval = attempt.decide(gate, artifact_sha256, decision, actor)
+            approval = attempt.decide(gate, artifact_sha256, decision, actor, reason=reason)
             await uow.store.add_approval(approval)
             if decision is ApprovalDecision.REJECTED:
                 rejected = attempt.transition(S.REJECTED)
