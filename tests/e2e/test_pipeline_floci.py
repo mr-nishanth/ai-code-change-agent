@@ -15,6 +15,9 @@ offloaded to S3 and read back intact by a fresh saver. A second test sends poiso
 A third runs a two-repository Story in manual approval mode: both children pause at their plan gates,
 are approved through the CLI, finish through their RESUME jobs, and the parent completes with one
 aggregated Jira comment (two repositories behind one fake App installation, `MultiHub`).
+A fourth (S2119) kills the intake job's only attempt and dead-letters its message: the sweep and the
+claim record it DEAD, its on_dead hook blocks the request, and the durable Jira report survives
+three 503s and a worker restart to be posted exactly once; a redriven DLQ message changes nothing.
 
 Nothing reaches the network: Jira and GitHub are mock transports, the model is scripted, AWS is Floci
 on a loopback endpoint with dummy credentials. DynamoDB request units are measured
@@ -690,3 +693,136 @@ async def test_a_multi_repository_story_in_manual_mode_completes_its_parent_once
     assert len(rows) == 8 and {r.record.provider for r in rows} == {LEDGER_PROVIDER}
     print(f"\nMulti-repository E2E runtime {elapsed:.1f}s; parent {parent.id} COMPLETED")
     assert elapsed < 900
+
+
+# ---- exhausted job -> DLQ + sweep -> DEAD -> terminal request -> durable Jira report ----------
+@pytest.mark.parametrize("resources", [{"max_receive_count": 2}], indirect=True)
+async def test_a_crashed_last_attempt_ends_dead_terminal_and_reported_once_despite_jira_failures(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2119: the intake job's only attempt dies with its worker (claimed, then the process is
+    gone) and its message is received once more without a claim, so SQS dead-letters it. The
+    sweep re-sends a message for the job (RUNNING, lease expired), the claim finds the last
+    attempt used and records it DEAD (lease_expired_attempts_exhausted); the dispatcher runs its
+    on_dead hook: the request ends BLOCKED and Jira gets exactly one "could not start" comment.
+    Jira answers 503 to the first three POSTs: the report stays PENDING through a worker restart
+    and the next worker posts it once (it looks for its marker first). Redriving the DLQ message
+    (twice) after that changes nothing."""
+    from ai_code_change_agent.application.jira import reports as durable_reports
+    from ai_code_change_agent.persistence.dynamodb.job_queue import EXHAUSTED, DynamoSqsJobQueue
+
+    settings = rig.settings.model_copy(
+        update={"job_max_attempts": 1, "jira_reporting_enabled": True}
+    )
+    jira = rig.world.jira
+    jira.post_failures = [503, 503, 503]  # one whole delivery round fails
+
+    def reporter(s: Settings) -> JiraOutcomeReporter:
+        return JiraOutcomeReporter(
+            enabled=True,
+            base_url=jira_rest.BASE_URL,
+            authenticator=composition._jira_authenticator(s),
+            transport=httpx.MockTransport(jira.handle),
+        )
+
+    monkeypatch.setattr(composition, "build_jira_reporter", reporter)
+    monkeypatch.setattr(durable_reports, "RETRY_BASE_SECONDS", 4.0)  # the next round in ~3-5 s
+    changes = build_change_service(settings, rig.inspect)
+    table = app_table(settings, rig.inspect)
+
+    # 1. webhook -> request + intake job (outbox); a duplicate delivery is recognised
+    app = create_app(settings)
+    body = body_bytes(key=ISSUE_KEY, project=PROJECT, issue_id="10001", summary="Say goodbye")
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://acca.test"
+        ) as api,
+    ):
+        first = await api.post(WEBHOOK, content=body, headers=headers(body))
+        again = await api.post(WEBHOOK, content=body, headers=headers(body))
+    assert first.json()["status"] == "accepted" and again.json()["status"] == "duplicate"
+    intake = rig.job("code_change.intake")
+    job_id = intake["id"]["S"]
+    assert intake["max_attempts"]["N"] == "1" and intake["GSI3PK"]["S"] == "DISPATCH"
+    request_id = uuid.UUID(json.loads(intake["payload_json"]["S"])["code_change_request_id"])
+
+    # 2. a worker relays and claims the job (its only attempt), then dies: nothing records it
+    ghost = DynamoSqsJobQueue(table, rig.inspect.sqs, rig.res.queue_url, receive_wait_seconds=1)
+    assert await ghost.dispatch_pending() == 1
+    claimed = await ghost.claim("ghost-worker", 2)
+    assert claimed is not None and str(claimed.id) == job_id and claimed.attempts == 1
+    await asyncio.sleep(2.5)
+    # another process receives the message and dies before its claim: receive count 2 of 2
+    got = rig.inspect.sqs.receive_message(
+        QueueUrl=rig.res.queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=2, VisibilityTimeout=1
+    )["Messages"]
+    assert json.loads(got[0]["Body"]) == {"job_id": job_id}
+    await asyncio.sleep(1.5)
+
+    def report_item() -> dict[str, Any] | None:
+        found = rig.inspect.dynamodb.get_item(
+            TableName=rig.res.table,
+            Key={"PK": {"S": f"JIRAREPORT#intake-{request_id}"}, "SK": {"S": "REPORT"}},
+            ConsistentRead=True,
+        )
+        item: dict[str, Any] | None = found.get("Item")
+        return item
+
+    # 3. worker A: the message is dead-lettered, the sweep re-sends, the claim records DEAD,
+    #    the hook blocks the request and the report's first round fails (503 x 3): PENDING
+    async with running_worker(settings):
+
+        async def pending_report() -> Any:
+            item = report_item()
+            return item if item and item["state"]["S"] == "PENDING" else None
+
+        pending = await until(pending_report, "the Jira report PENDING after a failed round", 90)
+    assert (pending["attempts"]["N"], pending["last_error"]["S"]) == ("1", "http_503")
+    dead = rig.job_by_id(job_id)
+    assert (dead["status"]["S"], dead["last_error"]["S"], dead["attempts"]["N"]) == (
+        "DEAD", EXHAUSTED, "1",
+    )  # fmt: skip
+    assert "GSI3PK" not in dead  # its on_dead hook ran and was settled
+    request = await changes.get_request(request_id)
+    assert request.status == "BLOCKED" and request.current_attempt_id is None
+    assert jira.comments == [] and jira.posts == 3
+    await until(lambda: _true(depth(rig.inspect, rig.res.dlq_url) == 1), "the DLQ message", 30)
+    shown = await cli("jobs", "dlq")
+    assert f"job {job_id}: kind=code_change.intake status=DEAD attempts=1/1" in shown
+    assert "state=PENDING" in await cli("reports", "list")
+
+    # 4. worker B (a restart) picks the PENDING report up when it is due and posts it once
+    async with running_worker(settings):
+
+        async def posted() -> Any:
+            item = report_item()
+            return item if item and item["state"]["S"] == "POSTED" else None
+
+        done = await until(posted, "the Jira report POSTED by the restarted worker", 60)
+
+        # 5. the DLQ message is redriven (twice, a duplicate): a terminal job is never run again
+        dlq = rig.inspect.sqs.receive_message(
+            QueueUrl=rig.res.dlq_url, MaxNumberOfMessages=1, WaitTimeSeconds=2
+        )["Messages"][0]
+        assert json.loads(dlq["Body"]) == {"job_id": job_id}  # the DLQ keeps the job id
+        for _ in range(2):
+            rig.inspect.sqs.send_message(QueueUrl=rig.res.queue_url, MessageBody=dlq["Body"])
+        rig.inspect.sqs.delete_message(QueueUrl=rig.res.dlq_url, ReceiptHandle=dlq["ReceiptHandle"])
+        await until(lambda: _true(rig.queues_empty()), "both queues empty after the redrive", 30)
+    assert done["attempts"]["N"] == "2" and "GSI3PK" not in done
+    (comment,) = jira.comments  # exactly one Jira failure report
+    text = json.dumps(comment)
+    assert f"could not start {ISSUE_KEY}" in text and EXHAUSTED in text
+    assert f"aica-report-intake-{request_id}" in text
+    assert jira.posts == 4  # 3 failed POSTs, then one that succeeded; never a duplicate
+    final = rig.job_by_id(job_id)
+    assert (final["status"]["S"], final["attempts"]["N"]) == ("DEAD", "1")
+    assert (await changes.get_request(request_id)).status == "BLOCKED"
+    assert await changes.recent_attempts(10) == []  # nothing ever ran for it
+    assert f"/rest/api/3/issue/{ISSUE_KEY}" not in jira.calls  # intake never ran again
+    assert "state=POSTED" in await cli("reports", "list")
+
+
+async def _true(value: bool) -> bool:
+    return value

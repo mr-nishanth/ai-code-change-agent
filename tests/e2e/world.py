@@ -198,15 +198,24 @@ class FakeJira:
     calls: list[str] = field(default_factory=list)
     description: tuple[str, ...] = DESCRIPTION
     comments: list[dict[str, Any]] = field(default_factory=list)
+    post_failures: list[int] = field(default_factory=list)  # statuses for the next POSTs
+    posts: int = 0
+    issue_failures: list[int] = field(default_factory=list)  # statuses for the next issue GETs
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request.url.path)
-        if (
-            request.method == "POST"
-            and request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}/comment"
-        ):
+        comments_path = f"/rest/api/3/issue/{ISSUE_KEY}/comment"
+        if request.method == "POST" and request.url.path == comments_path:
+            self.posts += 1
+            if self.post_failures:
+                return jira_rest.json_response({}, status=self.post_failures.pop(0))
             self.comments.append(json.loads(request.read())["body"])
             return jira_rest.json_response({"id": str(10000 + len(self.comments))}, status=201)
+        if request.method == "GET" and request.url.path == comments_path:  # newest first
+            listed = [{"id": str(10001 + i), "body": c} for i, c in enumerate(self.comments)]
+            return jira_rest.json_response({"comments": listed[::-1]})
+        if request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}" and self.issue_failures:
+            return jira_rest.json_response({}, status=self.issue_failures.pop(0))
         if request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}":
             return jira_rest.json_response(
                 jira_rest.issue_payload(
