@@ -467,7 +467,7 @@ async def test_a_job_the_queue_marks_dead_runs_its_kinds_on_dead_hook_once(
         raise AssertionError("an exhausted job is never run again")
 
     w = Worker(q, {"k.test": never}, lease_seconds=30, heartbeat_seconds=10, poll_seconds=0.05,
-               relay_seconds=0.1, on_dead={"k.test": on_dead})  # fmt: skip
+               relay_seconds=0.1, sweep_seconds=0.1, on_dead={"k.test": on_dead})  # fmt: skip
     stop = asyncio.Event()
     task = asyncio.create_task(w.run(stop))
     for _ in range(100):
@@ -558,3 +558,37 @@ async def test_concurrent_terminal_writes_leave_exactly_one_outcome(
     stored = await item(app_table, job.id)
     assert (done, failed is JobStatus.DEAD).count(True) == 1  # one conditional write wins
     assert stored["status"] == ("SUCCEEDED" if done else "DEAD")
+
+
+async def test_shutdown_refunds_are_bounded_per_job(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    from ai_code_change_agent.application.jobs.queue import MAX_SHUTDOWN_REFUNDS
+
+    q = make(app_table, job_queues)
+    await q.enqueue("k.test", {}, dedupe_key="d", max_attempts=5)
+    for n in range(MAX_SHUTDOWN_REFUNDS + 1):
+        job = await q.claim(f"w{n}", 300)
+        assert job is not None and job.attempts == 1  # every refund gave the attempt back
+        assert await q.release_lease(job.id, f"w{n}", refund=True, bounded=True)
+    job = await q.claim("last", 300)
+    assert job is not None and job.attempts == 2  # past the cap: released without a refund
+    stored = await item(app_table, job.id)
+    assert stored["shutdown_refunds"] == MAX_SHUTDOWN_REFUNDS
+    assert not await q.release_lease(job.id, "nobody", refund=True, bounded=True)
+
+
+async def test_two_dispatchers_never_run_the_same_dead_hook(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    q = make(app_table, job_queues)
+    for n in range(3):
+        await q.enqueue("k.test", {}, dedupe_key=f"d{n}", max_attempts=1)
+        assert await q.claim("crashed", 1) is not None
+    await asyncio.sleep(1.5)
+    for _ in range(3):
+        await q.claim("w", 60)  # each marks one exhausted job DEAD
+    one, two = await asyncio.gather(q.dead_pending(), make(app_table, job_queues).dead_pending())
+    ids = [j.id for j in one] + [j.id for j in two]
+    assert len(ids) == 3 and len(set(ids)) == 3  # every hook claimed by exactly one dispatcher
+    assert await q.dead_pending() == []  # claimed: not listed again until the claim lapses

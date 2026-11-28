@@ -14,15 +14,16 @@ relay tick; neither stops the worker.
 
 Every job that ends DEAD runs its kind's `on_dead` hook, whichever path recorded it: this worker's
 own last failure runs it at once; a job a claim found exhausted with an expired lease (a crashed
-worker's last attempt) is listed by `JobQueue.dead_pending` and run by the dispatcher on its next
-relay tick. `periodic` steps (the Jira report retry) run on the same tick.
+worker's last attempt) is listed (and claimed) by `JobQueue.dead_pending` and run by the
+maintenance task on the sweep cadence, beside the relay, never in its way. `periodic` steps (the
+Jira report retry) run in the same task, within `maintenance_budget_seconds` per round.
 
 Shutdown (`stop` set, SIGINT/SIGTERM in the CLI): no new claim starts; a claim already in its
 long poll (at most `receive_wait_seconds`, 20 s) that returns a job gives it straight back
 (`release_lease(refund=True)`). A running handler gets `shutdown_grace_seconds` to finish; then
 (or at once when `force` is set, a second signal) it is cancelled and its lease released with its
-attempt refunded (`release_lease`), so another worker or a restart resumes it right away instead of
-waiting for the lease to run out, and a shutdown never uses up a job's last attempt.
+attempt refunded (`release_lease`, at most `MAX_SHUTDOWN_REFUNDS` times per job), so another worker
+or a restart resumes it right away instead of waiting for the lease to run out.
 """
 
 import asyncio
@@ -97,6 +98,7 @@ class Worker:
         on_dead: Mapping[str, Handler] | None = None,
         periodic: Sequence[Periodic] = (),
         shutdown_grace_seconds: float = 30.0,
+        maintenance_budget_seconds: float = 60.0,
     ) -> None:
         self._queue = queue
         self._handlers = dict(handlers)
@@ -105,6 +107,7 @@ class Worker:
         self._on_dead = dict(on_dead or {})
         self._periodic = tuple(periodic)
         self._grace = shutdown_grace_seconds
+        self._budget = maintenance_budget_seconds
         self._force: asyncio.Event | None = None
         self._lease = lease_seconds
         self._beat = heartbeat_seconds
@@ -118,13 +121,13 @@ class Worker:
         self._force = force
         slots = [asyncio.create_task(self._slot(stop)) for _ in range(self._concurrency)]
         dispatcher = asyncio.create_task(self._dispatcher(stop))
+        maintenance = asyncio.create_task(self._maintenance(stop))
         try:
             await asyncio.gather(*slots)
         finally:
-            for slot in slots:
-                slot.cancel()
-            dispatcher.cancel()
-            await asyncio.gather(*slots, dispatcher, return_exceptions=True)
+            for task in (*slots, dispatcher, maintenance):
+                task.cancel()
+            await asyncio.gather(*slots, dispatcher, maintenance, return_exceptions=True)
 
     async def _slot(self, stop: asyncio.Event) -> None:
         """One free slot: claim (a long-poll receive with SQS), process, repeat until stopped. A
@@ -156,13 +159,25 @@ class Worker:
         next_sweep = loop.time()
         while not stop.is_set():
             await self._tick("dispatch_pending", self._queue.dispatch_pending)
-            await self._tick("dead_hooks", self._dead_hooks)
-            for name, step in self._periodic:
-                await self._tick(name, step)
             if loop.time() >= next_sweep:
                 await self._tick("sweep", self._queue.sweep)
                 next_sweep = loop.time() + self._sweep
             await self._wait(stop, self._relay)
+
+    async def _maintenance(self, stop: asyncio.Event) -> None:
+        """Dead-job hooks and `periodic` steps (the Jira report retry), on the sweep cadence and in
+        their own task, so the relay never waits behind them (a Jira outage cannot delay new
+        jobs). One round is bounded by `maintenance_budget_seconds`; what it did not reach waits
+        for the next round (the inline paths, which run at once, are the primary ones)."""
+        while not stop.is_set():
+            try:
+                async with asyncio.timeout(self._budget):
+                    await self._tick("dead_hooks", self._dead_hooks)
+                    for name, step in self._periodic:
+                        await self._tick(name, step)
+            except TimeoutError:
+                _log.warning("job_maintenance_budget_exceeded", budget_seconds=self._budget)
+            await self._wait(stop, self._sweep)
 
     @staticmethod
     async def _tick(name: str, step: Callable[[], Coroutine[Any, Any, int]]) -> None:
@@ -266,9 +281,7 @@ class Worker:
                 return
             if watch is not None and _cancelled_by(watch):
                 await self._stop_beat(beat)
-                # an operator's stop is not a failure: the attempt is given back too (the
-                # workflow resumes from its checkpoint), so a shutdown never exhausts a job
-                await self._queue.release_lease(job.id, self.owner, refund=True)
+                await self._give_back(job)
                 return
             raise
         except JobFailedError as exc:
@@ -307,8 +320,18 @@ class Worker:
         if _lost(beat):  # the lease went while the handler was finishing: not ours to record
             self._lease_lost(job)
             return
+        if watch is not None and _cancelled_by(watch):  # it swallowed the cancel: unfinished
+            await self._give_back(job)
+            return
         if await self._queue.complete(job.id, self.owner):
             _log.info("job_succeeded", job_id=str(job.id), kind=job.kind)
+
+    async def _give_back(self, job: Job) -> None:
+        """A handler cancelled by the shutdown: release its lease. An operator's stop is not a
+        failure, so the attempt is refunded too (the workflow resumes from its checkpoint), but
+        only a bounded number of times per job (`bounded`): a job that never finishes within the
+        grace cannot be refunded forever."""
+        await self._queue.release_lease(job.id, self.owner, refund=True, bounded=True)
 
     @staticmethod
     def _lease_lost(job: Job) -> None:

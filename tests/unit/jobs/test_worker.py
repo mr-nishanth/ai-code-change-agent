@@ -1,6 +1,7 @@
 """Worker behaviour over an in-memory queue double."""
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -29,6 +30,7 @@ class MemoryQueue:
         self.sweeps = 0
         self.released: list[uuid.UUID] = []
         self.lease_released: list[tuple[uuid.UUID, bool]] = []
+        self.bounded: list[bool] = []
         self.dead: list[Job] = []  # what dead_pending lists next (DEAD by another path)
         self.settled: list[tuple[uuid.UUID, bool]] = []
 
@@ -70,8 +72,11 @@ class MemoryQueue:
         self.sweeps += 1
         return 0
 
-    async def release_lease(self, job_id: uuid.UUID, owner: str, *, refund: bool) -> bool:
+    async def release_lease(
+        self, job_id: uuid.UUID, owner: str, *, refund: bool, bounded: bool = False
+    ) -> bool:
         self.lease_released.append((job_id, refund))
+        self.bounded.append(bounded)
         return True
 
     async def dead_pending(self) -> list[Job]:
@@ -750,3 +755,61 @@ async def test_one_worker_consumes_several_jobs_and_keeps_no_state_per_job() -> 
     events = [e["event"] for e in logs]
     assert events.count("job_claimed") == 4 and events.count("job_succeeded") == 3
     assert events.count("job_dead") == 1
+
+
+async def test_the_relay_keeps_dispatching_while_jira_reporting_hangs() -> None:
+    """Report retries and dead hooks run in their own task with a time budget: a Jira outage
+    (a periodic step that never answers) never delays the outbox relay."""
+    hung = asyncio.Event()
+
+    async def report_retry() -> int:
+        hung.set()
+        await asyncio.sleep(3600)  # Jira hangs
+        return 0
+
+    q = MemoryQueue()
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=5, relay_seconds=0.01,
+               sweep_seconds=0.05, periodic=[("jira_report_retry", report_retry)],
+               maintenance_budget_seconds=0.1)  # fmt: skip
+    stop = asyncio.Event()
+    with capture_logs() as logs:
+        task = asyncio.create_task(w.run(stop))
+        await asyncio.wait_for(hung.wait(), 1)
+        before = q.relays
+        await asyncio.sleep(0.3)
+        stop.set()
+        await asyncio.wait_for(task, 2)
+    assert q.relays - before >= 10  # the relay ran on while the step hung
+    assert any(e["event"] == "job_maintenance_budget_exceeded" for e in logs)
+
+
+async def test_a_handler_that_swallows_the_shutdown_cancel_is_never_completed() -> None:
+    async def stubborn(j: Job) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(60)
+
+    claimed = job()
+    q = MemoryQueue([claimed])
+    w = Worker(q, {"k.one": stubborn}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01,
+               shutdown_grace_seconds=0.05)  # fmt: skip
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert q.completed == [] and q.failed == []
+    assert q.lease_released == [(claimed.id, True)] and q.bounded == [True]  # capped refund
+
+
+async def test_only_the_shutdown_cancel_path_bounds_its_refund() -> None:
+    stop = asyncio.Event()
+
+    class StopDuringClaim(MemoryQueue):
+        async def claim(self, owner: str, lease_seconds: int) -> Job | None:
+            stop.set()
+            return await super().claim(owner, lease_seconds)
+
+    q = StopDuringClaim([job()])
+    w = Worker(q, {}, lease_seconds=60, heartbeat_seconds=30, poll_seconds=0.01)
+    await asyncio.wait_for(w.run(stop), 2)
+    assert q.bounded == [False]  # never started: always refunded

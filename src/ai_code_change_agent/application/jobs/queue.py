@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+MAX_SHUTDOWN_REFUNDS = 3  # shutdown cancellations that give a job its attempt back
+
 
 class JobStatus(StrEnum):
     QUEUED = "QUEUED"
@@ -85,18 +87,23 @@ class JobQueue(Protocol):
         period). Returns how many were re-sent; a queue that cannot lose messages returns 0."""
         ...
 
-    async def release_lease(self, job_id: uuid.UUID, owner: str, *, refund: bool) -> bool:
+    async def release_lease(
+        self, job_id: uuid.UUID, owner: str, *, refund: bool, bounded: bool = False
+    ) -> bool:
         """Give a claimed job back at once (worker shutdown): its lease ends now, so the next
         receipt reclaims it instead of waiting for the lease to run out. `refund` also returns
-        the attempt the claim counted (the handler never started). False when `owner` no longer
-        holds it."""
+        the attempt the claim counted: unconditionally for a job claimed during the stop (its
+        handler never started); with `bounded` (a handler cancelled after the grace) only while
+        the job was refunded fewer than MAX_SHUTDOWN_REFUNDS times, else the lease is released and
+        the attempt counts. False when `owner` no longer holds it."""
         ...
 
     async def dead_pending(self) -> list[Job]:
         """DEAD jobs whose kind's on_dead hook has not run yet, whichever path recorded them DEAD
         (the worker's last failure, or a claim that found the last attempt's lease expired), with
-        `last_error` set. A job recorded DEAD by this worker's own `fail` is listed only after a
-        grace period (the worker runs its hook at once)."""
+        `last_error` set. Each listed job is claimed for the caller (a second caller does not get
+        it until the claim lapses). A job recorded DEAD by this worker's own `fail` is claimed by
+        that write (the worker runs its hook at once) and listed only after it lapses."""
         ...
 
     async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
