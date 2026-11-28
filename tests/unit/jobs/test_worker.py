@@ -699,7 +699,7 @@ async def test_shutdown_cancels_a_long_job_after_the_grace_and_gives_its_lease_b
         await asyncio.wait_for(task, 3)
         took = asyncio.get_running_loop().time() - started
     assert cancelled.is_set() and took < (1 if force else 2)
-    assert q.lease_released == [(claimed.id, False)] and q.released == [claimed.id]
+    assert q.lease_released == [(claimed.id, True)] and q.released == [claimed.id]
     assert q.completed == [] and q.failed == []
     assert any(e["event"] == "job_shutdown_cancelled" for e in logs)
 

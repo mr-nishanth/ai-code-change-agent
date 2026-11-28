@@ -20,9 +20,9 @@ relay tick. `periodic` steps (the Jira report retry) run on the same tick.
 Shutdown (`stop` set, SIGINT/SIGTERM in the CLI): no new claim starts; a claim already in its
 long poll (at most `receive_wait_seconds`, 20 s) that returns a job gives it straight back
 (`release_lease(refund=True)`). A running handler gets `shutdown_grace_seconds` to finish; then
-(or at once when `force` is set, a second signal) it is cancelled and its lease released
-(`release_lease`), so another worker or a restart resumes it right away instead of waiting for
-the lease to run out.
+(or at once when `force` is set, a second signal) it is cancelled and its lease released with its
+attempt refunded (`release_lease`), so another worker or a restart resumes it right away instead of
+waiting for the lease to run out, and a shutdown never uses up a job's last attempt.
 """
 
 import asyncio
@@ -266,7 +266,9 @@ class Worker:
                 return
             if watch is not None and _cancelled_by(watch):
                 await self._stop_beat(beat)
-                await self._queue.release_lease(job.id, self.owner, refund=False)
+                # an operator's stop is not a failure: the attempt is given back too (the
+                # workflow resumes from its checkpoint), so a shutdown never exhausts a job
+                await self._queue.release_lease(job.id, self.owner, refund=True)
                 return
             raise
         except JobFailedError as exc:

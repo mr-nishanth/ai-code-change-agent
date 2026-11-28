@@ -200,7 +200,7 @@ process) every `JOB_RELAY_SECONDS` (default 30 s; only a fallback, producers sen
 | Fail, dead | Conditional DEAD; the job moves to GSI3 `DEADHOOK` (due after a 60 s grace: this worker runs the hook at once) | `DeleteMessage` |
 | Worker crash | Lease expires | Visibility expires with the lease; the next receiver's conditional claim succeeds (`attempts + 1`), as today |
 | Lost or dead-lettered message for a live job | Sweep (every `JOB_SWEEP_SECONDS`, default 300 s, at least the relay interval) queries GSI3 `SWEEP` (non-terminal, sent) and, after one consistent `BatchGetItem` re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. SUCCEEDED `REMOVE`s the GSI3 keys; DEAD moves them to `DEADHOOK` |
-| Shutdown (SIGINT/SIGTERM) | `release_lease`: conditional on RUNNING + owner, `lease_expires_at` = now (with `attempts - 1` for a job claimed after stop, whose handler never started) | `ChangeMessageVisibility(0)`: the next receiver reclaims it at once |
+| Shutdown (SIGINT/SIGTERM) | `release_lease`: conditional on RUNNING + owner, `lease_expires_at` = now and `attempts - 1` (a stop is not a failure: a job claimed during the stop, or cancelled after the grace, keeps its attempts) | `ChangeMessageVisibility(0)`: the next receiver reclaims it at once |
 
 ### 8.3 Outbox evaluated
 
