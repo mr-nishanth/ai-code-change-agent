@@ -105,6 +105,7 @@ class JiraOutcomeReporter:
         self._auth = authenticator
         self._transport = transport
         self._timeout = timeout_seconds
+        self._account: str | None = None
 
     def __repr__(self) -> str:
         return f"JiraOutcomeReporter(enabled={self._enabled})"
@@ -112,6 +113,23 @@ class JiraOutcomeReporter:
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout
+
+    async def _account_id(self, client: httpx.AsyncClient) -> str | None:
+        """The reporting account's id (`GET /rest/api/3/myself`, cached): only its comments can
+        carry a genuine report marker. None when Jira did not say (the lookup then fails)."""
+        if self._account is None:
+            try:
+                response = await client.get("/rest/api/3/myself", headers=self._headers())
+                account = response.json().get("accountId") if response.status_code == 200 else None
+            except (httpx.HTTPError, ValueError, AttributeError):
+                account = None
+            if isinstance(account, str) and account:
+                self._account = account
+        return self._account
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -160,15 +178,19 @@ class JiraOutcomeReporter:
         return CommentResult(CommentStatus.POSTED, comment_id=cid, http_status=201)
 
     async def find_comment(self, issue_key: str, marker: str) -> CommentResult | None:
-        """The newest comment on the issue whose text contains marker (a report id), or None
-        when Jira confirms there is none. A failed lookup is returned as RETRYABLE/PERMANENT:
-        the caller must not post while the outcome is unknown."""
+        """The newest comment by the reporting account (`/myself`) whose text contains marker (a
+        report id), or None when Jira confirms there is none; a user who pastes the marker into a
+        comment of their own cannot suppress the report. A failed lookup is returned as
+        RETRYABLE/PERMANENT: the caller must not post while the outcome is unknown."""
         if not self._enabled:
             return CommentResult(CommentStatus.DISABLED)
         if not _KEY.fullmatch(issue_key):
             return CommentResult(CommentStatus.PERMANENT, error="issue_key_invalid")
         try:
             async with self._client() as client:
+                account = await self._account_id(client)
+                if account is None:
+                    return CommentResult(CommentStatus.RETRYABLE, error="lookup_identity_unknown")
                 response = await client.get(
                     f"/rest/api/3/issue/{issue_key}/comment",
                     params={"orderBy": "-created", "maxResults": 100},
@@ -190,8 +212,13 @@ class JiraOutcomeReporter:
             comments = response.json().get("comments") or []
         except ValueError:
             return CommentResult(CommentStatus.RETRYABLE, error="lookup_invalid_json")
-        for comment in comments:
-            if isinstance(comment, dict) and marker in _adf_text(comment.get("body")):
+        for comment in comments:  # only the reporting account's own comments can be the report
+            if not isinstance(comment, dict):
+                continue
+            author = comment.get("author")
+            if not isinstance(author, dict) or author.get("accountId") != account:
+                continue
+            if marker in _adf_text(comment.get("body")):
                 cid = str(comment.get("id", ""))
                 return CommentResult(
                     CommentStatus.POSTED,

@@ -190,6 +190,9 @@ def implementation_script() -> list[AIMessage]:
 DESCRIPTION = ("Change the greeting.", "Acceptance criteria:", "- greet returns Goodbye")
 
 
+REPORTER_ACCOUNT = "acc-reporting-bot"  # the reporting account (/myself)
+
+
 @dataclass
 class FakeJira:
     """Serves one synthetic Story through the real Jira client (mock transport) and records the
@@ -211,8 +214,13 @@ class FakeJira:
                 return jira_rest.json_response({}, status=self.post_failures.pop(0))
             self.comments.append(json.loads(request.read())["body"])
             return jira_rest.json_response({"id": str(10000 + len(self.comments))}, status=201)
+        if request.method == "GET" and request.url.path == "/rest/api/3/myself":
+            return jira_rest.json_response({"accountId": REPORTER_ACCOUNT})
         if request.method == "GET" and request.url.path == comments_path:  # newest first
-            listed = [{"id": str(10001 + i), "body": c} for i, c in enumerate(self.comments)]
+            listed = [
+                {"id": str(10001 + i), "author": {"accountId": REPORTER_ACCOUNT}, "body": c}
+                for i, c in enumerate(self.comments)
+            ]
             return jira_rest.json_response({"comments": listed[::-1]})
         if request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}" and self.issue_failures:
             return jira_rest.json_response({}, status=self.issue_failures.pop(0))
