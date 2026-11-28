@@ -5,7 +5,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from ai_code_change_agent.application.jobs.queue import Job
+import pytest
+
+from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.models import ChildStatus
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.domain.changes.states import AttemptStatus
@@ -219,3 +221,60 @@ async def test_a_dead_multi_repository_intake_advances_its_parent() -> None:
     await handler.on_dead(dead("code_change.intake", code_change_request_id=req.id))
     assert coordinator.advanced == [parent.id] and jira.comments == []
     assert (await changes.service().get_request(req.id)).status == "RECEIVED"
+
+
+class FlakyStore(MemoryReportStore):
+    """The first report write fails (a DynamoDB outage)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures = 1
+
+    async def create(self, report_id: str, issue_key: str, text: str, sha256: str) -> bool:
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("store down")
+        return await super().create(report_id, issue_key, text, sha256)
+
+
+async def test_a_report_store_failure_in_the_dead_hook_never_loses_the_report() -> None:
+    """The report is stored before the request is blocked: if storing fails, nothing changed and
+    the hook's re-run (dead_settled failed) still blocks and reports."""
+    from ai_code_change_agent.application.jira.reports import DurableJiraReporter
+
+    changes, jira = MemoryChanges(), CommentJira()
+    req = changes.add_request()
+    store = FlakyStore()
+    handler = durable_intake(changes, jira)
+    handler._reporter = DurableJiraReporter(jira.reporter(), store)
+    dead_job = dead("code_change.intake", code_change_request_id=req.id)
+    with pytest.raises(RuntimeError):
+        await handler.on_dead(dead_job)
+    assert (await changes.service().get_request(req.id)).status == "RECEIVED"
+    await handler.on_dead(dead_job)  # the hook runs again
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+    assert len(jira.comments) == 1
+
+
+async def test_a_report_store_failure_in_a_refusal_retries_the_job_and_reports_once() -> None:
+    from ai_code_change_agent.application.jira.reports import DurableJiraReporter
+    from tests.support.workflow import UnregisteredRepositoryJira
+
+    changes, jira = MemoryChanges(), CommentJira()
+    req = changes.add_request()
+    handler = IntakeHandler(
+        changes=changes.service(),
+        jira=UnregisteredRepositoryJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=lambda _: None,  # type: ignore[arg-type,return-value]
+        repository_field_configured=False,
+        reporter=DurableJiraReporter(jira.reporter(), FlakyStore()),
+    )
+    payload = Job(uuid.uuid4(), "code_change.intake", {"code_change_request_id": str(req.id)}, 1, 3)
+    with pytest.raises(RuntimeError):
+        await handler(payload)
+    assert (await changes.service().get_request(req.id)).status == "RECEIVED"
+    with pytest.raises(JobFailedError):
+        await handler(payload)
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+    assert len(jira.comments) == 1

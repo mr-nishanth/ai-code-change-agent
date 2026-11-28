@@ -162,16 +162,25 @@ class IntakeHandler:
             if found is not None:
                 await self._coordinator.advance(found[0].id)
                 return
+        if request.status != "RECEIVED":
+            return  # refused (and reported) already
+        code = job.last_error or "job_dead"
+        text = _not_started(
+            request.jira_issue_key,
+            f"intake failed on every attempt ({code}); no attempt was started",
+            advice="not automatically; an operator must check the cause and resubmit",
+        )
+        report_id = intake_report_id(request_id)
+        # the report is stored before the request is blocked: a failure in between leaves either
+        # nothing changed (the hook runs again) or a stored report the worker's retry delivers
+        await self._prepare(request.jira_issue_key, text, report_id)
         if await self._changes.refuse_request(request_id) and self._reporter is not None:
-            code = job.last_error or "job_dead"
-            text = _not_started(
-                request.jira_issue_key,
-                f"intake failed on every attempt ({code}); no attempt was started",
-                advice="not automatically; an operator must check the cause and resubmit",
-            )
-            await self._reporter.report(
-                request.jira_issue_key, text, report_id=intake_report_id(request_id)
-            )
+            await self._reporter.report(request.jira_issue_key, text, report_id=report_id)
+
+    async def _prepare(self, issue_key: str, text: str, report_id: str) -> None:
+        prepare = getattr(self._reporter, "prepare", None)
+        if prepare is not None:
+            await prepare(issue_key, text, report_id=report_id)
 
     async def _refused(
         self,
@@ -180,16 +189,23 @@ class IntakeHandler:
         issue_key: str | None = None,
         text: str | None = None,
     ) -> JobFailedError:
-        """The intake job ends DEAD with `code`, so no attempt will start from it: the request
-        becomes BLOCKED (idempotent) before Jira is told, so a storage failure here retries the
-        job without posting a comment. A request already BLOCKED when this run began was refused
+        """The intake job ends DEAD with `code`, so no attempt will start from it: the report is
+        stored (not posted), then the request becomes BLOCKED (idempotent), then Jira is told, so
+        a failure at any point either retries the job or leaves a stored report the worker's retry
+        delivers; it is never lost. A request already BLOCKED when this run began was refused
         and reported by an earlier run (its lease expired before the job failed): no second
         comment. The report is durable and keyed per request (`intake-<rid>`): a transient Jira
         failure is retried and an overlapping run never posts it twice."""
+        report_id = intake_report_id(request.id)
+        tells = text is not None and issue_key is not None and self._reporter is not None
+        if tells and request.status != AttemptStatus.BLOCKED.value:
+            assert text is not None and issue_key is not None  # noqa: S101 - checked above
+            await self._prepare(issue_key, text, report_id)  # stored before BLOCKED is written
         changed = await self._changes.refuse_request(request.id)
         first = changed or request.status != AttemptStatus.BLOCKED.value
-        if first and text is not None and issue_key is not None and self._reporter is not None:
-            await self._reporter.report(issue_key, text, report_id=intake_report_id(request.id))
+        if first and tells:
+            assert text is not None and issue_key is not None  # noqa: S101 - checked above
+            await self._reporter.report(issue_key, text, report_id=report_id)
         return JobFailedError(code)
 
 
