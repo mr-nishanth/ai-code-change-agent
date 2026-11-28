@@ -6,15 +6,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 
 from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
+from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
 from ai_code_change_agent.domain.changes.states import AttemptStatus, can_transition
 from ai_code_change_agent.orchestration.intake import ResumeHandler
+from ai_code_change_agent.orchestration.langgraph.graph import build_graph
 from ai_code_change_agent.orchestration.langgraph.runner import (
     CheckpointExpiredError,
     WorkflowRunner,
 )
+from ai_code_change_agent.orchestration.steps import CodeChangeSteps
 from tests.support.changes import MemoryChanges
+from tests.support.workflow import Rig, make_rig
 
 S = AttemptStatus
 
@@ -88,3 +93,73 @@ async def test_an_expired_checkpoint_of_an_already_finished_attempt_changes_noth
     with pytest.raises(JobFailedError):
         await ResumeHandler(expired, changes=svc)(job)
     assert (await svc.get_attempt(attempt.id)).status is S.CANCELLED
+
+
+# ---- S2117: the expired attempt is reported to Jira once, like any other failed attempt -----
+
+
+async def paused_rig(tmp_path: Any) -> tuple[Rig, CodeChangeSteps]:
+    rig = await make_rig(tmp_path)  # manual approval: the workflow stops at the plan gate
+    await rig.runner.start(rig.attempt_id)
+    assert (await rig.deps.changes.get_attempt(rig.attempt_id)).status is S.AWAITING_PLAN_APPROVAL
+    assert rig.reporter.reports == []
+    return rig, CodeChangeSteps(rig.deps)
+
+
+def resume_job(attempt_id: uuid.UUID) -> Job:
+    return Job(uuid.uuid4(), "code_change.resume", {"attempt_id": str(attempt_id)}, 1, 3)
+
+
+async def test_an_expired_checkpoint_is_reported_to_jira_exactly_once(tmp_path: Any) -> None:
+    rig, steps = await paused_rig(tmp_path)
+    lost = WorkflowRunner(build_graph(steps, MemorySaver()))  # the checkpoint row expired (TTL)
+    handler = ResumeHandler(lost.resume, changes=rig.deps.changes, report=steps.cleanup)
+    job = resume_job(rig.attempt_id)
+    with pytest.raises(JobFailedError) as raised:
+        await handler(job)
+    assert raised.value.code == "checkpoint_expired"
+    failed = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert failed.status is S.FAILED and failed.failure_code == "checkpoint_expired"
+    ((issue, text),) = rig.reporter.reports
+    assert issue == "SHOP-1" and "Outcome: FAILED" in text and "Reason: checkpoint_expired" in text
+    with pytest.raises(JobFailedError):  # the RESUME job redelivered: still one comment
+        await handler(resume_job(rig.attempt_id))
+    with pytest.raises(JobFailedError):
+        await handler(job)
+    assert len(rig.reporter.reports) == 1
+
+
+async def test_a_successful_resume_posts_no_failure_report(tmp_path: Any) -> None:
+    rig, steps = await paused_rig(tmp_path)
+    handler = ResumeHandler(rig.runner.resume, changes=rig.deps.changes, report=steps.cleanup)
+    for gate in (ApprovalGate.PLAN, ApprovalGate.FINAL):
+        attempt = await rig.deps.changes.get_attempt(rig.attempt_id)
+        digest = attempt.plan_sha256 if gate is ApprovalGate.PLAN else attempt.manifest_sha256
+        assert digest is not None
+        await rig.deps.changes.decide(attempt.id, gate, digest, ApprovalDecision.APPROVED, "cli:op")
+        await handler(resume_job(rig.attempt_id))
+    assert (await rig.deps.changes.get_attempt(rig.attempt_id)).status is S.COMPLETED
+    ((_, text),) = rig.reporter.reports  # only the workflow's own pull-request comment
+    assert "created a draft pull request" in text and "checkpoint_expired" not in text
+
+
+async def test_the_cost_report_sees_the_expired_attempt_as_failed(tmp_path: Any) -> None:
+    rig, steps = await paused_rig(tmp_path)
+    seen: list[AttemptStatus] = []
+
+    def around(launch: Any) -> Any:  # what CostReporter.around does: look after the run
+        async def run(attempt_id: uuid.UUID) -> Any:
+            try:
+                return await launch(attempt_id)
+            finally:
+                seen.append((await rig.deps.changes.get_attempt(attempt_id)).status)
+
+        return run
+
+    lost = WorkflowRunner(build_graph(steps, MemorySaver()))
+    handler = ResumeHandler(
+        lost.resume, changes=rig.deps.changes, report=steps.cleanup, around=around
+    )
+    with pytest.raises(JobFailedError):
+        await handler(resume_job(rig.attempt_id))
+    assert seen == [S.FAILED]  # not "AWAITING_PLAN_APPROVAL (not finished)"

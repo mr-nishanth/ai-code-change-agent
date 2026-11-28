@@ -574,7 +574,8 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
             multirepo=coordinator,
             toolchains=frozenset(execution_images(settings)),
         )
-        runner = WorkflowRunner(build_graph(CodeChangeSteps(deps), saver))
+        steps = CodeChangeSteps(deps)
+        runner = WorkflowRunner(build_graph(steps, saver))
         handlers: dict[str, Any] = {
             INTAKE: IntakeHandler(
                 changes=changes,
@@ -586,7 +587,11 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
                 coordinator=coordinator,
             ),
             RESUME: ResumeHandler(
-                costs.around(runner.resume), changes=changes, coordinator=coordinator
+                runner.resume,
+                changes=changes,
+                coordinator=coordinator,
+                report=steps.cleanup,  # the once-per-attempt Jira report (checkpoint_expired)
+                around=costs.around,
             ),
             CHILD: ChildHandler(
                 coordinator=coordinator, changes=changes, start=costs.around(runner.start)

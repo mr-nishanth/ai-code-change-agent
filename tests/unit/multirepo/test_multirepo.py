@@ -1120,10 +1120,14 @@ class Paused:
     single_reports: list[uuid.UUID]  # the single-repository report path (never for a child)
 
     def handler(self, resume: Callable[[uuid.UUID], Awaitable[Any]]) -> ResumeHandler:
+        async def report(attempt_id: uuid.UUID) -> None:
+            self.single_reports.append(attempt_id)
+
         return ResumeHandler(
             resume,
             changes=self.changes,  # type: ignore[arg-type]
             coordinator=self.coordinator,
+            report=report,
         )
 
     def resume_to(

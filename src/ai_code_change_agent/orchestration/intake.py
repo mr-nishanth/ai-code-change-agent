@@ -209,11 +209,15 @@ class ParentReportHandler:
 class ResumeHandler:
     """Resumes an attempt after an approval. When the workflow's checkpoint has expired
     (ACCA_CHECKPOINT_TTL_DAYS) the attempt cannot resume: it becomes FAILED with
-    `checkpoint_expired`, which releases its active guard, and the job ends with that code.
+    `checkpoint_expired`, which releases its active guard, is reported to Jira through the
+    workflow's own once-per-attempt report (`report`, the cleanup step), and the job ends with
+    that code.
 
     A multi-repository child that paused at a gate is finished here: once the resumed (or
     expired) attempt is terminal the coordinator records the child and advances its parent, so
-    the parent never stays RUNNING after its last child."""
+    the parent never stays RUNNING after its last child. Children report only through the
+    parent's aggregated comment. `around` wraps the run (the cost report), so it already sees the
+    expired attempt as FAILED."""
 
     def __init__(
         self,
@@ -221,10 +225,14 @@ class ResumeHandler:
         *,
         changes: CodeChangeService | None = None,
         coordinator: Coordinator | None = None,
+        report: Launch | None = None,
+        around: Callable[[Launch], Launch] | None = None,
     ) -> None:
         self._resume = resume
         self._changes = changes
         self._coordinator = coordinator
+        self._report = report
+        self._run = (around or (lambda launch: launch))(self._resume_or_expire)
 
     async def __call__(self, job: Job) -> None:
         try:
@@ -232,10 +240,11 @@ class ResumeHandler:
         except (KeyError, ValueError):
             raise JobFailedError("payload_invalid") from None
         try:
-            await self._resume_or_expire(attempt_id)
+            await self._run(attempt_id)
         except CheckpointExpiredError as exc:
             _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
-            await self._child_finished(attempt_id)
+            if not await self._child_finished(attempt_id) and self._report is not None:
+                await self._report(attempt_id)
             raise JobFailedError(exc.code) from None
         await self._child_finished(attempt_id)
 
