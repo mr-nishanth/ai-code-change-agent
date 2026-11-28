@@ -52,7 +52,19 @@ docker inspect <aica-sbx-...> --format '{{.HostConfig.NetworkMode}} {{.HostConfi
 | `floci=true` | containers and volumes Floci started | owned by Floci |
 
 Do not stop or exec into a live sandbox while an attempt runs: a stopped or changed sandbox can fail the
-attempt. Heavy Docker or Floci tests run only when `docker ps --filter label=aica.role=agent-sandbox` is empty.
+attempt.
+
+**Orphan sandbox after a killed worker.** A worker killed with SIGKILL (or a host crash) cannot remove
+its sandbox. The container runs `sleep WORKSPACE_TIMEOUT_SECONDS` (default 7200 s) and exits on its own
+after that; it has no network. When a worker reclaims the job and resumes the attempt, crash recovery
+removes the attempt's old workspaces and containers first (`destroy_attempt_workspaces`). A job that
+never resumes (DEAD, cancelled attempt) leaves the sandbox for the full lifetime. To find one, list
+sandboxes with `docker ps --filter label=aica.role=agent-sandbox` and compare the `aica.attempt` label
+with attempts no worker is running (`changes show <attempt-id>`, job not `RUNNING`); then remove only
+that container: `docker rm -f $(docker ps -q --filter label=aica.attempt=<attempt-id>)`. Never remove
+a sandbox whose attempt is still running.
+
+Heavy Docker or Floci tests run only when `docker ps --filter label=aica.role=agent-sandbox` is empty.
 
 ## lazydocker (terminal UI)
 
