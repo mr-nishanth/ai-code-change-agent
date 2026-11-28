@@ -15,6 +15,7 @@ import sys
 import uuid
 from typing import TextIO
 
+from ai_code_change_agent.application.artifacts.redaction import find_secrets
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
@@ -60,7 +61,11 @@ def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-a
 def _reason(text: str) -> str:
     reason = text.strip()
     if not REASON.fullmatch(reason):
-        raise argparse.ArgumentTypeError(f"one line of 1-{REASON_MAX} characters is required")
+        raise argparse.ArgumentTypeError(
+            f"one line of 1-{REASON_MAX} printable characters is required"
+        )
+    if find_secrets(reason):  # never stored: the reason is shown in Jira and kept in DynamoDB
+        raise argparse.ArgumentTypeError("the reason looks like a secret; it was not recorded")
     return reason
 
 

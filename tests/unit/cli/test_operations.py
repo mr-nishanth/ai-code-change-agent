@@ -129,7 +129,12 @@ def test_a_rejection_records_the_operator_reason(monkeypatch: pytest.MonkeyPatch
     assert stores.changes.reasons == [None, "wrong module"]  # optional; surrounding space dropped
 
 
-@pytest.mark.parametrize("reason", ["", "   ", "two\nlines", "tab\there", "x" * 501])
+@pytest.mark.parametrize(
+    "reason",
+    ["", "   ", "two\nlines", "tab\there", "x" * 501, "c1\x85control", "bidi\u202eoverride",
+     "zero\u200bwidth", "isolate\u2066x", "line\u2028separator", "para\u2029separator",
+     "mark\u200fx"],
+)  # fmt: skip
 def test_a_reason_that_is_empty_multi_line_or_too_long_is_refused(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], reason: str
 ) -> None:
@@ -141,6 +146,20 @@ def test_a_reason_that_is_empty_multi_line_or_too_long_is_refused(
     )  # fmt: skip
     assert code == 2 and out == "" and "argument --reason" in capsys.readouterr().err  # argparse
     assert stores.changes.decided == [] and stores.queue.jobs == []
+
+
+def test_a_reason_that_looks_like_a_secret_is_never_stored(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stores = FakeStores(FakeChanges())
+    use(monkeypatch, stores)
+    code, _, _ = run(
+        "changes", "reject", str(uuid.uuid4()), "--gate", "PLAN", "--sha256", "f" * 64,
+        "--reason", 'the password: "hunter2-secret-value"',
+    )  # fmt: skip
+    err = capsys.readouterr().err
+    assert code == 2 and "looks like a secret" in err and "hunter2" not in err
+    assert stores.changes.decided == []
 
 
 def test_approve_takes_no_reason(monkeypatch: pytest.MonkeyPatch) -> None:

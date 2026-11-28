@@ -28,7 +28,10 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 ACTOR = re.compile(r"[a-z]{2,16}:[A-Za-z0-9_.@-]{1,64}")
 REASON_MAX = 500
-REASON = re.compile(rf"[^\x00-\x1f\x7f]{{1,{REASON_MAX}}}")  # one line, no control characters
+# One line of printable text: no C0/C1 controls, no zero-width, bidi-override or isolate marks and
+# no line or paragraph separators (they could reorder or hide text in a Jira comment).
+_UNSAFE = r"\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069\ufeff"
+REASON = re.compile(rf"[^{_UNSAFE}]{{1,{REASON_MAX}}}")
 S = AttemptStatus
 
 

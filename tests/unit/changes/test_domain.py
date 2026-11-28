@@ -139,7 +139,7 @@ def test_a_rejection_may_carry_a_bounded_single_line_reason() -> None:
     no = a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP, reason="wrong module")
     assert no.reason == "wrong module"
     assert a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP).reason is None
-    for bad in ("", "two\nlines", "x" * 501):
+    for bad in ("", "two\nlines", "x" * 501, "c1\x9fx", "rtl\u202ex", "zw\u200dx", "\u2069"):
         with pytest.raises(ChangeValidationError, match="reason_invalid"):
             a.decide(ApprovalGate.PLAN, A, ApprovalDecision.REJECTED, OP, reason=bad)
     with pytest.raises(ChangeValidationError, match="reason_invalid"):  # approvals carry none
