@@ -12,6 +12,9 @@ is a no-op; the worker is SIGKILLed in the middle of the resume job (inside the 
 sandbox running) and a restarted worker completes that same job once; the final resume message is
 deleted out of band and the sweep re-sends it; the planning run's checkpoint is over 400 KB and is
 offloaded to S3 and read back intact by a fresh saver. A second test sends poison messages to the DLQ.
+A third runs a two-repository Story in manual approval mode: both children pause at their plan gates,
+are approved through the CLI, finish through their RESUME jobs, and the parent completes with one
+aggregated Jira comment (two repositories behind one fake App installation, `MultiHub`).
 
 Nothing reaches the network: Jira and GitHub are mock transports, the model is scripted, AWS is Floci
 on a loopback endpoint with dummy credentials. DynamoDB request units are measured
@@ -35,9 +38,11 @@ from typing import Any
 import httpx
 import pytest
 
+from ai_code_change_agent import composition
 from ai_code_change_agent.agents.coding.agent import CodingAgent
 from ai_code_change_agent.agents.coding.configuration import AgentPhase
 from ai_code_change_agent.application.jobs.queue import JobStatus
+from ai_code_change_agent.application.multirepo.models import ChildStatus, ParentStatus
 from ai_code_change_agent.cli.main import main as cli_main
 from ai_code_change_agent.composition import (
     WorkerApp,
@@ -50,11 +55,13 @@ from ai_code_change_agent.core.config import Settings, get_settings
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.execution.docker.sandbox import DockerSandbox, SandboxLimits
 from ai_code_change_agent.integrations.aws import AwsClients
+from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
 from ai_code_change_agent.main import create_app
 from ai_code_change_agent.orchestration.langgraph.checkpointer import (
     CHECKPOINT_S3_PREFIX,
     dynamodb_checkpointer,
 )
+from ai_code_change_agent.persistence.dynamodb.multirepo_store import DynamoMultiRepoStore
 from ai_code_change_agent.persistence.dynamodb.usage_store import DynamoUsageStore
 from tests.e2e import capacity
 from tests.e2e.conftest import Resources, docker
@@ -67,6 +74,8 @@ from tests.e2e.world import (
     PROJECT,
     REPO_FILES,
     REPO_ID,
+    FakeJira,
+    MultiHub,
     World,
     build_world,
     dump,
@@ -74,8 +83,14 @@ from tests.e2e.world import (
     install,
     make_settings,
     planning_script,
+    public_key,
     settings_document,
+    tool_turn,
 )
+from tests.e2e.world import PLAN as PLAN_DOC
+from tests.e2e.world import REPORT as REPORT_DOC
+from tests.support import jira_rest
+from tests.support.fake_github import FakeGitHub
 from tests.support.github_repos import commit
 from tests.support.jira import body_bytes, headers
 from tests.support.models import ScriptedChatModel
@@ -471,3 +486,207 @@ async def test_poison_messages_go_to_the_dlq_and_the_worker_keeps_running(rig: R
         await until(dead_lettered, "both poison messages in the DLQ", 60)
         assert app.worker is not None
     assert rig.jobs() == []  # nothing was created or run for them
+
+
+# ---- multi-repository Story, manual approval ---------------------------------------------------
+WEB_REPO_ID = 424243
+MULTI_STORY = (
+    "Change the greeting in both services.",
+    "Repository: acme/shop-service",
+    "Repository: acme/web-app",
+    "Acceptance criteria:",
+    "- greet returns Goodbye",
+)
+
+
+def small_planning_script(child: int) -> list[Any]:
+    """Planning without the 450 KB read (the offload is covered by the pipeline test). Every turn
+    has its own provider message id: the usage ledger is idempotent per message id."""
+    return [
+        tool_turn("read_file", {"file_path": "/workspace/app/greeting.py"}, 10 * child + 1),
+        tool_turn("ImplementationPlan", PLAN_DOC, 10 * child + 2),
+    ]
+
+
+def child_implementation_script(child: int) -> list[Any]:
+    edit = {
+        "file_path": "/workspace/app/greeting.py",
+        "old_string": "'Hello'",
+        "new_string": "'Goodbye'",
+    }
+    return [
+        tool_turn("edit_file", edit, 10 * child + 3),
+        tool_turn("ImplementationReport", REPORT_DOC, 10 * child + 4),
+    ]
+
+
+async def seed_web_app(rig: Rig) -> None:
+    svc = build_registry_service(rig.settings, rig.inspect)
+    actor = "cli:e2e"
+    await svc.register_repository(
+        new_repo("web-app", pid=str(WEB_REPO_ID), owner="acme", name="web-app",
+                 ref="app-installation:22"),
+        actor=actor,
+    )  # fmt: skip
+    await svc.create_version("web-app", {**PROFILE, "repository_key": "web-app"}, actor=actor)
+    await svc.publish_version("web-app", 1, actor=actor)
+    await svc.map_project(PROJECT, "web-app", actor=actor)
+    await svc.enable("web-app", actor=actor)
+
+
+async def test_a_multi_repository_story_in_manual_mode_completes_its_parent_once(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two child repositories, each paused at its plan gate, approved through the CLI (plan, then
+    final); the children finish through their RESUME jobs and the parent completes with one
+    aggregated Jira comment (S2117 fix 1: no parent left RUNNING)."""
+    started = time.monotonic()
+    settings = rig.settings
+    changes = build_change_service(settings, rig.inspect)
+    # two repositories behind one App installation; Jira reporting on, through the fake transport
+    web_bare = rig.res.root / "web.git"
+    commit(web_bare, REPO_FILES)
+    assert settings.github_app_private_key_path is not None
+    web = FakeGitHub(
+        web_bare,
+        public_key=public_key(Path(settings.github_app_private_key_path)),
+        name="web-app",
+        repo_id=WEB_REPO_ID,
+    )
+    shop = rig.world.hub
+    jira = FakeJira(description=MULTI_STORY)
+    model = ScriptedChatModel(
+        script=small_planning_script(1)
+        + small_planning_script(2)
+        + child_implementation_script(1)
+        + child_implementation_script(2)  # 2 children x 2 phases, run in this order
+    )
+    model.profile = {"max_input_tokens": settings.llm_context_tokens}
+    world = World(settings, shop, jira, model, github=MultiHub(shop, web))
+    install(world, monkeypatch.setattr)
+
+    def reporter(s: Settings) -> JiraOutcomeReporter:
+        return JiraOutcomeReporter(
+            enabled=True,
+            base_url=jira_rest.BASE_URL,
+            authenticator=composition._jira_authenticator(s),
+            transport=httpx.MockTransport(jira.handle),
+        )
+
+    monkeypatch.setattr(composition, "build_jira_reporter", reporter)
+    await seed_registry(rig)
+    await seed_web_app(rig)
+
+    # webhook (signed) -> one accepted delivery, the replay is a duplicate
+    app = create_app(settings)
+    body = body_bytes(key=ISSUE_KEY, project=PROJECT, issue_id="10001", summary="Say goodbye")
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://acca.test"
+        ) as api,
+    ):
+        first = await api.post(WEBHOOK, content=body, headers=headers(body))
+        again = await api.post(WEBHOOK, content=body, headers=headers(body))
+    assert first.json()["status"] == "accepted" and again.json()["status"] == "duplicate"
+    intake = rig.job("code_change.intake")
+    request_id = uuid.UUID(json.loads(intake["payload_json"]["S"])["code_change_request_id"])
+    store = DynamoMultiRepoStore(app_table(settings, rig.inspect))
+
+    async def tree() -> Any:
+        found = await store.find_by_request(request_id)
+        return found if found is not None else None
+
+    async def status_of(attempt_id: uuid.UUID) -> AttemptStatus:
+        return (await changes.get_attempt(attempt_id)).status
+
+    async with running_worker(settings):
+        # 1. intake -> parent + two children -> each child runs up to its plan gate
+        async def both_at_plan() -> Any:
+            found = await tree()
+            if found is None or len(found[1]) != 2 or not all(c.attempt_id for c in found[1]):
+                return None
+            for c in found[1]:
+                if await status_of(c.attempt_id) is not AttemptStatus.AWAITING_PLAN_APPROVAL:
+                    return None
+            return found
+
+        parent, children = await until(both_at_plan, "both children at their plan gates", 300)
+        rig.attempts.extend(c.attempt_id for c in children if c.attempt_id)
+
+        async def children_jobs_done() -> bool:
+            kids = [j for j in rig.jobs() if j["kind"]["S"] == "code_change.child"]
+            return len(kids) == 2 and all(j["status"]["S"] == "SUCCEEDED" for j in kids)
+
+        await until(children_jobs_done, "both CHILD jobs SUCCEEDED (children paused)")
+        parent, children = await tree()
+        assert parent.status is ParentStatus.RUNNING
+        assert {c.status for c in children} == {ChildStatus.RUNNING}  # paused at their gates
+        assert jira.comments == []
+
+        # 2. approve each child through the CLI; the RESUME jobs finish it
+        for n, child in enumerate(sorted(children, key=lambda c: c.position)):
+            assert child.attempt_id is not None
+            attempt = await changes.get_attempt(child.attempt_id)
+            assert attempt.plan_sha256
+            await cli("changes", "approve", str(attempt.id), "--gate", "PLAN",
+                      "--sha256", attempt.plan_sha256)  # fmt: skip
+
+            async def at_final(aid: uuid.UUID = attempt.id) -> bool:
+                return await status_of(aid) is AttemptStatus.AWAITING_FINAL_APPROVAL
+
+            await until(at_final, f"child {n} at its final gate", 240)
+            attempt = await changes.get_attempt(attempt.id)
+            assert attempt.manifest_sha256
+            await cli("changes", "approve", str(attempt.id), "--gate", "FINAL",
+                      "--sha256", attempt.manifest_sha256)  # fmt: skip
+
+            async def recorded(cid: uuid.UUID = child.id) -> bool:
+                found = await store.child(cid)
+                return found is not None and found.status is ChildStatus.COMPLETED
+
+            await until(recorded, f"child {n} recorded COMPLETED by its RESUME job", 180)
+            assert await status_of(attempt.id) is AttemptStatus.COMPLETED
+            parent, _ = await tree()
+            if n == 0:  # the other child still waits at its gate: the parent keeps running
+                assert parent.status is ParentStatus.RUNNING and jira.comments == []
+
+        async def parent_reported() -> Any:
+            found = await tree()
+            done = found[0].status is ParentStatus.COMPLETED and found[0].jira_report == "SUCCEEDED"
+            return found if done else None
+
+        parent, children = await until(parent_reported, "the parent COMPLETED and reported")
+
+        async def settled() -> bool:
+            jobs = rig.jobs()
+            return all(j["status"]["S"] == "SUCCEEDED" for j in jobs) and rig.queues_empty()
+
+        await until(settled, "every job SUCCEEDED and both queues empty")
+    elapsed = time.monotonic() - started
+
+    # ---- assertions -----------------------------------------------------------------------------
+    assert parent.status is ParentStatus.COMPLETED
+    assert {c.status for c in children} == {ChildStatus.COMPLETED}
+    assert all(c.pr_url and c.branch for c in children)
+    kinds = sorted(j["kind"]["S"] for j in rig.jobs())
+    assert kinds == [
+        *["code_change.child"] * 2,
+        "code_change.intake",
+        *["code_change.resume"] * 4,
+    ]  # no parent_report retry job: the single report POST succeeded
+    assert len(shop.pulls) == 1 and len(web.pulls) == 1  # one draft PR per repository
+    for hub in (shop, web):
+        (pr,) = hub.pulls.values()
+        head = hub.ref(pr["head"]["ref"])
+        assert pr["draft"] is True and head is not None
+        assert hub.git("show", f"{head}:app/greeting.py").encode() + b"\n" == CHANGED
+    (comment,) = jira.comments  # exactly one Jira comment: the parent's aggregated report
+    text = json.dumps(comment)
+    assert "Execution: COMPLETED" in text and "shop-service" in text and "web-app" in text
+    assert f"aica-report-{parent.id}-r0" in text
+    assert model.script == []  # 2 children x (planning + implementation), each consumed once
+    rows = await DynamoUsageStore(app_table(settings, rig.inspect)).rows(issue_keys=[ISSUE_KEY])
+    assert len(rows) == 8 and {r.record.provider for r in rows} == {LEDGER_PROVIDER}
+    print(f"\nMulti-repository E2E runtime {elapsed:.1f}s; parent {parent.id} COMPLETED")
+    assert elapsed < 900

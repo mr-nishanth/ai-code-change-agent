@@ -16,6 +16,7 @@ The same `install` runs in the SIGKILL subprocess (`tests/e2e/crash_worker.py`).
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +38,7 @@ from ai_code_change_agent.integrations.github.publisher import GitHubAppPublishe
 from ai_code_change_agent.integrations.jira.issues import JiraCloudIssueReader
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
 from tests.support import jira_rest
-from tests.support.fake_github import FakeGitHub
+from tests.support.fake_github import DOWNLOAD_HOST, FakeGitHub
 from tests.support.jira import EVENT, SECRET
 from tests.support.models import ScriptedChatModel
 
@@ -186,27 +187,72 @@ def implementation_script() -> list[AIMessage]:
     ]
 
 
+DESCRIPTION = ("Change the greeting.", "Acceptance criteria:", "- greet returns Goodbye")
+
+
 @dataclass
 class FakeJira:
-    """Serves one synthetic Story through the real Jira client (mock transport)."""
+    """Serves one synthetic Story through the real Jira client (mock transport) and records the
+    comments posted to it (only reached when a test turns Jira reporting on)."""
 
     calls: list[str] = field(default_factory=list)
+    description: tuple[str, ...] = DESCRIPTION
+    comments: list[dict[str, Any]] = field(default_factory=list)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request.url.path)
+        if (
+            request.method == "POST"
+            and request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}/comment"
+        ):
+            self.comments.append(json.loads(request.read())["body"])
+            return jira_rest.json_response({"id": str(10000 + len(self.comments))}, status=201)
         if request.url.path == f"/rest/api/3/issue/{ISSUE_KEY}":
             return jira_rest.json_response(
                 jira_rest.issue_payload(
                     ISSUE_KEY,
                     "10001",
                     summary="Say goodbye",
-                    description=jira_rest.adf(
-                        "Change the greeting.", "Acceptance criteria:", "- greet returns Goodbye"
-                    ),
+                    description=jira_rest.adf(*self.description),
                     project={"id": "100", "key": PROJECT, "name": "Shop"},
                 )
             )
         return jira_rest.json_response({"errorMessages": ["not found"]}, status=404)
+
+
+class MultiHub:
+    """Several `FakeGitHub` repositories behind one App installation and one transport: each
+    request goes to the repository it names (path, repository id, or the token it asks for), so
+    an installation token issued for one repository is refused by the others."""
+
+    def __init__(self, *hubs: FakeGitHub) -> None:
+        self.hubs = hubs
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        return self._target(request).handle(request)
+
+    def _target(self, request: httpx.Request) -> FakeGitHub:
+        path = request.url.path
+        names = {h.name: h for h in self.hubs}
+        ids = {h.repo_id: h for h in self.hubs}
+        if request.url.host == DOWNLOAD_HOST:  # /<owner>/<name>/legacy.tar.gz/<sha>
+            return names.get(path.split("/")[2], self.hubs[0])
+        if hit := re.fullmatch(r"/repos/[^/]+/([^/]+)(?:/.*)?", path):
+            return names.get(hit.group(1), self.hubs[0])
+        if hit := re.fullmatch(r"/repositories/(\d+)", path):
+            return ids.get(int(hit.group(1)), self.hubs[0])
+        if path.endswith("/access_tokens"):
+            wanted = json.loads(request.read() or b"{}")
+            for repo_id in wanted.get("repository_ids") or []:
+                if repo_id in ids:
+                    return ids[repo_id]
+            for name in wanted.get("repositories") or []:
+                if name in names:
+                    return names[name]
+        return self.hubs[0]
 
 
 @dataclass
@@ -215,6 +261,7 @@ class World:
     hub: FakeGitHub
     jira: FakeJira
     model: ScriptedChatModel
+    github: MultiHub | None = None  # several repositories; else `hub` serves the only one
 
 
 def public_key(key_path: Path) -> rsa.RSAPublicKey:
@@ -234,7 +281,7 @@ def build_world(settings: Settings, bare: Path, model: ScriptedChatModel) -> Wor
 def install(world: World, setattr_: Callable[[Any, str, Any], None]) -> None:
     """Swap the composition builders listed in the module docstring (pytest's monkeypatch.setattr in
     tests, builtin setattr in the crash subprocess)."""
-    hub = world.hub
+    hub: FakeGitHub | MultiHub = world.github or world.hub
 
     def jira_reader(settings: Settings) -> JiraCloudIssueReader:
         return JiraCloudIssueReader(
