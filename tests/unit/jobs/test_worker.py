@@ -14,6 +14,7 @@ from ai_code_change_agent.application.jobs.queue import (
     JobStatus,
 )
 from ai_code_change_agent.application.jobs.worker import Worker, backoff_seconds
+from ai_code_change_agent.domain.webhooks.models import PersistenceError
 
 
 class MemoryQueue:
@@ -251,3 +252,86 @@ async def test_claim_dispatcher_and_recording_failures_never_stop_the_worker() -
     stop.set()
     await task
     assert q.claims >= 3 and q.sweeps >= 1
+
+
+class BeatScriptQueue(MemoryQueue):
+    """Heartbeats follow a script: an exception instance is raised, a bool is returned; the last
+    entry repeats once the script runs out."""
+
+    def __init__(self, script: list[bool | Exception]) -> None:
+        super().__init__([job()])
+        self.script = script
+
+    async def heartbeat(self, job_id: uuid.UUID, owner: str, lease_seconds: int) -> bool:
+        self.beats += 1
+        step = self.script[min(self.beats - 1, len(self.script) - 1)]
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+async def test_a_transient_heartbeat_failure_is_retried_and_the_job_completes() -> None:
+    async def medium(j: Job) -> None:
+        await asyncio.sleep(0.2)
+
+    q = BeatScriptQueue([PersistenceError("EndpointConnectionError"), True])
+    await worker(q, {"k.one": medium}, beat=0.02).run_once()
+    assert q.beats >= 3 and len(q.completed) == 1 and q.failed == []
+
+
+async def test_heartbeat_failures_never_escape_into_the_completion_path() -> None:
+    """Regression for the S2116 review probe: every heartbeat raises, the handler finishes well
+    inside the lease, and the job is still completed instead of process() raising."""
+    done = asyncio.Event()
+
+    async def handler(j: Job) -> None:
+        await asyncio.sleep(0.5)
+        done.set()
+
+    q = BeatScriptQueue([PersistenceError("EndpointConnectionError")])
+    await worker(q, {"k.one": handler}, beat=0.05).run_once()  # must not raise
+    assert done.is_set() and q.beats >= 5 and len(q.completed) == 1 and q.failed == []
+
+
+async def test_persistent_heartbeat_failure_gives_up_before_the_lease_expires() -> None:
+    cancelled = asyncio.Event()
+
+    async def slow(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    q = BeatScriptQueue([PersistenceError("ReadTimeoutError")])
+    w = Worker(q, {"k.one": slow}, lease_seconds=1, heartbeat_seconds=0.1)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await w.run_once()  # must not raise
+    elapsed = loop.time() - started
+    assert cancelled.is_set() and elapsed < 1.0  # stopped before the 1 s lease ran out
+    assert q.completed == [] and q.failed == []  # the lease may belong to another worker now
+
+
+async def test_a_lost_lease_records_nothing_even_when_the_handler_swallows_cancel() -> None:
+    async def stubborn(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return  # returns normally after the cancel
+
+    q = MemoryQueue([job()], keep_lease=False)
+    await worker(q, {"k.one": stubborn}, beat=0.01).run_once()
+    assert q.completed == [] and q.failed == []
+
+
+async def test_a_lost_lease_records_no_failure_from_the_handler() -> None:
+    async def fails_on_cancel(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise JobFailedError("too_late") from None
+
+    q = MemoryQueue([job()], keep_lease=False)
+    await worker(q, {"k.one": fails_on_cancel}, beat=0.01).run_once()
+    assert q.completed == [] and q.failed == []

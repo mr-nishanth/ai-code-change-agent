@@ -154,18 +154,24 @@ class Worker:
         try:
             await work
         except _LeaseLost:
-            _log.warning("job_lease_lost", job_id=str(job.id), kind=job.kind)
+            self._lease_lost(job)
             return
         except asyncio.CancelledError:
-            if beat.done() and isinstance(beat.exception(), _LeaseLost):
-                _log.warning("job_lease_lost", job_id=str(job.id), kind=job.kind)
+            if _lost(beat):
+                self._lease_lost(job)
                 return
             raise
         except JobFailedError as exc:
+            if await self._stop_beat(beat):
+                self._lease_lost(job)
+                return
             await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason=exc.code)
             return
         except Exception as exc:  # retryable by default; the code never carries raw messages
+            if await self._stop_beat(beat):
+                self._lease_lost(job)
+                return
             code = exc.code if isinstance(exc, JobRetryableError) else type(exc).__name__
             status = await self._queue.fail(
                 job.id, self.owner, code, retry_in_seconds=retry_delay_seconds(exc, job.attempts)
@@ -180,15 +186,62 @@ class Worker:
             )
             return
         finally:
-            beat.cancel()
-            with contextlib.suppress(asyncio.CancelledError, _LeaseLost):
-                await beat
+            await self._stop_beat(beat)
+        if _lost(beat):  # the lease went while the handler was finishing: not ours to record
+            self._lease_lost(job)
+            return
         if await self._queue.complete(job.id, self.owner):
             _log.info("job_succeeded", job_id=str(job.id), kind=job.kind)
 
+    @staticmethod
+    def _lease_lost(job: Job) -> None:
+        _log.warning("job_lease_lost", job_id=str(job.id), kind=job.kind)
+
+    @staticmethod
+    async def _stop_beat(beat: asyncio.Task[None]) -> bool:
+        """Stop the heartbeat task; nothing it raised escapes. True when it saw the lease lost."""
+        beat.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await beat
+        return _lost(beat)
+
     async def _heartbeat(self, job: Job, work: asyncio.Task[None]) -> None:
+        """Renew the lease every `heartbeat_seconds` until cancelled.
+
+        `False` from the queue means the lease is gone (another worker may own the job): the
+        handler is cancelled and nothing is recorded for it. A failing renewal (a store outage, a
+        timeout, exhausted throttling retries) is logged and retried on the next beat while the last
+        successful renewal still covers it; when the next retry would land after that lease ran
+        out, the worker treats the lease as lost too, so it stops before another worker can claim
+        the job. Nothing raised here reaches the completion path (see `_stop_beat`)."""
+        loop = asyncio.get_running_loop()
+        covered_until = loop.time() + self._lease  # the claim just set the lease
+        failures = 0
         while True:
             await asyncio.sleep(self._beat)
-            if not await self._queue.heartbeat(job.id, self.owner, self._lease):
+            asked_at = loop.time()  # a renewal's lease runs from the request, not the reply
+            try:
+                renewed = await self._queue.heartbeat(job.id, self.owner, self._lease)
+            except Exception as exc:  # transient: retry while the last renewal still holds
+                failures += 1
+                _log.warning(
+                    "job_heartbeat_failed",
+                    job_id=str(job.id),
+                    kind=job.kind,
+                    code=_code(exc),
+                    failures=failures,
+                )
+                if loop.time() + self._beat < covered_until:
+                    continue
+                renewed = False
+            else:
+                if renewed:
+                    covered_until = asked_at + self._lease
+                    failures = 0
+            if not renewed:
                 work.cancel()
                 raise _LeaseLost
+
+
+def _lost(beat: asyncio.Task[None]) -> bool:
+    return beat.done() and not beat.cancelled() and isinstance(beat.exception(), _LeaseLost)
