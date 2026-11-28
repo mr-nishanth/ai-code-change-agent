@@ -69,7 +69,7 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 |---|---|---|---|---|
 | Jira delivery | `DELIVERY#<delivery_id>` | `DELIVERY` | - | `DELIVERY#5b2c...-webhook-17`. Written once with final `processing_result`, `request_id`; TTL `expires_at` (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30 days) |
 | Issue guard | `JIRAISSUE#<jira_issue_id>` | `GUARD` | - | `JIRAISSUE#10042` -> `request_id`. Unique Story |
-| Code change request | `REQ#<rid>` | `REQUEST` | GSI1 `ISSUEKEY#<jira_issue_key>` / `REQ#<created_at>#<rid>` | Status projection, assignment, `row_version`. `status`: RECEIVED until the first attempt, then that attempt's status; BLOCKED when no attempt will start from this intake (it refused the request, or the worker recorded its job DEAD, before any attempt; intake is never re-run, so this is terminal). A job the queue's sweep marks DEAD (`lease_expired_attempts_exhausted`) leaves the request RECEIVED |
+| Code change request | `REQ#<rid>` | `REQUEST` | GSI1 `ISSUEKEY#<jira_issue_key>` / `REQ#<created_at>#<rid>` | Status projection, assignment, `row_version`. `status`: RECEIVED until the first attempt, then that attempt's status; BLOCKED when no attempt will start from this intake (it refused the request, or its job ended DEAD by any path before any attempt, including a worker that died on the last attempt, `lease_expired_attempts_exhausted`; intake is never re-run, so this is terminal). See 8.5 |
 | Attempt | `REQ#<rid>` | `ATT#<aid>` | GSI2 `LIST#ATTEMPT` / `<created_at>#<aid>` | Same attributes as today, plus `request_id` |
 | Attempt pointer | `ATTEMPT#<aid>` | `PTR` | - | Immutable `request_id`, `number`. Cache forever in-process |
 | Agent thread index | `ATTEMPT#<aid>` | `THREAD#<thread_id>` | - | `THREAD#attempt:<aid>:planning:9f3a1c2e` (studio only) |
@@ -93,7 +93,8 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 | Usage, session copy | `USAGE#SES#<session_id>` | `<created_at>#<call_id>` | - | Second immutable copy (both written in one transaction) |
 | LLM call guard | `LLMCALL#<call_id>` | `GUARD` | - | Uniqueness of the call (run) id |
 | Provider message guard | `LLMMSG#<provider_message_id>` | `GUARD` | - | Only when the provider reports an id |
-| Job | `JOB#<jid>` | `JOB` | GSI3 `DISPATCH` (message not sent yet) or `SWEEP` (sent) / `<due_at>#<jid>` while non-terminal | State, attempts, lease, `payload_json`, `last_error` |
+| Job | `JOB#<jid>` | `JOB` | GSI3 `DISPATCH` (message not sent yet) or `SWEEP` (sent) / `<due_at>#<jid>` while non-terminal; `DEADHOOK` / `<due_at>#<jid>` while DEAD and its on_dead hook has not run (8.5) | State, attempts, lease, `payload_json`, `last_error`, `dead_hook_failures` |
+| Jira report | `JIRAREPORT#<report_id>` | `REPORT` | GSI3 `REPORTDUE` / `<due_at>#<report_id>` while not settled; GSI2 `LIST#JIRAREPORT` / `<created_at>#<report_id>` | One app-posted Jira comment (`attempt-<aid>`, `intake-<rid>`): `issue_key`, `text` (as posted, with its marker line), `content_sha256`, `state` PENDING / IN_PROGRESS / POSTED / FAILED_PERMANENT, `attempts` (delivery rounds), `next_retry_at`, `last_error` (a code), `comment_id`, `claimed_at` + `claim_token`, `row_version`; `expires_at` once settled (8.6) |
 | Job dedupe guard | `JOBKEY#<dedupe_key>` | `GUARD` | - | `JOBKEY#code_change.child:<cid>:2` -> `job_id`. Permanent |
 
 The change aggregate of one Story is a single item collection: `Query PK=REQ#<rid>` returns the request,
@@ -140,7 +141,7 @@ optimistic race. `CodeChangeService` and `RepositoryRegistryService` retry the w
 |---|---|---|---|---|---|
 | GSI1 | `GSI1PK`, `GSI1SK` | KEYS_ONLY | Request (`ISSUEKEY#`), mapping (`REPOMAPS#`) | U3 issue -> request ids (from the index keys alone); R17 by repository (display: keys, then an eventual `BatchGetItem`) | Eventual. Requests exist long before a cost query; display only for mappings. Authorisation never uses a GSI |
 | GSI2 | `GSI2PK`, `GSI2SK` | INCLUDE `entity_type`, `entity_id` | `LIST#REPOSITORY`, `LIST#MAPPING`, `LIST#AUDIT`, `LIST#ATTEMPT` | R5, R17 (no filter), R19 (filters on the two projected attributes), studio S1; keys, then an eventual `BatchGetItem` | Eventual; operator and studio listings |
-| GSI3 | `GSI3PK`, `GSI3SK` | KEYS_ONLY | Non-terminal jobs: `DISPATCH` (outbox, not sent) or `SWEEP` (sent) / `<due_at>#<jid>` | Relay (`DISPATCH`) and sweep (`SWEEP`) (J8) | Eventual; each hit is re-checked with a consistent `GetItem` |
+| GSI3 | `GSI3PK`, `GSI3SK` | KEYS_ONLY | Non-terminal jobs: `DISPATCH` (outbox, not sent) or `SWEEP` (sent) / `<due_at>#<jid>`; DEAD jobs whose hook has not run: `DEADHOOK`; unsettled Jira reports: `REPORTDUE` / `<due_at>#<report_id>` | Relay (`DISPATCH`), sweep (`SWEEP`) (J8), dead-job hooks (`DEADHOOK`, 8.5), report retries (`REPORTDUE`, 8.6) | Eventual; each hit is re-checked with a consistent read before anything is done |
 
 No LSIs (they would cap item collections at 10 GB and must be created with the table). No index projects
 ALL: an index stores (and is written for) only what a listing needs to find its items, see section 13.
@@ -148,7 +149,7 @@ ALL: an index stores (and is written for) only what a listing needs to find its 
 ## 7. TTL, item size, hot partitions, pagination
 
 **TTL.** Attribute `expires_at` on `acca-app`. Set on terminal job items (`SUCCEEDED`/`DEAD`;
-retention 90 days) and on Jira delivery records (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30
+retention 90 days), on settled Jira reports (POSTED / FAILED_PERMANENT, 90 days) and on Jira delivery records (`ACCA_JIRA_DELIVERY_RETENTION_DAYS`, default 30
 days: Jira redelivers within hours, and the permanent Story guard keeps a late redelivery from creating
 anything). Never set on domain records, the usage ledger, the audit log or dedupe guards
 (`JIRAISSUE#`, `JOBKEY#`, `LLMCALL#`, `LLMMSG#` stay forever). The checkpoint table uses the
@@ -192,13 +193,14 @@ is claimable again while `attempts < max_attempts`, otherwise it becomes `DEAD`
 | Relay (J8) | `Query GSI3 DISPATCH` for due rows, one consistent `BatchGetItem` re-read | `SendMessage`, then move the job from `DISPATCH` to `SWEEP` (the outbox entry is cleared). Runs as the dispatcher role inside the existing worker deployment (its own loop in the worker
 process) every `JOB_RELAY_SECONDS` (default 30 s; only a fallback, producers send right after commit) |
 | Claim (J2) | Conditional `UpdateItem` (same predicate as `_CLAIM`), `ALL_NEW` | `ReceiveMessage` (`WaitTimeSeconds` 20, `VisibilityTimeout` = lease, `MaxNumberOfMessages` 1 per free slot) |
-| Not claimable | Read the item | Terminal -> `DeleteMessage`; not due -> `ChangeMessageVisibility(available_at - now)`; leased elsewhere -> visibility = remaining lease; exhausted and expired -> mark DEAD, `DeleteMessage` |
+| Not claimable | Read the item | Terminal -> `DeleteMessage`; not due -> `ChangeMessageVisibility(available_at - now)`; leased elsewhere -> visibility = remaining lease; exhausted and expired -> mark DEAD (`lease_expired_attempts_exhausted`, GSI3 `DEADHOOK` due now: no worker ran its hook), `DeleteMessage` |
 | Heartbeat (J4) | Conditional lease extension (owner, RUNNING, not expired). A condition failure means the lease is lost: the worker cancels the handler and records nothing. A failing call (outage, timeout, throttling) is logged (`job_heartbeat_failed`) and retried every beat while the last renewal still covers the next retry; after that the worker treats the lease as lost and stops before another worker can claim the job. Each call has its own timeout, ending a safety margin (min(5 s, lease/10)) before the last renewal runs out: a call that has not answered by then (`job_heartbeat_timeout`) is a lost lease too, so a hung call can never outlive the lease. Only that deadline's expiry counts: a `TimeoutError` raised by the call itself is an ordinary failed call. The renewal uses its own clients (`AwsClients.dynamodb_heartbeat` / `sqs_heartbeat`, `heartbeat_config`: connect 2 s + read 3 s, one botocore attempt, no table-level retry), so a call the worker abandoned at the deadline, which keeps running in its thread, ends within about one margin. Residual: such a call can still succeed late; it then extends only this worker's own lease (the condition names this owner, so it can never take over a job another worker claimed) and the job is redelivered after that lease, never run twice at once | `ChangeMessageVisibility(lease)`; failure is non-fatal (DynamoDB decides) |
 | Complete (J5) | Conditional SUCCEEDED, `expires_at` set | `DeleteMessage` |
 | Fail, retry (J6) | Conditional QUEUED, `available_at = now + retry` (le 900 s) | `ChangeMessageVisibility(retry)` on the same message: no new message, no outbox row |
-| Fail, dead | Conditional DEAD | `DeleteMessage` |
+| Fail, dead | Conditional DEAD; the job moves to GSI3 `DEADHOOK` (due after a 60 s grace: this worker runs the hook at once) | `DeleteMessage` |
 | Worker crash | Lease expires | Visibility expires with the lease; the next receiver's conditional claim succeeds (`attempts + 1`), as today |
-| Lost or dead-lettered message for a live job | Sweep (every `JOB_SWEEP_SECONDS`, default 300 s, at least the relay interval) queries GSI3 `SWEEP` (non-terminal, sent) and, after one consistent `BatchGetItem` re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. Terminal transitions `REMOVE` the GSI3 keys |
+| Lost or dead-lettered message for a live job | Sweep (every `JOB_SWEEP_SECONDS`, default 300 s, at least the relay interval) queries GSI3 `SWEEP` (non-terminal, sent) and, after one consistent `BatchGetItem` re-read, picks jobs whose `available_at` (QUEUED) or lease (RUNNING) passed by more than a grace period (default 300 s) and that were not re-sent within it | Re-send, `dispatched_at` = now. SUCCEEDED `REMOVE`s the GSI3 keys; DEAD moves them to `DEADHOOK` |
+| Shutdown (SIGINT/SIGTERM) | `release_lease`: conditional on RUNNING + owner, `lease_expires_at` = now (with `attempts - 1` for a job claimed after stop, whose handler never started) | `ChangeMessageVisibility(0)`: the next receiver reclaims it at once |
 
 ### 8.3 Outbox evaluated
 
@@ -224,6 +226,48 @@ process) every `JOB_RELAY_SECONDS` (default 30 s; only a fallback, producers sen
 6. **Limits**: `DelaySeconds` le 900 and visibility le 43,200 s (AWS). The 900 s backoff cap
    (`worker.py:26`) fits exactly; `job_lease_seconds` le 3,600 (`core/config.py:186`). Settings must keep
    lease le 43,200 because Floci does not enforce it (section 10.2).
+
+### 8.5 Dead jobs: every DEAD path runs the job kind's hook
+
+A job ends DEAD on two paths: the worker's own `fail` (a permanent error, or the last attempt), or a
+claim that finds the last attempt's lease expired (its worker died; the sweep re-sends a message for
+such a job, see below). Both writes set `last_error` and move the job to GSI3 `DEADHOOK`. The worker
+that recorded the failure runs the kind's `on_dead` hook at once; the dispatcher lists due
+`DEADHOOK` jobs on every relay tick (`dead_pending`, `job_dead_recovered` in the log) and runs the
+hook for the rest. After the hook the job leaves GSI3 (`dead_settled`); a hook that raises is listed
+again after 300 s, at most 5 times (`dead_hook_failures`, then `job_dead_hook_abandoned`). Hooks are
+idempotent (conditional writes), so an overlap of the two paths changes nothing twice:
+
+| Kind | Hook |
+|---|---|
+| `code_change.intake` | No attempt: the request becomes BLOCKED and, when the hook blocked it (not a refusal, which reported itself), Jira gets one "could not start" comment with the code (report `intake-<rid>`). An attempt was started: as for resume. A multi-repository parent exists: it advances |
+| `code_change.resume` | The attempt becomes FAILED (`job_attempts_exhausted`), releasing its active guard, and is reported once (`attempt-<aid>`); REPORTING completes through the report step instead (its pull request exists). An old child attempt reports nothing alone |
+| `code_change.child` | Its attempt as above, then `Coordinator.child_finished` (the parent advances, finishes and reports once); a child without an attempt becomes FAILED and its parent advances |
+
+A late worker (its lease was lost) cannot undo this: `complete`/`fail`/`heartbeat`/`release_lease`
+are conditional on RUNNING and its `lease_owner`, and terminal attempts never change.
+
+**DLQ.** A message moves to the DLQ after `maxReceiveCount` receives without a delete, whatever the
+job's state; its body is still `{"job_id": ...}`. A job that is QUEUED or RUNNING when that happens is
+not lost: it stays in GSI3 `SWEEP`, and the sweep re-sends a message once it is overdue by the grace
+period; that message's claim either runs the job (attempts left) or records it DEAD (exhausted) and
+the hook runs. A DLQ message of a terminal job, redriven or duplicated, is deleted by the claim and
+runs nothing. `ai-code-change jobs dlq` peeks at the DLQ (job id, kind, status, attempts, last error)
+without removing anything.
+
+### 8.6 Jira reports (durable reporting)
+
+Every app-posted comment (single-repository outcome, intake refusal, dead intake) is a `JIRAREPORT#`
+item written before the POST (`attribute_not_exists`: one report per id). Delivery: a conditional
+claim (`PENDING` and due, or `IN_PROGRESS` older than 300 s: a crashed poster) sets `IN_PROGRESS`,
+`claim_token`, `attempts + 1` and `GSI3SK` = claim + 300 s; one round posts up to 3 times
+(429 waits `Retry-After` up to 10 s, else 1 s, 2 s with jitter); `finish` is conditional on the
+token: POSTED or FAILED_PERMANENT (400/401/403/404, or 6 rounds used: `retries_exhausted:<code>`)
+remove the GSI3 keys; a transient round sets `PENDING`, `next_retry_at` (30 s doubling to 900 s,
++-25 % jitter, at least `Retry-After`) and `last_error`. The worker dispatcher queries `REPORTDUE`
+on every relay tick. The text ends with `Report ID: aica-report-<report_id>`; any POST that might
+repeat an earlier one is preceded by a search of the issue's newest 100 comments for that marker. The
+multi-repository parent keeps its own report state on the parent item (M9-M10, same marker idea).
 
 ## 9. LangGraph checkpointer
 
@@ -449,8 +493,8 @@ makes 10-20 transitions, each saving at least 2 index writes, so the trade pays 
 list is opened many times per attempt (the studio lists on demand; it never polls the list).
 
 **Sparse indexes.** Only these items carry index keys: GSI1 `code_change_request`, `project_mapping`;
-GSI2 `attempt`, `repository`, `project_mapping`, `audit_event`; GSI3 `job` while not terminal (the
-terminal transition removes the keys). Guards, pointers, deliveries, aliases, profile versions,
+GSI2 `attempt`, `repository`, `project_mapping`, `audit_event`, `jira_report`; GSI3 `job` while not
+terminal or DEAD with its hook pending, and `jira_report` while not settled. Guards, pointers, deliveries, aliases, profile versions,
 approvals, threads, parents, children and usage rows carry none (`tests/unit/persistence_dynamodb/
 test_table_schema.py`).
 

@@ -64,7 +64,32 @@ with attempts no worker is running (`changes show <attempt-id>`, job not `RUNNIN
 that container: `docker rm -f $(docker ps -q --filter label=aica.attempt=<attempt-id>)`. Never remove
 a sandbox whose attempt is still running.
 
+A DEAD job no longer leaves its attempt running in the database: its on_dead hook marks the attempt
+FAILED (`job_attempts_exhausted`), so such a sandbox belongs to a FAILED attempt.
+
 Heavy Docker or Floci tests run only when `docker ps --filter label=aica.role=agent-sandbox` is empty.
+
+## Stuck jobs, the DLQ and pending Jira reports
+
+```bash
+uv run ai-code-change jobs dlq                    # peek: job id, kind, status, attempts, last error
+uv run ai-code-change reports list --state PENDING           # reports waiting for a retry
+uv run ai-code-change reports list --state FAILED_PERMANENT  # reports Jira refused or retries ran out
+uv run ai-code-change reports show attempt-<attempt-id>      # one report (never its text)
+```
+
+- `jobs dlq` never removes a message. A DLQ message of a job that is still QUEUED or RUNNING needs no
+  action: the worker's sweep re-sends a message for that job once it is overdue, and the claim either
+  runs it or records it DEAD. A DLQ message of a terminal job (SUCCEEDED or DEAD) can be redriven or
+  purged safely; the claim deletes it and runs nothing.
+- Worker log events: `job_claimed`, `job_succeeded`, `job_failed` (retry scheduled), `job_dead`
+  (with `reason`), `job_dead_recovered` (a DEAD job found by the dispatcher, hook run now),
+  `job_dead_hook_failed` / `job_dead_hook_abandoned`, `job_lease_released` and
+  `job_shutdown_cancelled` (shutdown), `jira_report_retry_scheduled`, `jira_report_posted`,
+  `jira_report_failed_permanent`. Identifiers and codes only, never payloads, Story or comment text.
+- A worker stops on SIGINT or SIGTERM within one SQS long poll (at most 20 s) plus a 30 s grace for a
+  running job; a second signal cancels the job at once. Either way its lease is released, so a restarted
+  worker resumes it immediately.
 
 ## lazydocker (terminal UI)
 
