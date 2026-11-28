@@ -672,4 +672,9 @@ def _code(exc: ClientError | BotoCoreError) -> str:
     return type(exc).__name__
 
 
-__all__ = ["EXHAUSTED", "DynamoSqsJobQueue"]
+def job_id_of_message(body: object) -> uuid.UUID | None:
+    """The job id a queue (or DLQ) message names, or None for anything else."""
+    return _job_id(body)
+
+
+__all__ = ["EXHAUSTED", "DynamoSqsJobQueue", "job_id_of_message"]

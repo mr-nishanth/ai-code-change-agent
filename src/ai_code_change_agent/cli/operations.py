@@ -16,6 +16,7 @@ import uuid
 from typing import TextIO
 
 from ai_code_change_agent.application.artifacts.redaction import find_secrets
+from ai_code_change_agent.application.jira.reports import ReportRecord, ReportState
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
@@ -27,6 +28,8 @@ from ai_code_change_agent.domain.changes.models import (
     ApprovalGate,
 )
 from ai_code_change_agent.orchestration.intake import RESUME
+from ai_code_change_agent.persistence.dynamodb.job_queue import job_id_of_message as dlq_job_id
+from ai_code_change_agent.persistence.dynamodb.keys import job as job_key
 
 _log = get_logger("worker")
 
@@ -34,6 +37,17 @@ _log = get_logger("worker")
 def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     worker = top.add_parser("worker", help="run the job worker (trusted host process)")
     worker.add_argument("--once", action="store_true", help="process at most one job and exit")
+    reports = top.add_parser("reports", help="inspect durable Jira reports (pending, failed)")
+    rsub = reports.add_subparsers(dest="command", required=True)
+    rlist = rsub.add_parser("list", help="the newest reports and their delivery state")
+    rlist.add_argument("--state", choices=[s.value for s in ReportState])
+    rlist.add_argument("--limit", type=int, default=20)
+    rshow = rsub.add_parser("show", help="one report (never its comment text)")
+    rshow.add_argument("report_id")
+    jobs = top.add_parser("jobs", help="inspect the job queue")
+    jsub = jobs.add_subparsers(dest="command", required=True)
+    dlq = jsub.add_parser("dlq", help="peek at dead-lettered messages and their jobs")
+    dlq.add_argument("--max", type=int, default=10, choices=range(1, 11), metavar="1..10")
     costs = top.add_parser("costs", help="print LLM API cost reports from the usage ledger")
     costs.add_argument("--issue", action="append", default=[], help="Jira issue key (repeatable)")
     costs.add_argument("--attempt", type=uuid.UUID, action="append", default=[])
@@ -165,6 +179,66 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
     )
 
 
+async def _reports(args: argparse.Namespace, out: TextIO) -> None:
+    """Delivery state of app-posted Jira comments (DurableJiraReporter); never the text."""
+    store = CliStores(get_settings()).reports()
+    if args.command == "show":
+        record = await store.get(args.report_id)
+        if record is None:
+            out.write(f"report {args.report_id} not found\n")
+            return
+        out.write(json.dumps(_report_row(record), indent=2) + "\n")
+        return
+    for record in await store.recent(max(1, min(args.limit, 200))):
+        if args.state and record.state.value != args.state:
+            continue
+        row = _report_row(record)
+        out.write(" ".join(f"{k}={v}" for k, v in row.items() if v is not None) + "\n")
+
+
+def _report_row(record: ReportRecord) -> dict[str, object]:
+    def when(moment: object) -> str | None:
+        return moment.isoformat(timespec="seconds") if hasattr(moment, "isoformat") else None
+
+    return {
+        "report_id": record.report_id, "issue": record.issue_key, "state": record.state.value,
+        "attempts": record.attempts, "next_retry_at": when(record.next_retry_at),
+        "last_error": record.last_error, "comment_id": record.comment_id,
+        "sha256": record.content_sha256[:12], "updated_at": when(record.updated_at),
+    }  # fmt: skip
+
+
+async def _jobs(args: argparse.Namespace, out: TextIO) -> None:
+    """`jobs dlq`: what reached the dead-letter queue (job id, and the job's stored state). A peek:
+    the messages stay in the DLQ, visible. A job that is not terminal is recovered by the worker's
+    sweep (it re-sends a message for it); a terminal one needs nothing (a redrive is a no-op)."""
+    stores = CliStores(get_settings())
+    url = await asyncio.to_thread(stores.dlq_url)
+    sqs = stores.aws.sqs
+    attrs = (await asyncio.to_thread(
+        sqs.get_queue_attributes, QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
+    ))["Attributes"]  # fmt: skip
+    out.write(f"dlq messages: {attrs.get('ApproximateNumberOfMessages', '0')}\n")
+    got = await asyncio.to_thread(
+        sqs.receive_message, QueueUrl=url, MaxNumberOfMessages=args.max, WaitTimeSeconds=0,
+        VisibilityTimeout=0, AttributeNames=["ApproximateReceiveCount"],
+    )  # fmt: skip
+    for message in got.get("Messages") or []:
+        job_id = dlq_job_id(message.get("Body"))
+        if job_id is None:
+            out.write("message: not a job message (poison)\n")
+            continue
+        item = await stores.table.get(job_key(job_id))
+        if item is None:
+            out.write(f"job {job_id}: unknown (no job item)\n")
+            continue
+        out.write(
+            f"job {job_id}: kind={item.get('kind')} status={item.get('status')} "
+            f"attempts={item.get('attempts')}/{item.get('max_attempts')} "
+            f"last_error={item.get('last_error') or '-'}\n"
+        )
+
+
 def _line_buffered_output() -> None:
     """The worker is long-running and often redirected to a file: write every line as it is
     printed instead of holding it in a block buffer (as PYTHONUNBUFFERED=1 would)."""
@@ -181,6 +255,10 @@ def run(args: argparse.Namespace, out: TextIO) -> int:
         asyncio.run(_worker(args.once))
     elif args.area == "costs":
         asyncio.run(_costs(args, out))
+    elif args.area == "reports":
+        asyncio.run(_reports(args, out))
+    elif args.area == "jobs":
+        asyncio.run(_jobs(args, out))
     else:
         asyncio.run(_changes(args, out))
     return 0
