@@ -11,6 +11,7 @@ import getpass
 import json
 import re
 import signal
+import sys
 import uuid
 from typing import TextIO
 
@@ -123,8 +124,19 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
     )
 
 
+def _line_buffered_output() -> None:
+    """The worker is long-running and often redirected to a file: write every line as it is
+    printed instead of holding it in a block buffer (as PYTHONUNBUFFERED=1 would)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(Exception):  # a replaced stream that cannot be reconfigured
+                reconfigure(line_buffering=True)
+
+
 def run(args: argparse.Namespace, out: TextIO) -> int:
     if args.area == "worker":
+        _line_buffered_output()
         asyncio.run(_worker(args.once))
     elif args.area == "costs":
         asyncio.run(_costs(args, out))

@@ -1,7 +1,9 @@
 """Operator CLI wiring on DynamoDB, SQS and S3 (unit level; Floci scenarios live in
 `tests/integration/floci/test_cli_dynamo.py`)."""
 
+import argparse
 import io
+import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -195,3 +197,21 @@ def test_the_cli_has_no_sql_database_code() -> None:
         text = path.read_text()
         for word in ("Postgres", "SqlAlchemy", "sqlalchemy", "create_engine", "DATABASE_URL"):
             assert word not in text, (path.name, word)
+
+
+def test_the_worker_writes_its_output_line_by_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker redirected to a log file must not hold lines in a block buffer until exit
+    (observed: empty log files unless PYTHONUNBUFFERED=1)."""
+    out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    assert not out.line_buffering
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    ran: list[bool] = []
+
+    async def worker(once: bool) -> None:
+        ran.append(once)
+
+    monkeypatch.setattr(operations, "_worker", worker)
+    assert operations.run(argparse.Namespace(area="worker", once=True), out) == 0
+    assert ran == [True] and out.line_buffering and err.line_buffering
