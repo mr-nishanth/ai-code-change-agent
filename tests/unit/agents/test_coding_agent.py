@@ -589,3 +589,8 @@ async def test_a_clarification_request_is_returned_as_the_typed_schema(tmp_path:
     model = ScriptedChatModel(script=[call("ImplementationPlan", ask, 1)])
     plan = await CodingAgent(model).plan(STORY, sandbox(tmp_path, False), thread_id="t")
     assert plan.needs_clarification and plan.changes == []
+
+
+def test_the_implementer_is_told_it_cannot_widen_the_plan() -> None:
+    assert "repair cannot widen the plan" in IMPLEMENTATION_SYSTEM
+    assert 'outcome "blocked"' in IMPLEMENTATION_SYSTEM

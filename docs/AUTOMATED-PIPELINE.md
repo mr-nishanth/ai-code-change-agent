@@ -34,6 +34,8 @@ Gate decisions are recorded exactly like operator approvals: bound to the plan o
 
 ## What is checked independently (validation engine)
 
+Before the plan is stored and approved, the platform completes its scope deterministically: an existing file that the plan's own `findings` or `todo` say must change (no negation), or a path named in a `tests` entry (an existing file, or a new `test_*.py`/`*_test.py` module), is added to `changes` with a "added by the platform" purpose when it is missing; protected paths are never added, and the PLAN policy and validation treat the added entries like any other. The implementation prompt forbids touching any other file (a repair cannot widen the plan). A failed validation's Jira comment lists the failed checks with their detail (for example the files outside the approved plan) and the commands that did not pass, never file content or command output.
+
 The rebuilt tree must equal baseline + changes. Also checked: path safety, protected paths, plan scope, change limits and secrets in the diff. Every profile command (re-checked against the command policy) must pass in a fresh, network-less container with the same dependency bundle. **A profile without a test command can never pass** (`profile_defines_no_test_command`). The agent's own report is never an input.
 
 ## Failure, retry and idempotency

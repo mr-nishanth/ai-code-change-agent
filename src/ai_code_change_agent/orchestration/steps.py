@@ -7,6 +7,7 @@ Workspaces never outlive a step: a sandbox is started for one phase and destroye
 
 import asyncio
 import hashlib
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -288,6 +289,62 @@ def dependency_preparation(profile: RepositoryProfile, toolchains: frozenset[str
     return None
 
 
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10}")
+_CHANGE_WORDS = re.compile(
+    r"\b(updat|modif|chang|edit|extend|adjust|fix|add|refactor|rewrit|replac|renam|amend|cover)",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(no|not|never|without|unchanged|untouched)\b|n't\b", re.IGNORECASE)
+_NEW_TEST_FILE = re.compile(r"(?:[\w.-]+/)*(?:test_[\w.-]*|[\w.-]*_test)\.py")
+
+
+def complete_plan_scope(plan: ImplementationPlan, existing: frozenset[str]) -> ImplementationPlan:
+    """Deterministic plan consistency at plan acceptance: a file the plan itself says must change
+    but leaves out of `changes` is added to them, so the approved scope matches the plan's own
+    words (independent validation enforces `changes` and exact `tests` entries only). Sources:
+    paths in `tests` entries, and existing paths in `findings` and `todo` items that say the
+    file changes (no negation). Only safe, unprotected paths; an existing file is modified, a new
+    file only when `tests` names a test module; never a deletion. The policy gate and validation
+    then treat the added entries like any other."""
+    planned = {c.path for c in plan.changes} | set(plan.tests)
+    added: list[dict[str, str]] = []
+
+    def add(path: str, operation: str, field: str) -> None:
+        if path not in planned and len(plan.changes) + len(added) < 100:
+            planned.add(path)
+            purpose = f"added by the platform: the plan's {field} names this file as changing"
+            added.append({"path": path, "operation": operation, "purpose": purpose})
+
+    def paths(text: str) -> list[str]:
+        found = []
+        for token in _PATH_TOKEN.findall(text):
+            try:
+                path = validate_relative_path(token.rstrip("."))
+            except Exception:  # noqa: S112 - not a repository path
+                continue
+            if not is_protected(path):
+                found.append(path)
+        return found
+
+    for field in ("findings", "todo"):
+        for item in getattr(plan, field):
+            if _CHANGE_WORDS.search(item) and not _NEGATION.search(item):
+                for path in paths(item):
+                    if path in existing:
+                        add(path, "modify", field)
+    for item in plan.tests:
+        for path in paths(item):
+            if path in existing:
+                add(path, "modify", "tests")
+            elif _NEW_TEST_FILE.fullmatch(path):
+                add(path, "create", "tests")
+    if not added:
+        return plan
+    data = plan.model_dump()
+    data["changes"] = [*data["changes"], *added]
+    return ImplementationPlan.model_validate(data)
+
+
 def _code(exc: BaseException) -> str:
     code = getattr(exc, "code", None)
     return str(code) if isinstance(code, str) and code else type(exc).__name__.lower()[:64]
@@ -464,6 +521,9 @@ class CodeChangeSteps:
                     ),
                     checkpointer=self._d.agent_checkpointer,
                 )
+                if not plan.needs_clarification:
+                    baseline = await self._d.runtime.manifest(handle, "baseline")
+                    plan = complete_plan_scope(plan, baseline.paths)
             await store_model(
                 self._d.artifacts,
                 self._scope(a),
@@ -987,8 +1047,12 @@ class CodeChangeSteps:
         )
 
     async def _failure_detail(self, a: CodeChangeAttempt) -> str:
-        """Bounded detail lines for the Jira comment: the planner's questions for a Story that
-        needs clarification. Empty for every other outcome."""
+        """Bounded detail lines for the Jira comment: why independent validation failed (failed
+        checks with their fixed detail, commands that did not pass; never file content or command
+        output), or the planner's questions for a Story that needs clarification. Empty for every
+        other outcome."""
+        if (a.failure_code or "").startswith("validation"):
+            return await self._validation_detail(a)
         if a.failure_code != "story_needs_clarification":
             return ""
         latest = await self._latest_optional(a, ArtifactKind.IMPLEMENTATION_PLAN)
@@ -1001,6 +1065,27 @@ class CodeChangeSteps:
             f"- {' '.join(q.split())[:300]}\n" for q in plan.clarification_questions[:10]
         )
         return f"Questions to answer in the Story before a new attempt:\n{questions}"
+
+    async def _validation_detail(self, a: CodeChangeAttempt) -> str:
+        latest = await self._latest_optional(a, ArtifactKind.VALIDATION_REPORT)
+        if latest is None:
+            return ""
+        report = await load_verified(
+            self._d.artifacts, self._scope(a), latest[0], latest[1], ValidationReport
+        )
+        lines = [
+            f"{c.kind.value}: {' '.join((c.detail or c.status.value).split())[:300]}"
+            for c in report.checks
+            if c.status.value == "FAILED"
+        ]
+        lines += [
+            f"command {c.command_id}: {c.status}" + (f" ({c.reason})" if c.reason else "")
+            for c in report.commands
+            if c.status != "PASSED"
+        ]
+        if not lines:
+            return ""
+        return "Validation detail:\n" + "".join(f"- {ln[:320]}\n" for ln in lines[:8])
 
     async def _report_once(self, a: CodeChangeAttempt, issue_key: str, text: str) -> None:
         """One Jira comment per attempt outcome: a JIRA_REPORT artifact marks it as settled, either

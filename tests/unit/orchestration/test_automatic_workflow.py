@@ -18,7 +18,12 @@ from ai_code_change_agent.domain.dependencies.policy import DependencyPolicyErro
 from ai_code_change_agent.execution.docker.process import ProcessResult
 from ai_code_change_agent.integrations.jira.authentication import BasicAuthenticator
 from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
-from ai_code_change_agent.orchestration.steps import AUTOMATIC_ACTOR, CodeChangeSteps, JiraReportDoc
+from ai_code_change_agent.orchestration.steps import (
+    AUTOMATIC_ACTOR,
+    CodeChangeSteps,
+    JiraReportDoc,
+    complete_plan_scope,
+)
 from tests.support import workflow
 from tests.support.changes import python_profile
 from tests.support.workflow import make_rig
@@ -606,3 +611,67 @@ async def test_clarification_questions_in_the_jira_comment_are_bounded(tmp_path:
         workflow.FakeAgent.plan_result = None
     ((_, text),) = rig.reporter.reports
     assert len(text) < 4000 and "- Q0 " in text
+
+
+def test_files_the_plan_itself_names_as_needing_change_join_its_changes() -> None:
+    plan = plan_with(
+        findings=[
+            "tests/test_vehicles_api.py must be updated to cover the new field",
+            "app/config.py must not be changed",
+            "app/models.py defines the Vehicle model",  # no change wording: only context
+            ".github/workflows/ci.yml must be updated as well",  # protected: never added
+        ],
+        todo=["Extend `app/routes.py` with the new endpoint.", "Fix docs/missing.py"],
+        tests=[
+            "Update tests/test_greeting.py with a Goodbye case",
+            "Add tests/test_routes.py for the endpoint",
+            "tests/test_new_api.py",  # an exact entry is already allowed as a test path
+        ],
+    )
+    existing = frozenset(
+        {"app/greeting.py", "tests/test_vehicles_api.py", "app/config.py", "app/models.py",
+         "app/routes.py", "tests/test_greeting.py", ".github/workflows/ci.yml"}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("tests/test_vehicles_api.py", "modify"),
+        ("app/routes.py", "modify"),
+        ("tests/test_greeting.py", "modify"),
+        ("tests/test_routes.py", "create"),
+    ]
+    assert all("added by the platform" in c.purpose for c in done.changes[1:])
+    assert complete_plan_scope(done, existing) == done  # idempotent
+    assert complete_plan_scope(workflow.PLAN, frozenset(workflow.FILES)) == workflow.PLAN
+
+
+async def test_a_test_file_named_only_in_the_findings_may_be_changed(tmp_path: Path) -> None:
+    """Live campaign: the findings said a test file must be updated, the changes omitted it, the
+    agent edited it and validation failed the result as outside the approved plan."""
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    workflow.FakeAgent.plan_result = plan_with(findings=["README.md must be updated too"])
+    rig.agent.edits = [{"app/greeting.py": workflow.GOOD, "README.md": b"# Shop\nGoodbye\n"}]
+    try:
+        assert await run(rig) is S.COMPLETED
+    finally:
+        workflow.FakeAgent.plan_result = None
+    att = await rig.deps.changes.get_attempt(rig.attempt_id)
+    assert att.plan_ref and att.plan_sha256
+    plan = await load_verified(
+        rig.artifacts,
+        CodeChangeSteps._scope(att),
+        att.plan_ref,
+        att.plan_sha256,
+        ImplementationPlan,
+    )
+    assert [c.path for c in plan.changes] == ["app/greeting.py", "README.md"]  # approved by hash
+
+
+async def test_the_jira_comment_says_which_files_were_outside_the_plan(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path, approval_mode="automatic", max_repairs=0)
+    rig.agent.edits = [{"app/greeting.py": workflow.GOOD, "app/extra.py": b"y = 2\n"}]
+    assert await run(rig) is S.FAILED
+    ((_, text),) = rig.reporter.reports
+    assert "Reason: validation_failed" in text
+    assert "plan_scope: outside the approved plan: app/extra.py" in text
+    assert "y = 2" not in text  # never file content or command output

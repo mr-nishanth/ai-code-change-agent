@@ -84,6 +84,10 @@ network-less container:
 2. new behaviour has tests, and every validation command listed below passes when you run it
    from /workspace exactly as written;
 3. no secrets, tokens or credentials appear in any file.
+SCOPE: never create, modify or delete a file that is not in the plan's `changes` (a test file
+may also be one listed exactly in its `tests`), even when the plan's findings or the Story
+suggest it. Validation fails such a result and a repair cannot widen the plan, so if the work
+needs another file, stop and report outcome "blocked" naming that file.
 If the plan turns out to be impossible, stop and report outcome "blocked" with the reason.
 Repair failures within your budget, inspect your final diff, then return the structured
 implementation report."""
