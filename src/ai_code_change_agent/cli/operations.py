@@ -18,6 +18,7 @@ from typing import TextIO
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
+from ai_code_change_agent.core.logging import configure_logging
 from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
 from ai_code_change_agent.orchestration.intake import RESUME
 
@@ -51,7 +52,10 @@ def _actor() -> str:
 
 
 async def _worker(once: bool) -> None:
-    async with worker_app(get_settings()) as app:
+    settings = get_settings()
+    # the API configures this in main.py; the worker is its own process and must do it too
+    configure_logging(settings.log_level, json_output=settings.log_json)  # redacts secret keys
+    async with worker_app(settings) as app:
         try:
             if once:
                 await app.worker.run_once()

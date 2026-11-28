@@ -2,20 +2,26 @@
 `tests/integration/floci/test_cli_dynamo.py`)."""
 
 import argparse
+import asyncio
+import contextlib
 import io
+import json
 import sys
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import structlog
 
 from ai_code_change_agent.application.multirepo.coordinator import MultiRepoBlockedError
 from ai_code_change_agent.cli import main as cli_main
 from ai_code_change_agent.cli import operations
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.core.config import Settings
+from ai_code_change_agent.core.logging import REDACTED, get_logger
 from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
 from ai_code_change_agent.domain.webhooks.models import PersistenceError
 from ai_code_change_agent.execution.s3_artifacts import S3ArtifactStore
@@ -215,3 +221,30 @@ def test_the_worker_writes_its_output_line_by_line(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(operations, "_worker", worker)
     assert operations.run(argparse.Namespace(area="worker", once=True), out) == 0
     assert ran == [True] and out.line_buffering and err.line_buffering
+
+
+def test_the_worker_configures_redacting_logs_before_it_runs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    structlog.reset_defaults()  # what a fresh process has: no redaction processor
+    settings = local().model_copy(update={"log_level": "INFO", "log_json": True})
+    monkeypatch.setattr(operations, "get_settings", lambda: settings)
+
+    class Worker:
+        async def run_once(self) -> None:
+            get_logger("worker").info("job_started", api_token="abc123secret", job="j1")
+
+    class Costs:
+        async def print_session_summary(self) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def worker_app(_settings: Settings) -> AsyncIterator[Any]:
+        yield SimpleNamespace(worker=Worker(), costs=Costs())
+
+    monkeypatch.setattr(operations, "worker_app", worker_app)
+    asyncio.run(operations._worker(once=True))
+    out = capsys.readouterr().out
+    line = json.loads(next(ln for ln in out.splitlines() if "job_started" in ln))
+    assert line["api_token"] == REDACTED and line["job"] == "j1"
+    assert "abc123secret" not in out
