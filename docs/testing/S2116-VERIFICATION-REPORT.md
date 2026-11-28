@@ -218,3 +218,85 @@ Before: 2026-11-27T23:45:14Z. After: 2026-11-28T00:00:43Z.
   replaying the same script twice into one table. It is not a product behaviour change.
 - Docker-backed Floci services (ECR images, ECS, RDS, Lambda) cannot work on the verify Floci, because
   it has no Docker socket. The application does not use them.
+
+## S2117 re-run (2026-11-28)
+
+The same procedure, repeated on `feature/dynamodb-aws-alignment` HEAD `fb00fa1` (2026-11-28 04:27-04:32 UTC),
+next to the running local stack, which was not touched. Same compose project (`acca-verify`), override
+and isolation; a fresh random 64-hex `JIRA_WEBHOOK_SECRET` (`<synthetic>`); every process under `env -i`
+with only the variables shown; no `.env` in the worktree; no real model, Jira, GitHub or AWS call.
+
+| Check | Result |
+|---|---|
+| `$DC config`: floci `127.0.0.1:4577`, api `127.0.0.1:18000`, network `acca-verify`, volume `acca_verify_floci_data`, no `docker.sock`, no `:latest` | yes |
+| Verify Floci up + bootstrap on `http://127.0.0.1:4577` | healthy; `bootstrap complete` (queues + DLQ, buckets, tables + TTL) |
+| `acca-verify-api` (`acca-verify-api:s2116-verify`) network `acca-verify` only, no mounts, `ro=true`, `capdrop=[ALL]`; `acca-postgres` on `ai-code-change-agent_default` | yes |
+| `DATABASE_URL` in the API container | not set (env: `ACCA_AWS_ENDPOINT_URL`, `ACCA_DYNAMODB_TABLE_NAME`, `APP_ENV` only) |
+| `python -c "import psycopg"` / `"import sqlalchemy"` in the container | `ModuleNotFoundError` / `ModuleNotFoundError` (exit 1) |
+| `acca-postgres:5432` from the container | `socket.gaierror: [Errno -2] Name or service not known` |
+| `/health/live`, `/health/ready` | 200 `{"status":"alive",...}`, 200 `{"status":"ready","dependencies":{"dynamodb":true}}` |
+| Signed webhook `SHOP-1` / same delivery again / bad signature / `SHOP-2` | 200 `accepted` / 200 `duplicate` / 401 / 200 `accepted` |
+| Items after `SHOP-1` | `DELIVERY#verify-delivery-0001`, `JIRAISSUE#10001` guard, `JOBKEY#...` guard, `JOB#23dd9558-...` `code_change.intake QUEUED GSI3PK=DISPATCH`, `REQ#eefd6bbc-...` `RECEIVED` (+ registry items) |
+| Worker, `DATABASE_URL` unset | intake `SUCCEEDED`; attempt `f4fea4b7-...` `AWAITING_PLAN_APPROVAL`; runner wall time 7.9 s |
+| Worker, `DATABASE_URL=postgresql://127.0.0.1:1/none` exported | ignored; intake `SUCCEEDED`; attempt `eee995ef-...` `AWAITING_PLAN_APPROVAL`; 8.0 s |
+| `grep -rnEi 'psycopg\|sqlalchemy\|alembic\|DATABASE_URL' src/` | no matches (exit 1) |
+| Teardown `-p acca-verify down -v --rmi local` | containers, network, volume, image removed; 4577 and 18000 free; no verify runner left |
+| Live runtime before/after | identical (below) |
+
+Worker runs (scratchpad runner, not committed; same design as S2116: `tests/e2e/world.py` fakes installed
+with `install(world, setattr)`, a `FakeJira` subclass serving `SHOP-<n>`, `FakeGitHub` over a local bare
+repository, scripted planning model, then the real `ai_code_change_agent.cli.main.main(["worker"])`;
+a watcher thread sends SIGINT once a new attempt reaches the plan gate):
+
+```text
+env -i PATH=... HOME=$HOME APP_ENV=development ACCA_AWS_ENDPOINT_URL=http://127.0.0.1:4577 \
+  PYTHONPATH=<worktree> VERIFY_SCRATCH=<scratch> LOG_JSON=false \
+  HTTP(S)_PROXY=http://127.0.0.1:9 NO_PROXY=127.0.0.1,localhost \
+  uv run python <scratch>/verify_runner.py worker 1           # the runner fills the world.py settings
+                                                              # (dummy key sk-test-never-used, fake Jira/GitHub)
+verify-runner: DATABASE_URL unset | endpoint http://127.0.0.1:4577
+[info] job_dispatcher_sent   count=1 step=dispatch_pending
+[info] jira_request          operation=get_issue status=200          (mock transport, twice)
+[info] workspace_created     attempt_id=f4fea4b7-... files=4
+[info] job_succeeded         job_id=23dd9558-... kind=code_change.intake
+status: {"attempt": "f4fea4b7-...", "status": "AWAITING_PLAN_APPROVAL", "plan_sha256": "cda03dda...", "base_commit": "98948f50..."}
+verify-runner: worker exit 0 | model turns left 0 | jira calls ['/rest/api/3/issue/SHOP-1', '/rest/api/3/issue/SHOP-1']
+
+... DATABASE_URL=postgresql://127.0.0.1:1/none uv run python <scratch>/verify_runner.py worker 2
+verify-runner: DATABASE_URL set (ignored) | endpoint http://127.0.0.1:4577
+[info] job_succeeded         job_id=a304dafd-... kind=code_change.intake
+status: {"attempt": "eee995ef-...", "status": "AWAITING_PLAN_APPROVAL", "plan_sha256": "cda03dda...", "base_commit": "98948f50..."}
+verify-runner: worker exit 0 | model turns left 0 | jira calls ['/rest/api/3/issue/SHOP-2', '/rest/api/3/issue/SHOP-2']
+```
+
+State afterwards: both intake jobs `SUCCEEDED` and out of the outbox index; both requests and attempts
+`AWAITING_PLAN_APPROVAL`; job queue and DLQ 0/0; 190 checkpoint items; plan and workspace artifacts under
+`s3://acca-local-artifacts/artifacts/<request>/<attempt>/`; each planning checkpoint write offloaded to S3
+(`checkpoints/attempt:...:planning:.../writes/.../0`, 450,415 bytes); 0 agent sandboxes before, between
+and after the runs.
+
+Live runtime, before 2026-11-28T04:27:39Z, after 2026-11-28T04:31:59Z:
+
+| Item | Before | After |
+|---|---|---|
+| `acca-api` | running, started 2026-11-28T03:33:39.750908887Z, pid 1619, id ce23de4aa2b3 | same |
+| `acca-postgres` | running (healthy), started 2026-11-28T03:32:44.969889333Z, pid 745, id 59ec4ce0d8fe | same |
+| `acca-floci` | running (healthy), started 2026-11-28T03:32:44.967532916Z, pid 746, id 2459314d222b | same |
+| `floci-aws-ui` | running, started 2026-11-28T03:33:39.821396262Z, pid 1685, id 568c6feb4004 | same |
+| `floci-aws-ecr-registry` | running, started 2026-11-28T03:33:39.905340137Z, pid 1753, id 8ae7bf3b79b5 | same |
+| host worker (`caffeinate -i uv run ai-code-change worker`) | PIDs 7890 (shell), 7891 (uv), 7892 (caffeinate), 7895 (python), started Sat Nov 28 09:03:46 2026 | same |
+| ngrok (`ngrok http 8000`) | PIDs 8510 (shell), 8511, started Sat Nov 28 09:04:03 2026 | same |
+| `127.0.0.1:8000/health/live` | 200 `{"status":"alive","version":"0.1.0"}` | 200, same body |
+| `127.0.0.1:4566/_floci/health` | 200 | 200 |
+| agent sandboxes | 0 | 0 |
+| networks, volumes | 12 networks, 4 volumes (no `acca-verify*`) | identical lists |
+
+Notes:
+
+- The live stack was restarted between S2116 and this run (new start times and PIDs, same container ids);
+  that restart predates this run and is not part of it.
+- Intake now reads the Story twice from the fake Jira (`get_issue` x2 per run; S2116 recorded one call).
+  Both calls go to the mock transport; no network call is involved.
+- The worker's session cost summary reports `2 call(s) without usage` for the scripted model, so the cost
+  is "at least $0.0000". The scripted turns carry `usage_metadata`; this is a reporting detail of the fake
+  model run, not a PostgreSQL concern.
