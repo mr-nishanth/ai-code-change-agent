@@ -337,6 +337,24 @@ async def test_an_unresolvable_repository_is_reported_to_jira_once() -> None:
     assert len(reporter.reports) == 1  # already BLOCKED before the re-run: no second comment
 
 
+async def test_a_dead_intake_job_blocks_its_request_whatever_killed_it() -> None:
+    """A transient Jira error or an unexpected exception that used up the job's attempts ends it
+    DEAD outside the handler's own refusals: the worker's on_dead hook blocks the request."""
+    changes = MemoryChanges()
+    req = changes.add_request()
+    handler = IntakeHandler(
+        changes=changes.service(),
+        jira=FakeJira(),
+        resolver=RepositoryResolver(InMemoryRegistry().uow),
+        start=_never_started(),
+        repository_field_configured=False,
+    )
+    await handler.on_dead(job({"code_change_request_id": str(req.id)}))
+    await handler.on_dead(job({"code_change_request_id": str(req.id)}))  # idempotent
+    assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+    await handler.on_dead(job({}))  # a bad payload has no request to block
+
+
 async def test_a_refusal_that_cannot_be_recorded_is_retried_before_jira_hears_of_it() -> None:
     """Blocking the request comes first: a storage failure there leaves the job retryable and
     no comment posted, so the redelivered job reports once."""

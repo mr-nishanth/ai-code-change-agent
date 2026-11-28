@@ -50,6 +50,8 @@ class MemoryQueue:
         self, job_id: uuid.UUID, owner: str, code: str, *, retry_in_seconds: int | None
     ) -> JobStatus:
         self.failed.append((job_id, code, retry_in_seconds))
+        if job_id in getattr(self, "exhaust", ()):  # no attempts left: dead despite the retry
+            return JobStatus.DEAD
         return JobStatus.QUEUED if retry_in_seconds is not None else JobStatus.DEAD
 
     def release(self, job_id: uuid.UUID, owner: str) -> None:
@@ -210,6 +212,52 @@ async def test_a_jira_rate_limit_carries_its_retry_after_into_the_queue() -> Non
     q = MemoryQueue([job()])
     await worker(q, {"k.one": limited}).run_once()
     assert q.failed[0][1:] == ("JiraRateLimitError", 120)
+
+
+async def test_a_job_that_ends_dead_runs_its_kind_on_dead_hook_once() -> None:
+    dead: list[uuid.UUID] = []
+
+    async def on_dead(j: Job) -> None:
+        dead.append(j.id)
+
+    async def refused(j: Job) -> None:
+        raise JobFailedError("repository_unknown")
+
+    async def broken(j: Job) -> None:
+        raise RuntimeError("unexpected")
+
+    retried, exhausted, final = job(attempts=1), job(attempts=3), job()
+    q = MemoryQueue([retried, exhausted])
+    q.exhaust = {exhausted.id}  # type: ignore[attr-defined]
+    w = Worker(
+        q, {"k.one": broken}, lease_seconds=60, heartbeat_seconds=30, on_dead={"k.one": on_dead}
+    )
+    await w.run_once()  # retried: not dead
+    await w.run_once()  # last attempt: dead
+    assert dead == [exhausted.id]
+    q2 = MemoryQueue([final, job(kind="k.other")])
+    w2 = Worker(
+        q2, {"k.one": refused, "k.other": refused}, lease_seconds=60, heartbeat_seconds=30,
+        on_dead={"k.one": on_dead},
+    )  # fmt: skip
+    await w2.run_once()
+    await w2.run_once()  # a kind without a hook
+    assert dead == [exhausted.id, final.id]
+
+
+async def test_a_failing_on_dead_hook_never_escapes() -> None:
+    async def on_dead(j: Job) -> None:
+        raise RuntimeError("storage down")
+
+    async def refused(j: Job) -> None:
+        raise JobFailedError("x")
+
+    q = MemoryQueue([job()])
+    w = Worker(
+        q, {"k.one": refused}, lease_seconds=60, heartbeat_seconds=30, on_dead={"k.one": on_dead}
+    )
+    await w.run_once()
+    assert q.failed[0][1] == "x" and q.released
 
 
 def test_backoff_is_exponential_and_capped() -> None:

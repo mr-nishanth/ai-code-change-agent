@@ -32,7 +32,14 @@ from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.errors import ConfigurationError
 from ai_code_change_agent.execution.s3_artifacts import S3ArtifactStore
 from ai_code_change_agent.integrations.aws import AwsClients
-from ai_code_change_agent.orchestration.intake import CHILD, RESUME, ChildHandler, ResumeHandler
+from ai_code_change_agent.orchestration.intake import (
+    CHILD,
+    INTAKE,
+    RESUME,
+    ChildHandler,
+    IntakeHandler,
+    ResumeHandler,
+)
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps
 from ai_code_change_agent.persistence.dynamodb import PersistenceError
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
@@ -203,7 +210,11 @@ async def test_the_resume_handler_reports_through_the_cleanup_step_and_knows_the
         stub.add_response("describe_table", describe(name=ckpt), {"TableName": ckpt})
         async with worker_app(s, aws) as app:
             handlers = app.worker._handlers
+            on_dead = app.worker._on_dead
             stub.assert_no_pending_responses()
+    intake = handlers[INTAKE]
+    assert isinstance(intake, IntakeHandler)
+    assert on_dead == {INTAKE: intake.on_dead}  # a dead intake job blocks its request
     resume, child = handlers[RESUME], handlers[CHILD]
     assert isinstance(resume, ResumeHandler) and isinstance(child, ChildHandler)
     report = resume._report

@@ -132,6 +132,18 @@ class IntakeHandler:
         attempt = await self._changes.start_attempt(request_id)
         await self._start(attempt.id)
 
+    async def on_dead(self, job: Job) -> None:
+        """The worker's hook for an intake job it recorded DEAD for any reason (a refusal, or a
+        transient Jira error or an unexpected exception on the last attempt): no attempt will
+        start from this intake, so the request ends BLOCKED instead of RECEIVED (idempotent; a
+        request that already has an attempt keeps its status). No Jira comment: the cause is
+        only a code in the job."""
+        try:
+            request_id = uuid.UUID(str(job.payload["code_change_request_id"]))
+        except (KeyError, ValueError):
+            return
+        await self._changes.refuse_request(request_id)
+
     async def _refused(
         self,
         request: CodeChangeRequest,

@@ -586,16 +586,17 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
         )
         steps = CodeChangeSteps(deps)
         runner = WorkflowRunner(build_graph(steps, saver))
+        intake = IntakeHandler(
+            changes=changes,
+            jira=jira,
+            resolver=resolver,
+            start=costs.around(runner.start),
+            repository_field_configured=settings.jira_repository_field is not None,
+            reporter=deps.reporter,
+            coordinator=coordinator,
+        )
         handlers: dict[str, Any] = {
-            INTAKE: IntakeHandler(
-                changes=changes,
-                jira=jira,
-                resolver=resolver,
-                start=costs.around(runner.start),
-                repository_field_configured=settings.jira_repository_field is not None,
-                reporter=deps.reporter,
-                coordinator=coordinator,
-            ),
+            INTAKE: intake,
             RESUME: ResumeHandler(
                 runner.resume,
                 changes=changes,
@@ -616,6 +617,7 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
             concurrency=settings.max_concurrent_jobs,
             relay_seconds=settings.job_relay_seconds,
             sweep_seconds=settings.job_sweep_seconds,
+            on_dead={INTAKE: intake.on_dead},
         )
         yield WorkerApp(worker, runner, changes, costs)
     finally:
