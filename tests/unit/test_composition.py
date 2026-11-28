@@ -10,7 +10,9 @@ from typing import Any
 
 import pytest
 from botocore.stub import Stubber  # type: ignore[import-untyped]
+from langgraph.checkpoint.memory import MemorySaver
 
+from ai_code_change_agent import composition
 from ai_code_change_agent.application.webhooks.receive import ReceiveJiraWebhook
 from ai_code_change_agent.composition import (
     app_table,
@@ -30,11 +32,14 @@ from ai_code_change_agent.core.config import Settings
 from ai_code_change_agent.core.errors import ConfigurationError
 from ai_code_change_agent.execution.s3_artifacts import S3ArtifactStore
 from ai_code_change_agent.integrations.aws import AwsClients
+from ai_code_change_agent.orchestration.intake import CHILD, RESUME, ChildHandler, ResumeHandler
+from ai_code_change_agent.orchestration.steps import CodeChangeSteps
 from ai_code_change_agent.persistence.dynamodb import PersistenceError
 from ai_code_change_agent.persistence.dynamodb.job_queue import DynamoSqsJobQueue
 from ai_code_change_agent.persistence.dynamodb.registry_store import DynamoRegistryUnitOfWork
 from ai_code_change_agent.persistence.dynamodb.usage_store import DynamoUsageStore
 from ai_code_change_agent.persistence.dynamodb.webhook_repository import DynamoWebhookRepository
+from tests.support.fake_github import make_key
 from tests.support.jira import PROJECT, SECRET
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -166,6 +171,46 @@ async def test_the_worker_fails_fast_on_missing_jira_or_github_configuration(
     with pytest.raises(ConfigurationError, match="GitHub App"):
         async with worker_app(floci_settings(**jira)):
             pass  # pragma: no cover - never entered
+
+
+async def test_the_resume_handler_reports_through_the_cleanup_step_and_knows_the_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkpoint_expired path reports via the workflow's own once-per-attempt report
+    (CodeChangeSteps.cleanup) and finishes children through the same coordinator the child
+    handler uses."""
+    make_key(tmp_path / "app.pem")
+    s = floci_settings(
+        jira_base_url="https://jira.invalid",
+        jira_email="a@b.c",
+        jira_api_token="t",
+        github_app_id=1,
+        github_app_installation_id=2,
+        github_app_private_key_path=str(tmp_path / "app.pem"),
+        workspace_root=str(tmp_path / "ws"),
+        artifact_root=str(tmp_path / "artifacts"),
+        workspace_image="img:1",
+        llm_provider="anthropic",
+        llm_model="claude-test",
+        anthropic_api_key="sk-test",
+    )
+    aws = AwsClients(s)
+    # the real checkpointer touches S3 on construction (lifecycle policy): no network here
+    monkeypatch.setattr(composition, "dynamodb_checkpointer", lambda *_: MemorySaver())
+    with Stubber(aws.dynamodb) as stub:
+        stub.add_response("describe_table", describe(), {"TableName": TABLE})
+        ckpt = "s2116-composition-ckpt"
+        stub.add_response("describe_table", describe(name=ckpt), {"TableName": ckpt})
+        async with worker_app(s, aws) as app:
+            handlers = app.worker._handlers
+            stub.assert_no_pending_responses()
+    resume, child = handlers[RESUME], handlers[CHILD]
+    assert isinstance(resume, ResumeHandler) and isinstance(child, ChildHandler)
+    report = resume._report
+    assert report is not None and getattr(report, "__func__", None) is CodeChangeSteps.cleanup
+    assert isinstance(report.__self__, CodeChangeSteps)  # type: ignore[attr-defined]
+    assert resume._coordinator is not None and resume._coordinator is child._coordinator
+    assert resume._changes is app.changes
 
 
 def test_composition_main_and_cli_have_no_sql_left() -> None:

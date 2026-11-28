@@ -32,7 +32,11 @@ from ai_code_change_agent.application.multirepo.models import (
     ReportState,
 )
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
-from ai_code_change_agent.domain.changes.models import CodeChangeAttempt
+from ai_code_change_agent.domain.changes.models import (
+    ApprovalDecision,
+    ApprovalGate,
+    CodeChangeAttempt,
+)
 from ai_code_change_agent.domain.changes.multirepo import (
     DeclarationError,
     dependency_order,
@@ -1283,6 +1287,55 @@ async def test_an_expired_single_repository_attempt_is_still_reported_once(
     with pytest.raises(JobFailedError):
         await p.handler(expired)(resume_job(lone))
     assert p.single_reports == [lone.id] and p.reporter.texts == []
+
+
+async def test_the_real_workflow_resumed_twice_for_one_child_advances_the_parent_once(
+    tmp_path: Path,
+) -> None:
+    """Real steps, graph and WorkflowRunner.resume: the final RESUME job resumed the child's
+    attempt but the worker died before notifying the coordinator, so the job is redelivered and
+    resumes the same, already finished, attempt again. No error; the parent finishes once."""
+    rig = await make_rig(tmp_path)  # manual approval: the child pauses at each gate
+    coordinator, store, _, reporter, changes = make_real(rig.artifacts)
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(TWO))
+    await complete_with_report(
+        coordinator, store, changes, rig.artifacts, "backend-api", {"published_contract": CONTRACT}
+    )
+    await begin(store, changes, "web-app", attempt_id=rig.attempt_id)
+    steps = CodeChangeSteps(replace(rig.deps, multirepo=coordinator))
+    runner = WorkflowRunner(build_graph(steps, MemorySaver()))
+    handler = ResumeHandler(
+        runner.resume, changes=rig.deps.changes, coordinator=coordinator, report=steps.cleanup
+    )
+    svc = rig.deps.changes
+
+    async def approve(gate: ApprovalGate) -> None:
+        attempt = await svc.get_attempt(rig.attempt_id)
+        digest = attempt.plan_sha256 if gate is ApprovalGate.PLAN else attempt.manifest_sha256
+        assert digest is not None
+        await svc.decide(attempt.id, gate, digest, ApprovalDecision.APPROVED, "cli:op")
+
+    await runner.start(rig.attempt_id)
+    assert (await svc.get_attempt(rig.attempt_id)).status is S.AWAITING_PLAN_APPROVAL
+    await approve(ApprovalGate.PLAN)
+    await handler(resume_job(await svc.get_attempt(rig.attempt_id)))
+    assert (await svc.get_attempt(rig.attempt_id)).status is S.AWAITING_FINAL_APPROVAL
+    assert by_key(store, "web-app").status is ChildStatus.RUNNING  # still at a gate
+    await approve(ApprovalGate.FINAL)
+    job = resume_job(await svc.get_attempt(rig.attempt_id))
+    await runner.resume(rig.attempt_id)  # the first delivery: resumed, then the worker died
+    assert (await svc.get_attempt(rig.attempt_id)).status is S.COMPLETED
+    assert by_key(store, "web-app").status is ChildStatus.RUNNING  # never notified
+    assert store.parents[by_key(store, "web-app").parent_id].status is ParentStatus.RUNNING
+    await handler(job)  # the redelivered RESUME job: the real resume runs a second time
+    await handler(job)  # and once more: nothing new
+    web = by_key(store, "web-app")
+    assert web.status is ChildStatus.COMPLETED and web.attempt_id == rig.attempt_id
+    assert store.parents[web.parent_id].status is ParentStatus.COMPLETED
+    assert len(reporter.texts) == 1 and store.reports == 1  # the parent reported once
+    assert "Execution: COMPLETED" in reporter.texts[0][1]
+    assert rig.reporter.reports == []  # the child never posts a comment of its own
+    assert len(rig.publisher.requests) == 1  # one pull request, not one per delivery
 
 
 async def test_a_duplicate_completion_notification_counts_once(tmp_path: Path) -> None:
