@@ -294,21 +294,32 @@ def dependency_preparation(profile: RepositoryProfile, toolchains: frozenset[str
 _PATH_TOKEN = re.compile(
     r"(?<![\w./~\\-])(?:\./)?([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,10})"
 )
+# Whole verb forms that ask for a change (fixture, address and "covers the parser" are not).
 _CHANGE_WORDS = re.compile(
-    r"\b(updat|modif|chang|edit|extend|adjust|fix|add|refactor|rewrit|replac|renam|amend|cover)",
+    r"\b(?:updat(?:e|ed|ing)|modif(?:y|ied|ying)|chang(?:e|ed|ing)|edit(?:ed|ing)?"
+    r"|extend(?:ed|ing)?|adjust(?:ed|ing)?|fix(?:ed|ing)?|add(?:ed|ing)?|refactor(?:ed|ing)?"
+    r"|rewr(?:ite|itten|iting|ote)|replac(?:e|ed|ing)|renam(?:e|ed|ing)|amend(?:ed|ing)?|cover)\b",
     re.IGNORECASE,
 )
-_NEGATION = re.compile(r"\b(no|not|never|without|unchanged|untouched)\b|n't\b", re.IGNORECASE)
+# Any of these makes the item ambiguous, so it adds nothing (a missed file only fails validation).
+_NEGATION = re.compile(
+    r"\b(?:no|not|never|without|unchanged|untouched|avoid(?:s|ed|ing)?|keep(?:s|ing)?|kept"
+    r"|preserv(?:e|es|ed|ing)|leav(?:e|es|ing)|remain(?:s|ed|ing)?|stay(?:s|ed|ing)?|as[- ]is"
+    r"|read[- ]only|do not|must not|should not)\b|n't\b",
+    re.IGNORECASE,
+)
 _NEW_TEST_FILE = re.compile(r"(?:[\w.-]+/)*(?:test_[\w.-]*|[\w.-]*_test)\.py")
+_TEST_MODULE = re.compile(r"(?:[\w.-]+/)*(?:test_[\w.-]*|[\w.-]*_test|conftest)\.py")
 
 
 def complete_plan_scope(plan: ImplementationPlan, existing: frozenset[str]) -> ImplementationPlan:
     """Deterministic plan consistency at plan acceptance: a file the plan itself says must change
     but leaves out of `changes` is added to them, so the approved scope matches the plan's own
     words (independent validation enforces `changes` and exact `tests` entries only). Sources:
-    paths in `tests` entries, and existing paths in `findings` and `todo` items that say the
-    file changes (no negation). Only safe, unprotected paths; an existing file is modified, a new
-    file only when `tests` names a test module; never a deletion. The policy gate and validation
+    paths in `findings`, `todo` and `tests` items that say the file changes (a whole change verb
+    and no negation). Only safe, unprotected paths; an existing file is modified (from `tests`
+    only a test module or conftest.py), a new file only when `tests` names a test module; never a
+    deletion. The policy gate and validation
     then treat the added entries like any other."""
     planned = {c.path for c in plan.changes} | set(plan.tests)
     added: list[dict[str, str]] = []
@@ -330,16 +341,20 @@ def complete_plan_scope(plan: ImplementationPlan, existing: frozenset[str]) -> I
                 found.append(path)
         return found
 
+    def asks_change(item: str) -> bool:
+        return bool(_CHANGE_WORDS.search(item)) and not _NEGATION.search(item)
+
     for field in ("findings", "todo"):
         for item in getattr(plan, field):
-            if _CHANGE_WORDS.search(item) and not _NEGATION.search(item):
+            if asks_change(item):
                 for path in paths(item):
                     if path in existing:
                         add(path, "modify", field)
-    for item in plan.tests:
+    for item in filter(asks_change, plan.tests):
         for path in paths(item):
             if path in existing:
-                add(path, "modify", "tests")
+                if _TEST_MODULE.fullmatch(path):
+                    add(path, "modify", "tests")
             elif _NEW_TEST_FILE.fullmatch(path):
                 add(path, "create", "tests")
     if not added:

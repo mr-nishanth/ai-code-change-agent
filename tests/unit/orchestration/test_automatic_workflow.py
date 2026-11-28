@@ -673,6 +673,50 @@ def test_a_path_token_is_taken_whole_or_not_at_all() -> None:
     ]
 
 
+def test_only_whole_change_verbs_without_a_negation_add_a_file() -> None:
+    plan = plan_with(
+        findings=[
+            "tests/conftest.py provides the fixture used by app/a.py",  # fixture is not fix
+            "app/b.py reads the address from settings",  # address is not add
+            "tests/test_c.py covers the parser",  # describes the file, asks no change
+            "Avoid touching app/d.py while updating the routes",
+            "Keep app/e.py and update the callers",
+            "Preserve app/f.py when refactoring",
+            "Leave app/g.py alone and edit the view",
+            "app/h.py must remain as it is after the change",
+            "app/i.py stays as-is; adjust the template",
+            "app/j.py is read-only; fix the caller",
+            "app/k.py should not be modified",
+            "Don't rewrite app/l.py",
+            "Modifying app/p.py is required",
+            "app/q.py needs to be rewritten",
+        ],
+        tests=[
+            "Do not modify tests/test_old.py",
+            "Never change tests/test_keep.py",
+            "Update app/m.py to expose the hook",  # an existing non-test file: never from tests
+            "Update tests/helpers.py with a builder",  # not a test module
+            "Update tests/conftest.py with a fixture",
+            "tests/test_n.py covers it",  # no change wording
+            "Add tests/test_new.py",
+            "Do not add tests/test_never.py",
+        ],
+    )
+    existing = frozenset(
+        {"app/greeting.py", *(f"app/{c}.py" for c in "abdefghijklmpq"), "tests/conftest.py",
+         "tests/test_c.py", "tests/test_old.py", "tests/test_keep.py", "tests/helpers.py",
+         "tests/test_n.py"}
+    )  # fmt: skip
+    done = complete_plan_scope(plan, existing)
+    assert [(c.path, c.operation) for c in done.changes] == [
+        ("app/greeting.py", "modify"),
+        ("app/p.py", "modify"),
+        ("app/q.py", "modify"),
+        ("tests/conftest.py", "modify"),
+        ("tests/test_new.py", "create"),
+    ]
+
+
 async def test_a_test_file_named_only_in_the_findings_may_be_changed(tmp_path: Path) -> None:
     """Live campaign: the findings said a test file must be updated, the changes omitted it, the
     agent edited it and validation failed the result as outside the approved plan."""
