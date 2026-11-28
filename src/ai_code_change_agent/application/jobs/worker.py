@@ -11,6 +11,18 @@ The relay is only a fallback (producers send right after commit), so both interv
 default (30 s and 300 s, `JOB_RELAY_SECONDS` / `JOB_SWEEP_SECONDS`): each tick costs a GSI3 Query.
 A failing claim is logged and retried after `poll_seconds`, a failing dispatcher tick at the next
 relay tick; neither stops the worker.
+
+Every job that ends DEAD runs its kind's `on_dead` hook, whichever path recorded it: this worker's
+own last failure runs it at once; a job a claim found exhausted with an expired lease (a crashed
+worker's last attempt) is listed by `JobQueue.dead_pending` and run by the dispatcher on its next
+relay tick. `periodic` steps (the Jira report retry) run on the same tick.
+
+Shutdown (`stop` set, SIGINT/SIGTERM in the CLI): no new claim starts; a claim already in its
+long poll (at most `receive_wait_seconds`, 20 s) that returns a job gives it straight back
+(`release_lease(refund=True)`). A running handler gets `shutdown_grace_seconds` to finish; then
+(or at once when `force` is set, a second signal) it is cancelled and its lease released
+(`release_lease`), so another worker or a restart resumes it right away instead of waiting for
+the lease to run out.
 """
 
 import asyncio
@@ -18,7 +30,8 @@ import contextlib
 import math
 import socket
 import uuid
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from ai_code_change_agent.application.jobs.queue import (
@@ -31,6 +44,7 @@ from ai_code_change_agent.application.jobs.queue import (
 from ai_code_change_agent.core.logging import get_logger
 
 Handler = Callable[[Job], Coroutine[Any, Any, None]]
+Periodic = tuple[str, Callable[[], Coroutine[Any, Any, int]]]
 _log = get_logger("worker")
 MAX_BACKOFF_SECONDS = 900
 # A renewal must answer this long before the last successful one runs out (clock skew between
@@ -63,6 +77,10 @@ class _LeaseLost(Exception):  # noqa: N818
     pass
 
 
+class _ShutdownCancelled(Exception):  # noqa: N818 - the shutdown grace ran out
+    pass
+
+
 class Worker:
     def __init__(
         self,
@@ -77,12 +95,17 @@ class Worker:
         sweep_seconds: float = 300.0,
         owner: str | None = None,
         on_dead: Mapping[str, Handler] | None = None,
+        periodic: Sequence[Periodic] = (),
+        shutdown_grace_seconds: float = 30.0,
     ) -> None:
         self._queue = queue
         self._handlers = dict(handlers)
-        # per kind, run once when this worker records the job DEAD (a refusal or the last
-        # attempt), for example to end the request a dead intake job leaves behind
+        # per kind, run once for every job that ends DEAD (a refusal, the last attempt, or a
+        # crashed worker's last attempt found by a claim), to end what the job leaves behind
         self._on_dead = dict(on_dead or {})
+        self._periodic = tuple(periodic)
+        self._grace = shutdown_grace_seconds
+        self._force: asyncio.Event | None = None
         self._lease = lease_seconds
         self._beat = heartbeat_seconds
         self._concurrency = concurrency
@@ -91,7 +114,8 @@ class Worker:
         self._sweep = sweep_seconds
         self.owner = owner or f"{socket.gethostname()[:64]}:{uuid.uuid4().hex[:12]}"
 
-    async def run(self, stop: asyncio.Event) -> None:
+    async def run(self, stop: asyncio.Event, force: asyncio.Event | None = None) -> None:
+        self._force = force
         slots = [asyncio.create_task(self._slot(stop)) for _ in range(self._concurrency)]
         dispatcher = asyncio.create_task(self._dispatcher(stop))
         try:
@@ -114,8 +138,16 @@ class Worker:
             if job is None:
                 await self._wait(stop, self._poll)
                 continue
+            if stop.is_set():  # claimed during shutdown: give it back untouched
+                try:
+                    await self._queue.release_lease(job.id, self.owner, refund=True)
+                except Exception as exc:  # the lease runs out and decides
+                    _log.warning("job_release_failed", job_id=str(job.id), code=_code(exc))
+                finally:
+                    self._queue.release(job.id, self.owner)
+                break
             try:
-                await self.process(job)
+                await self.process(job, stop)
             except Exception as exc:  # recording the result failed; the lease expires and decides
                 _log.warning("job_process_failed", job_id=str(job.id), code=_code(exc))
 
@@ -124,6 +156,9 @@ class Worker:
         next_sweep = loop.time()
         while not stop.is_set():
             await self._tick("dispatch_pending", self._queue.dispatch_pending)
+            await self._tick("dead_hooks", self._dead_hooks)
+            for name, step in self._periodic:
+                await self._tick(name, step)
             if loop.time() >= next_sweep:
                 await self._tick("sweep", self._queue.sweep)
                 next_sweep = loop.time() + self._sweep
@@ -151,7 +186,16 @@ class Worker:
             await self.process(job)
         return job
 
-    async def process(self, job: Job) -> None:
+    async def _dead_hooks(self) -> int:
+        """Run the on_dead hook of every DEAD job the queue lists (recorded DEAD by any path)."""
+        jobs = await self._queue.dead_pending()
+        for job in jobs:
+            _log.warning("job_dead_recovered", job_id=str(job.id), kind=job.kind,
+                         reason=job.last_error)  # fmt: skip
+            await self._dead(job)
+        return len(jobs)
+
+    async def process(self, job: Job, stop: asyncio.Event | None = None) -> None:
         # identifiers only: the payload can hold Story text and is never logged
         _log.info(
             "job_claimed",
@@ -162,26 +206,55 @@ class Worker:
         )
         handler = self._handlers.get(job.kind)
         if handler is None:
-            await self._queue.fail(job.id, self.owner, "no_handler", retry_in_seconds=None)
+            status = await self._queue.fail(job.id, self.owner, "no_handler", retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason="no_handler")
+            if status is JobStatus.DEAD:
+                await self._dead(replace(job, last_error="no_handler"))
             return
         try:
-            await self._run(job, handler)
+            await self._run(job, handler, stop)
         finally:  # whatever happened, the job is out of this worker's hands
             self._queue.release(job.id, self.owner)
 
     async def _dead(self, job: Job) -> None:
+        """Run the kind's hook (idempotent) and record that it ran; a hook that raises is logged
+        and listed again by `dead_pending` later (bounded), never changing the DEAD status."""
         hook = self._on_dead.get(job.kind)
-        if hook is None:
-            return
+        failed = False
+        if hook is not None:
+            try:
+                await hook(job)
+            except Exception as exc:  # the job is already DEAD; the hook never changes that
+                failed = True
+                _log.warning(
+                    "job_dead_hook_failed", job_id=str(job.id), kind=job.kind, code=_code(exc)
+                )
         try:
-            await hook(job)
-        except Exception as exc:  # the job is already DEAD; the hook never changes that
-            _log.warning("job_dead_hook_failed", job_id=str(job.id), kind=job.kind, code=_code(exc))
+            await self._queue.dead_settled(job.id, failed=failed)
+        except Exception as exc:  # listed again by dead_pending: the hook runs once more
+            _log.warning("job_dead_settle_failed", job_id=str(job.id), code=_code(exc))
 
-    async def _run(self, job: Job, handler: Handler) -> None:
+    async def _shutdown(self, stop: asyncio.Event, job: Job, work: asyncio.Task[None]) -> None:
+        """After `stop`, give the running handler `shutdown_grace_seconds` (less when `force` is
+        set), then cancel it; `_run` releases the lease."""
+        await stop.wait()
+        waiters: list[asyncio.Task[Any]] = [asyncio.create_task(asyncio.sleep(self._grace))]
+        if self._force is not None:
+            waiters.append(asyncio.create_task(self._force.wait()))
+        try:
+            await asyncio.wait([work, *waiters], return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        if not work.done():
+            _log.warning("job_shutdown_cancelled", job_id=str(job.id), kind=job.kind)
+            work.cancel()
+            raise _ShutdownCancelled
+
+    async def _run(self, job: Job, handler: Handler, stop: asyncio.Event | None = None) -> None:
         work = asyncio.create_task(handler(job))
         beat = asyncio.create_task(self._heartbeat(job, work))
+        watch = asyncio.create_task(self._shutdown(stop, job, work)) if stop is not None else None
         try:
             await work
         except _LeaseLost:
@@ -191,6 +264,10 @@ class Worker:
             if _lost(beat):
                 self._lease_lost(job)
                 return
+            if watch is not None and _cancelled_by(watch):
+                await self._stop_beat(beat)
+                await self._queue.release_lease(job.id, self.owner, refund=False)
+                return
             raise
         except JobFailedError as exc:
             if await self._stop_beat(beat):
@@ -199,7 +276,7 @@ class Worker:
             status = await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason=exc.code)
             if status is JobStatus.DEAD:  # not when the store refused (another owner has it)
-                await self._dead(job)
+                await self._dead(replace(job, last_error=exc.code))
             return
         except Exception as exc:  # retryable by default; the code never carries raw messages
             if await self._stop_beat(beat):
@@ -218,9 +295,12 @@ class Worker:
                 attempts=job.attempts,
             )
             if status is JobStatus.DEAD:
-                await self._dead(job)
+                _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason=code)
+                await self._dead(replace(job, last_error=code))
             return
         finally:
+            if watch is not None and not watch.done():
+                watch.cancel()
             await self._stop_beat(beat)
         if _lost(beat):  # the lease went while the handler was finishing: not ours to record
             self._lease_lost(job)
@@ -296,3 +376,9 @@ class Worker:
 
 def _lost(beat: asyncio.Task[None]) -> bool:
     return beat.done() and not beat.cancelled() and isinstance(beat.exception(), _LeaseLost)
+
+
+def _cancelled_by(watch: asyncio.Task[None]) -> bool:
+    return (
+        watch.done() and not watch.cancelled() and isinstance(watch.exception(), _ShutdownCancelled)
+    )

@@ -313,3 +313,37 @@ def test_the_worker_configures_redacting_logs_before_it_runs(
     line = json.loads(next(ln for ln in out.splitlines() if "job_started" in ln))
     assert line["api_token"] == REDACTED and line["job"] == "j1"
     assert "abc123secret" not in out
+
+
+@pytest.mark.parametrize("first", ["SIGINT", "SIGTERM"])
+def test_sigint_and_sigterm_stop_the_worker_and_a_second_signal_forces_it(
+    monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """Both signals stop claiming (stop); a second one sets force, which cancels a running job at
+    once instead of after the shutdown grace. The worker returns: nothing waits for minutes."""
+    import os
+    import signal
+
+    seen: dict[str, bool] = {}
+    monkeypatch.setattr(operations, "get_settings", lambda: local())
+
+    class Worker:
+        async def run(self, stop: asyncio.Event, force: asyncio.Event) -> None:
+            os.kill(os.getpid(), getattr(signal, first))
+            await asyncio.wait_for(stop.wait(), 5)
+            seen["stopped"] = True
+            os.kill(os.getpid(), signal.SIGTERM if first == "SIGINT" else signal.SIGINT)
+            await asyncio.wait_for(force.wait(), 5)
+            seen["forced"] = True
+
+    class Costs:
+        async def print_session_summary(self) -> None:
+            seen["summary"] = True
+
+    @contextlib.asynccontextmanager
+    async def worker_app(_settings: Settings) -> AsyncIterator[Any]:
+        yield SimpleNamespace(worker=Worker(), costs=Costs())
+
+    monkeypatch.setattr(operations, "worker_app", worker_app)
+    asyncio.run(operations._worker(once=False))
+    assert seen == {"stopped": True, "forced": True, "summary": True}

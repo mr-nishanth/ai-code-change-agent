@@ -19,7 +19,7 @@ from ai_code_change_agent.application.artifacts.redaction import find_secrets
 from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
-from ai_code_change_agent.core.logging import configure_logging
+from ai_code_change_agent.core.logging import configure_logging, get_logger
 from ai_code_change_agent.domain.changes.models import (
     REASON,
     REASON_MAX,
@@ -27,6 +27,8 @@ from ai_code_change_agent.domain.changes.models import (
     ApprovalGate,
 )
 from ai_code_change_agent.orchestration.intake import RESUME
+
+_log = get_logger("worker")
 
 
 def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -83,14 +85,25 @@ async def _worker(once: bool) -> None:
             if once:
                 await app.worker.run_once()
                 return
-            stop = asyncio.Event()
+            stop, force = asyncio.Event(), asyncio.Event()
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 with contextlib.suppress(NotImplementedError):
-                    loop.add_signal_handler(sig, stop.set)
-            await app.worker.run(stop)
+                    loop.add_signal_handler(sig, _on_signal, sig, stop, force)
+            await app.worker.run(stop, force)
         finally:
             await app.costs.print_session_summary()  # recomputed from the persisted ledger
+
+
+def _on_signal(sig: signal.Signals, stop: asyncio.Event, force: asyncio.Event) -> None:
+    """SIGINT and SIGTERM alike: the first stops claiming and gives a running job the worker's
+    shutdown grace; a second one cancels it at once (its lease is released either way)."""
+    if stop.is_set():
+        force.set()
+        _log.warning("worker_shutdown_forced", signal=sig.name)
+    else:
+        stop.set()
+        _log.warning("worker_shutdown_requested", signal=sig.name)
 
 
 async def _costs(args: argparse.Namespace, out: TextIO) -> None:

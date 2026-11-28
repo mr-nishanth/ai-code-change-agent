@@ -60,11 +60,19 @@ MAX_RECEIVE_WAIT_SECONDS = 20  # SQS long-poll maximum
 RETENTION_DAYS = 90  # TTL on terminal jobs (DM 7)
 RELAY_BATCH = 100
 EXHAUSTED = "lease_expired_attempts_exhausted"
+# A job this worker's own `fail` records DEAD runs its hook at once; the dispatcher lists it only
+# after this grace, so the two do not overlap (a hook is idempotent either way).
+DEAD_HOOK_GRACE_SECONDS = 60
+DEAD_HOOK_MAX_FAILURES = 5  # a hook that keeps raising is retried this often, then abandoned
+DEAD_HOOK_RETRY_SECONDS = 300
 _TERMINAL = frozenset({JobStatus.SUCCEEDED, JobStatus.DEAD})
 _NEW = "attribute_not_exists(PK)"
 _BUMP = "row_version = row_version + :one, updated_at = :now"
 _TERMINAL_SET = "finished_at = :now, expires_at = :ttl, " + _BUMP
 _TERMINAL_REMOVE = "lease_owner, lease_expires_at, GSI3PK, GSI3SK"
+# DEAD keeps GSI3, moved to the DEADHOOK partition, until its kind's on_dead hook has run
+_DEAD_SET = "GSI3PK = :deadp, GSI3SK = :deadsk"
+_DEAD_REMOVE = "lease_owner, lease_expires_at"
 _S = {"#s": "status"}
 
 
@@ -328,14 +336,15 @@ class DynamoSqsJobQueue:
         try:
             await self._table.update(
                 keys.job(job_id),
-                update=f"SET #s = :dead, last_error = :code, {_TERMINAL_SET} "
-                f"REMOVE {_TERMINAL_REMOVE}",
+                update=f"SET #s = :dead, last_error = :code, {_DEAD_SET}, {_TERMINAL_SET} "
+                f"REMOVE {_DEAD_REMOVE}",
                 condition="row_version = :seen",
                 names=_S,
                 values={
                     ":dead": JobStatus.DEAD.value,
                     ":code": code,
                     ":seen": old.get("row_version"),
+                    **self._dead_values(job_id, 0),  # nobody runs its hook inline: due now
                     **self._terminal_values(),
                 },
                 on_failed=_Stale(None),
@@ -360,6 +369,11 @@ class DynamoSqsJobQueue:
 
     def release(self, job_id: uuid.UUID, owner: str) -> None:
         self._forget(job_id, owner)
+
+    def _dead_values(self, job_id: uuid.UUID, grace_seconds: int) -> dict[str, Any]:
+        due = self._clock.now() + timedelta(seconds=grace_seconds)
+        partition = keys.job_dead_gsi3(due, job_id)
+        return {":deadp": partition["GSI3PK"], ":deadsk": partition["GSI3SK"]}
 
     def _terminal_values(self) -> dict[str, Any]:
         now = self._clock.now()
@@ -454,11 +468,16 @@ class DynamoSqsJobQueue:
         try:
             await self._table.update(
                 keys.job(job_id),
-                update=f"SET #s = :dead, last_error = :code, {_TERMINAL_SET} "
-                f"REMOVE {_TERMINAL_REMOVE}",
+                update=f"SET #s = :dead, last_error = :code, {_DEAD_SET}, {_TERMINAL_SET} "
+                f"REMOVE {_DEAD_REMOVE}",
                 condition=owned,
                 names=_S,
-                values={**base, ":dead": JobStatus.DEAD.value, **self._terminal_values()},
+                values={
+                    **base,
+                    ":dead": JobStatus.DEAD.value,
+                    **self._dead_values(job_id, DEAD_HOOK_GRACE_SECONDS),  # the worker runs it
+                    **self._terminal_values(),
+                },
                 on_failed=_Stale(None),
                 return_values="NONE",
             )
@@ -505,6 +524,105 @@ class DynamoSqsJobQueue:
                 sent += 1
                 _log.info("job_message_resent", job_id=str(job_id))
         return sent
+
+    async def release_lease(self, job_id: uuid.UUID, owner: str, *, refund: bool) -> bool:
+        """End `owner`'s lease now (shutdown) and make the message visible again at once; with
+        `refund` the claim's attempt is given back too (its handler never started)."""
+        now = self._clock.now()
+        refund_set = ", attempts = attempts - :one" if refund else ""
+        try:
+            await self._table.update(
+                keys.job(job_id),
+                update="SET lease_expires_at = :past" + refund_set + ", " + _BUMP,
+                condition="#s = :running AND lease_owner = :owner"
+                + (" AND attempts > :zero" if refund else ""),
+                names=_S,
+                values={
+                    ":running": JobStatus.RUNNING.value,
+                    ":owner": owner,
+                    ":past": encode_timestamp(now - timedelta(seconds=1)),
+                    ":now": encode_timestamp(now),
+                    ":one": 1,
+                    **({":zero": 0} if refund else {}),
+                },
+                on_failed=_Stale(None),
+                return_values="NONE",
+            )
+        except _Stale:
+            self._forget(job_id, owner)
+            return False
+        await self._visibility(job_id, self._forget(job_id, owner), 0)
+        _log.info("job_lease_released", job_id=str(job_id), refunded=refund)
+        return True
+
+    # Dead-job hooks ----------------------------------------------------------------------------
+
+    async def dead_pending(self) -> list[Job]:
+        """DEAD jobs (`GSI3PK = DEADHOOK`, due) whose kind's on_dead hook has not run."""
+        now = self._clock.now()
+        rows = await self._table.query(
+            key_condition="GSI3PK = :p AND GSI3SK <= :bound",
+            values={":p": keys.GSI_DEAD, ":bound": encode_timestamp(now) + "#~"},
+            index="GSI3",
+            limit=RELAY_BATCH,
+            page_size=RELAY_BATCH,
+        )
+        found: list[Job] = []
+        for _, item in await self._reread(rows):
+            if (
+                item is None
+                or item.get("GSI3PK") != keys.GSI_DEAD
+                or item.get("status") != JobStatus.DEAD.value
+            ):
+                continue
+            found.append(
+                Job(
+                    decode_uuid(item.get("id")),
+                    str(item.get("kind")),
+                    dict(decode_json(item.get("payload_json"), "payload_json")),
+                    decode_int(item.get("attempts"), "attempts"),
+                    decode_int(item.get("max_attempts"), "max_attempts"),
+                    last_error=str(item.get("last_error") or "") or None,
+                )
+            )
+        return found
+
+    async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
+        """Leave the DEADHOOK partition; a failed hook is listed again after a backoff, and is
+        abandoned (logged `job_dead_hook_abandoned`) after DEAD_HOOK_MAX_FAILURES."""
+        values: dict[str, Any] = {":deadp": keys.GSI_DEAD, ":now": self._now(), ":one": 1}
+        if failed:
+            due = keys.job_dead_gsi3(
+                self._clock.now() + timedelta(seconds=DEAD_HOOK_RETRY_SECONDS), job_id
+            )
+            try:
+                after = await self._table.update(
+                    keys.job(job_id),
+                    update="SET GSI3SK = :due, updated_at = :now "
+                    "ADD dead_hook_failures :one, row_version :one",
+                    condition="GSI3PK = :deadp",
+                    values={**values, ":due": due["GSI3SK"]},
+                    on_failed=_Stale(None),
+                    return_values="ALL_NEW",
+                )
+            except _Stale:
+                return
+            failures = decode_int(after.get("dead_hook_failures"), "dead_hook_failures")
+            if failures < DEAD_HOOK_MAX_FAILURES:
+                return
+            _log.error("job_dead_hook_abandoned", job_id=str(job_id), failures=failures)
+        with contextlib.suppress(_Stale):
+            await self._table.update(
+                keys.job(job_id),
+                update="SET updated_at = :now ADD row_version :one REMOVE GSI3PK, GSI3SK",
+                condition="GSI3PK = :deadp",
+                values=values,
+                on_failed=_Stale(None),
+                return_values="NONE",
+            )
+
+    def _now(self) -> str:
+        return encode_timestamp(self._clock.now())
 
     async def _reread(self, rows: list[Item]) -> list[tuple[uuid.UUID, Item | None]]:
         """The job items behind GSI3 hits, strongly consistent, in one `BatchGetItem` per 100

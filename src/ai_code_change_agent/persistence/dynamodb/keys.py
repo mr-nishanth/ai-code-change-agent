@@ -38,6 +38,8 @@ GSI_LIST_MAPPING = "LIST#MAPPING"
 GSI_LIST_AUDIT = "LIST#AUDIT"
 GSI_DISPATCH = "DISPATCH"  # GSI3: outbox, the job's message was never sent
 GSI_SWEEP = "SWEEP"  # GSI3: non-terminal job whose message was sent; watched by the sweep
+GSI_DEAD = "DEADHOOK"  # GSI3: DEAD job whose kind's on_dead hook has not run yet
+GSI_REPORT = "REPORTDUE"  # GSI3: Jira report not yet posted (PENDING / IN_PROGRESS)
 
 
 @dataclass(frozen=True, order=True)
@@ -286,3 +288,18 @@ def job_dispatch_gsi3(due_at: datetime, job_id: Id) -> dict[str, str]:
 
 def job_dedupe_guard(dedupe_key: str) -> Key:
     return Key(_join("JOBKEY", _last(dedupe_key)), SK_GUARD)
+
+
+def job_dead_gsi3(due_at: datetime, job_id: Id) -> dict[str, str]:
+    return {"GSI3PK": GSI_DEAD, "GSI3SK": _join(_ts(due_at), _id(job_id))}
+
+
+# Jira reports (one item per app-posted comment, docs/aws/DYNAMODB-DATA-MODEL.md)
+
+
+def jira_report(report_id: str) -> Key:
+    return Key(_join("JIRAREPORT", _last(report_id)), "REPORT")
+
+
+def jira_report_gsi3(due_at: datetime, report_id: str) -> dict[str, str]:
+    return {"GSI3PK": GSI_REPORT, "GSI3SK": _join(_ts(due_at), _last(report_id))}

@@ -21,6 +21,7 @@ class Job:
     payload: dict[str, Any]
     attempts: int  # including the current one
     max_attempts: int
+    last_error: str | None = None  # the code a DEAD job ended with (on_dead hooks only)
 
 
 class JobRetryableError(Exception):
@@ -82,4 +83,23 @@ class JobQueue(Protocol):
     async def sweep(self) -> int:
         """Re-deliver non-terminal jobs whose message was lost (overdue by more than a grace
         period). Returns how many were re-sent; a queue that cannot lose messages returns 0."""
+        ...
+
+    async def release_lease(self, job_id: uuid.UUID, owner: str, *, refund: bool) -> bool:
+        """Give a claimed job back at once (worker shutdown): its lease ends now, so the next
+        receipt reclaims it instead of waiting for the lease to run out. `refund` also returns
+        the attempt the claim counted (the handler never started). False when `owner` no longer
+        holds it."""
+        ...
+
+    async def dead_pending(self) -> list[Job]:
+        """DEAD jobs whose kind's on_dead hook has not run yet, whichever path recorded them DEAD
+        (the worker's last failure, or a claim that found the last attempt's lease expired), with
+        `last_error` set. A job recorded DEAD by this worker's own `fail` is listed only after a
+        grace period (the worker runs its hook at once)."""
+        ...
+
+    async def dead_settled(self, job_id: uuid.UUID, *, failed: bool = False) -> None:
+        """The DEAD job's hook ran (or it has none): it leaves `dead_pending`. With `failed` the
+        hook raised: it is listed again after a backoff, at most a bounded number of times."""
         ...
