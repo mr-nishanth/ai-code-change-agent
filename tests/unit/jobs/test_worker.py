@@ -52,6 +52,8 @@ class MemoryQueue:
         self.failed.append((job_id, code, retry_in_seconds))
         if job_id in getattr(self, "exhaust", ()):  # no attempts left: dead despite the retry
             return JobStatus.DEAD
+        if job_id in getattr(self, "not_ours", ()):  # the lease went: the store kept its status
+            return JobStatus.RUNNING
         return JobStatus.QUEUED if retry_in_seconds is not None else JobStatus.DEAD
 
     def release(self, job_id: uuid.UUID, owner: str) -> None:
@@ -243,6 +245,25 @@ async def test_a_job_that_ends_dead_runs_its_kind_on_dead_hook_once() -> None:
     await w2.run_once()
     await w2.run_once()  # a kind without a hook
     assert dead == [exhausted.id, final.id]
+
+
+async def test_a_refusal_the_store_did_not_record_as_dead_runs_no_hook() -> None:
+    dead: list[uuid.UUID] = []
+
+    async def on_dead(j: Job) -> None:
+        dead.append(j.id)
+
+    async def refused(j: Job) -> None:
+        raise JobFailedError("repository_unknown")
+
+    lost = job()
+    q = MemoryQueue([lost])
+    q.not_ours = {lost.id}  # type: ignore[attr-defined]
+    w = Worker(
+        q, {"k.one": refused}, lease_seconds=60, heartbeat_seconds=30, on_dead={"k.one": on_dead}
+    )
+    await w.run_once()
+    assert q.failed[0][1] == "repository_unknown" and dead == []
 
 
 async def test_a_failing_on_dead_hook_never_escapes() -> None:

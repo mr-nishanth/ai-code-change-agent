@@ -196,9 +196,10 @@ class Worker:
             if await self._stop_beat(beat):
                 self._lease_lost(job)
                 return
-            await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
+            status = await self._queue.fail(job.id, self.owner, exc.code, retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason=exc.code)
-            await self._dead(job)
+            if status is JobStatus.DEAD:  # not when the store refused (another owner has it)
+                await self._dead(job)
             return
         except Exception as exc:  # retryable by default; the code never carries raw messages
             if await self._stop_beat(beat):
