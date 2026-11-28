@@ -233,6 +233,8 @@ class CodeChangeService:
         artifact_sha256: str,
         decision: ApprovalDecision,
         actor: str,
+        *,
+        reason: str | None = None,
     ) -> tuple[Approval, CodeChangeAttempt]:
         """Record an operator decision bound to the exact artifact hash. A rejection ends the
         attempt (REJECTED); an approval leaves the transition to the workflow, which re-checks
@@ -241,7 +243,7 @@ class CodeChangeService:
             attempt = await uow.store.lock_attempt(attempt_id)
             if attempt is None:
                 raise ChangeNotFoundError("attempt_not_found")
-            approval = attempt.decide(gate, artifact_sha256, decision, actor)
+            approval = attempt.decide(gate, artifact_sha256, decision, actor, reason=reason)
             await uow.store.add_approval(approval)
             if decision is ApprovalDecision.REJECTED:
                 rejected = attempt.transition(S.REJECTED)

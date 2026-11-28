@@ -74,7 +74,7 @@ encryption at rest on both tables; bucket versioning off (artifacts are write-on
 | Attempt pointer | `ATTEMPT#<aid>` | `PTR` | - | Immutable `request_id`, `number`. Cache forever in-process |
 | Agent thread index | `ATTEMPT#<aid>` | `THREAD#<thread_id>` | - | `THREAD#attempt:<aid>:planning:9f3a1c2e` (studio only) |
 | Active-attempt guard | `REQ#<rid>` | `ACTIVE#<repo>` | - | Exists while a non-terminal attempt exists for that repository (replaces the partial unique index) |
-| Approval | `REQ#<rid>` | `APR#<aid>#<decided_at>#<approval_id>` | - | Append-only |
+| Approval | `REQ#<rid>` | `APR#<aid>#<decided_at>#<approval_id>` | - | Append-only; optional `reason` (operator rejections only; absent = none, as on older items) |
 | Multi-repo parent | `REQ#<rid>` | `PARENT` | - | One per request by construction; `declaration_json`, report lifecycle fields, `row_version` |
 | Parent pointer | `PARENT#<pid>` | `PTR` | - | `request_id` |
 | Multi-repo child | `REQ#<rid>` | `CHILD#<cid>` | - | `position`, `repository_id`, `depends_on` (string set or JSON list), status, ... |

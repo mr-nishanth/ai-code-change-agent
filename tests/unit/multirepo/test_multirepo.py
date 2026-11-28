@@ -33,6 +33,7 @@ from ai_code_change_agent.application.multirepo.models import (
 )
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import (
+    Approval,
     ApprovalDecision,
     ApprovalGate,
     CodeChangeAttempt,
@@ -1354,6 +1355,33 @@ async def test_every_child_failing_finishes_the_parent_as_failed(tmp_path: Path)
     for key in ("backend-api", "web-app"):
         await p.handler(p.resume_to(S.REJECTED))(resume_job(p.attempts[key]))
     assert p.parent_status() is ParentStatus.FAILED and len(p.reporter.texts) == 1
+
+
+async def test_an_operator_rejection_reason_is_shown_for_that_child(tmp_path: Path) -> None:
+    p = await paused_children(tmp_path)
+    rejected = p.attempts["backend-api"]
+    secret = p.attempts["web-app"]
+    approvals = {
+        rejected.id: [
+            Approval(rejected.id, ApprovalGate.PLAN, "a" * 64, ApprovalDecision.REJECTED,
+                     "cli:op", reason="wrong module, use billing/")
+        ],
+        secret.id: [
+            Approval(secret.id, ApprovalGate.PLAN, "a" * 64, ApprovalDecision.REJECTED,
+                     "cli:op", reason='the password: "hunter2-secret-value"')
+        ],
+    }  # fmt: skip
+
+    async def listed(attempt_id: uuid.UUID) -> list[Approval]:
+        return approvals.get(attempt_id, [])
+
+    p.changes.approvals = listed  # type: ignore[attr-defined]
+    for key in ("backend-api", "web-app"):
+        await p.handler(p.resume_to(S.REJECTED))(resume_job(p.attempts[key]))
+    ((_, text),) = p.reporter.texts
+    assert "   Reason given by the operator: wrong module, use billing/\n" in text
+    assert "   Reason given by the operator: [withheld: possible secret]\n" in text
+    assert "hunter2" not in text
 
 
 async def test_an_expired_checkpoint_fails_the_child_and_the_parent_reports_it_once(

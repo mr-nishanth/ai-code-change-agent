@@ -157,6 +157,34 @@ async def test_a_terminal_attempt_releases_its_guard_and_the_next_one_is_number_
     assert (await svc.get_request(rid)).current_attempt_id == second.id
 
 
+async def test_a_rejection_reason_round_trips_and_an_old_item_without_one_reads_none(
+    app_table: Table,
+) -> None:
+    svc, aid = await attempt_at_plan_approval(app_table)
+    rejection, _ = await svc.decide(
+        aid, ApprovalGate.PLAN, PLAN, ApprovalDecision.REJECTED, "cli:op", reason="wrong module"
+    )
+    (stored,) = await svc.approvals(aid)
+    assert stored == rejection and stored.reason == "wrong module"
+    rid = (await svc.get_attempt(aid)).request_id
+    (item,) = await collection(app_table, rid, keys.SK_APPROVAL)
+    assert item["reason"] == "wrong module"
+    # an approval written before the field existed (and every approval now) has no attribute
+    await app_table.update(
+        keys.approval(rid, aid, rejection.decided_at, rejection.id),
+        update="REMOVE #r",
+        names={"#r": "reason"},
+    )
+    (old,) = await svc.approvals(aid)
+    assert old.reason is None and old.id == rejection.id
+
+    svc2, aid2 = await attempt_at_plan_approval(app_table)
+    await svc2.decide(aid2, ApprovalGate.PLAN, PLAN, ApprovalDecision.APPROVED, "cli:op")
+    rid2 = (await svc2.get_attempt(aid2)).request_id
+    (approved,) = await collection(app_table, rid2, keys.SK_APPROVAL)
+    assert "reason" not in approved  # the approve path writes the same item as before
+
+
 async def test_update_of_a_terminal_attempt_is_refused(app_table: Table) -> None:
     svc, aid = await attempt_at_plan_approval(app_table)
     _, rejected = await svc.decide(

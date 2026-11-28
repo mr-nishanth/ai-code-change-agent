@@ -102,6 +102,7 @@ Go to History → Jira pipeline, click an attempt, then **Watch live**. See [DEE
 ```bash
 uv run ai-code-change costs --issue <KEY>               # LLM cost per stage, attempt, repository
 uv run ai-code-change changes show <attempt-id>
+uv run ai-code-change changes reject <attempt-id> --gate PLAN --sha256 <hash> --reason "why"  # manual mode
 uv run ai-code-change changes retry-child <child-id>    # re-run one failed repository of a Story
 ```
 

@@ -19,7 +19,12 @@ from ai_code_change_agent.cli.stores import CliStores
 from ai_code_change_agent.composition import build_cost_reporter, worker_app
 from ai_code_change_agent.core.config import get_settings
 from ai_code_change_agent.core.logging import configure_logging
-from ai_code_change_agent.domain.changes.models import ApprovalDecision, ApprovalGate
+from ai_code_change_agent.domain.changes.models import (
+    REASON,
+    REASON_MAX,
+    ApprovalDecision,
+    ApprovalGate,
+)
 from ai_code_change_agent.orchestration.intake import RESUME
 
 
@@ -44,6 +49,19 @@ def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-a
         p.add_argument("attempt", type=uuid.UUID)
         p.add_argument("--gate", choices=("PLAN", "FINAL"), required=True)
         p.add_argument("--sha256", required=True, help="the exact artifact hash being decided")
+        if name == "reject":
+            p.add_argument(
+                "--reason",
+                type=_reason,
+                help=f"why (one line, at most {REASON_MAX} characters; shown in the Jira comment)",
+            )
+
+
+def _reason(text: str) -> str:
+    reason = text.strip()
+    if not REASON.fullmatch(reason):
+        raise argparse.ArgumentTypeError(f"one line of 1-{REASON_MAX} characters is required")
+    return reason
 
 
 def _actor() -> str:
@@ -107,7 +125,7 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
             "approvals": [
                 {"gate": a.gate.value, "decision": a.decision.value,
                  "sha256": a.artifact_sha256,
-                 "actor": a.actor, "actor_verified": a.actor_verified}
+                 "actor": a.actor, "actor_verified": a.actor_verified, "reason": a.reason}
                 for a in approvals
             ],
         }  # fmt: skip
@@ -115,8 +133,9 @@ async def _changes(args: argparse.Namespace, out: TextIO) -> None:
         return
     decision = ApprovalDecision.APPROVED if args.command == "approve" else ApprovalDecision.REJECTED
     approval, attempt = await service.decide(
-        args.attempt, ApprovalGate(args.gate), args.sha256, decision, _actor()
-    )
+        args.attempt, ApprovalGate(args.gate), args.sha256, decision, _actor(),
+        reason=getattr(args, "reason", None),
+    )  # fmt: skip
     # the workflow re-reads and re-checks the approval itself; this only wakes it
     await stores.job_queue().enqueue(
         RESUME, {"attempt_id": str(attempt.id)},

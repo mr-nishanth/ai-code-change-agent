@@ -57,6 +57,7 @@ from ai_code_change_agent.application.workspaces.registry_baseline import Regist
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
 from ai_code_change_agent.domain.changes.models import (
+    REASON_MAX,
     ApprovalDecision,
     ApprovalGate,
     CodeChangeAttempt,
@@ -1042,10 +1043,15 @@ class CodeChangeSteps:
             rejection = max(rejected, key=lambda p: p.decided_at, default=None)
         operator = rejection is not None and rejection.actor != AUTOMATIC_ACTOR
         if operator and rejection is not None:
-            # An operator's decision (changes reject): name the gate; the CLI records no reason.
+            # An operator's decision (changes reject): name the gate and the optional reason
+            # (`--reason`), scanned like any other free text in a comment.
             subject = "plan" if rejection.gate is ApprovalGate.PLAN else "final change"
             stage = f"{rejection.gate.value.lower()} approval gate"
-            reason = f"{subject} rejected by an operator (no rejection reason is recorded)"
+            reason = f"{subject} rejected by an operator" + (
+                f"\nReason given by the operator: {safe_line(rejection.reason, REASON_MAX)}"
+                if rejection.reason
+                else " (no rejection reason is recorded)"
+            )
         elif a.status is S.REJECTED and decisions:
             latest = max(decisions, key=lambda m: (m.created_at, m.id))
             doc = await load_verified(
@@ -1053,7 +1059,8 @@ class CodeChangeSteps:
             )
             reason = f"{doc.gate} policy rejected: " + "; ".join(doc.reasons)[:600]
             stage = f"automatic {doc.gate.lower()} policy gate"
-        retryable = any(word in reason for word in _RETRYABLE)
+        # an operator's own words never make the attempt look retryable
+        retryable = not operator and any(word in reason for word in _RETRYABLE)
         advice = (
             "yes, after the temporary cause is resolved"
             if retryable
