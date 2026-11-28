@@ -14,6 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from ai_code_change_agent.application.artifacts.models import ArtifactKind, ArtifactScope
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.errors import ArtifactIntegrityError
+from ai_code_change_agent.application.jira.models import JiraRichText
 from ai_code_change_agent.application.jobs.queue import Job, JobFailedError
 from ai_code_change_agent.application.multirepo.coordinator import (
     CHILD_JOB,
@@ -50,14 +51,15 @@ from ai_code_change_agent.domain.repositories.resolution import (
 )
 from ai_code_change_agent.execution.artifacts import LocalFilesystemArtifactStore
 from ai_code_change_agent.integrations.jira.reporting import CommentResult, CommentStatus
-from ai_code_change_agent.orchestration.intake import ChildHandler, ResumeHandler
+from ai_code_change_agent.orchestration.intake import ChildHandler, IntakeHandler, ResumeHandler
 from ai_code_change_agent.orchestration.langgraph.graph import build_graph
 from ai_code_change_agent.orchestration.langgraph.runner import (
     CheckpointExpiredError,
     WorkflowRunner,
 )
 from ai_code_change_agent.orchestration.steps import CodeChangeSteps
-from tests.support.workflow import make_rig
+from tests.support.changes import MemoryChanges
+from tests.support.workflow import FakeJira, make_rig
 
 STORY = """Implement order tracking across the existing applications.
 
@@ -344,6 +346,61 @@ async def test_an_unauthorised_repository_blocks_everything_before_any_work() ->
     assert "acme/web-app" in err.value.report and queue.jobs == {}
     (parent,) = store.parents.values()
     assert parent.status is ParentStatus.BLOCKED and store.children == {}
+
+
+async def test_a_rerun_of_a_blocked_start_is_refused_again_with_the_stored_problems() -> None:
+    coordinator, store, queue, _ = make(denied={"acme/web-app"})
+    rid = uuid.uuid4()
+    with pytest.raises(MultiRepoBlockedError) as first:
+        await coordinator.start(rid, "SHOP-100", "SHOP", parse_story(STORY))
+    with pytest.raises(MultiRepoBlockedError) as again:  # a replayed intake: same refusal
+        await coordinator.start(rid, "SHOP-100", "SHOP", parse_story(STORY))
+    assert again.value.code == "multi_repository_blocked"
+    assert again.value.report == first.value.report and "acme/web-app" in again.value.report
+    assert len(store.parents) == 1 and queue.jobs == {}
+
+
+async def test_a_blocked_multi_repository_intake_is_reported_once() -> None:
+    """The refusal is posted by the run that blocks the request; a re-run (lease lost before the
+    job failed) posts nothing. A run that finds the BLOCKED parent of a crashed earlier run whose
+    request is still RECEIVED posts the stored problems."""
+
+    class StoryJira(FakeJira):
+        async def get_issue(self, issue_ref: str) -> Any:
+            issue = await super().get_issue(issue_ref)
+            return issue.model_copy(update={"description": JiraRichText(text=STORY)})
+
+    class Comments:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        async def report(self, key: str, text: str) -> str:
+            self.texts.append(text)
+            return "POSTED"
+
+    for crashed_before_report in (False, True):
+        coordinator, _, _, _ = make(denied={"acme/web-app"})
+        changes, comments = MemoryChanges(), Comments()
+        req = changes.add_request()
+        if crashed_before_report:  # the parent exists, the request was never refused
+            with pytest.raises(MultiRepoBlockedError):
+                await coordinator.start(req.id, "SHOP-1", "SHOP", parse_story(STORY))
+        handler = IntakeHandler(
+            changes=changes.service(), jira=StoryJira(), resolver=Resolver(),  # type: ignore[arg-type]
+            start=_never, repository_field_configured=False, reporter=comments,
+            coordinator=coordinator,
+        )  # fmt: skip
+        payload = {"code_change_request_id": str(req.id)}
+        intake = Job(uuid.uuid4(), "code_change.intake", payload, 1, 3)
+        for _ in range(2):
+            with pytest.raises(JobFailedError, match=r"^multi_repository_blocked$"):
+                await handler(intake)
+        assert len(comments.texts) == 1 and "acme/web-app" in comments.texts[0]
+        assert (await changes.service().get_request(req.id)).status == "BLOCKED"
+
+
+async def _never(attempt_id: uuid.UUID) -> None:  # pragma: no cover - never reached
+    raise AssertionError
 
 
 async def test_a_failed_upstream_blocks_dependents_and_a_missing_contract_never_lets_them_guess() -> (
