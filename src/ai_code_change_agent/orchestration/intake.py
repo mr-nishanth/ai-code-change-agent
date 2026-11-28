@@ -31,6 +31,7 @@ from ai_code_change_agent.application.repositories.resolver import (
 )
 from ai_code_change_agent.core.logging import get_logger
 from ai_code_change_agent.domain.changes.errors import InvalidTransitionError
+from ai_code_change_agent.domain.changes.models import CodeChangeRequest
 from ai_code_change_agent.domain.changes.multirepo import DeclarationError, parse_story
 from ai_code_change_agent.domain.changes.states import AttemptStatus
 from ai_code_change_agent.orchestration.langgraph.runner import CheckpointExpiredError
@@ -83,7 +84,7 @@ class IntakeHandler:
         try:
             issue = await self._jira.get_issue(request.jira_issue_key)
         except JiraIssueNotFoundError:
-            raise await self._refused(request_id, "jira_issue_not_found") from None
+            raise await self._refused(request, "jira_issue_not_found") from None
         except JiraIntegrationError as exc:
             # Authentication, permission, a bad request or an unusable response will not fix
             # itself on a retry: dead at once, with the fixed code. Transient errors (429, 5xx
@@ -91,25 +92,25 @@ class IntakeHandler:
             if _transient(exc):
                 raise JobRetryableError(exc.code) from None
             if not exc.retryable:
-                raise await self._refused(request_id, exc.code) from None
+                raise await self._refused(request, exc.code) from None
             raise
         if issue.project is None or issue.project.key != request.jira_project_key:
-            raise await self._refused(request_id, "jira_project_changed")
+            raise await self._refused(request, "jira_project_changed")
         story_text = f"{issue.summary or ''}\n{issue.description.text if issue.description else ''}"
         try:
             declarations = parse_story(story_text)
         except DeclarationError as exc:
             text = _not_started(issue.key, f"invalid repository declarations: {exc}")
-            raise await self._refused(request_id, exc.code, issue.key, text) from None
+            raise await self._refused(request, exc.code, issue.key, text) from None
         if len(declarations) > 1:
             if self._coordinator is None:
-                raise await self._refused(request_id, "multi_repository_disabled")
+                raise await self._refused(request, "multi_repository_disabled")
             try:
                 await self._coordinator.start(
                     request_id, issue.key, request.jira_project_key, declarations
                 )
             except MultiRepoBlockedError as exc:
-                raise await self._refused(request_id, exc.code, issue.key, exc.report) from None
+                raise await self._refused(request, exc.code, issue.key, exc.report) from None
             return
         resolution = build_resolution_request(issue, REPOSITORY_FIELD if self._field else None)
         result = await self._resolver.resolve(resolution)
@@ -123,7 +124,7 @@ class IntakeHandler:
                 "ACTIVE and mapped to this Jira project by an operator.\n"
                 "Retryable: no, the cause must be fixed first."
             )
-            raise await self._refused(request_id, code, issue.key, text)
+            raise await self._refused(request, code, issue.key, text)
         assert result.repository_id and result.profile_version_id  # noqa: S101 - resolved
         await self._changes.assign_repository(
             request_id, result.repository_id, result.profile_version_id
@@ -133,16 +134,19 @@ class IntakeHandler:
 
     async def _refused(
         self,
-        request_id: uuid.UUID,
+        request: CodeChangeRequest,
         code: str,
         issue_key: str | None = None,
         text: str | None = None,
     ) -> JobFailedError:
         """The intake job ends DEAD with `code`, so no attempt will start from it: the request
         becomes BLOCKED (idempotent) before Jira is told, so a storage failure here retries the
-        job without posting a comment twice."""
-        await self._changes.refuse_request(request_id)
-        if text is not None and issue_key is not None and self._reporter is not None:
+        job without posting a comment. A request already BLOCKED when this run began was refused
+        and reported by an earlier run (its lease expired before the job failed): no second
+        comment. Jira hears of a refusal at most once."""
+        changed = await self._changes.refuse_request(request.id)
+        first = changed or request.status != AttemptStatus.BLOCKED.value
+        if first and text is not None and issue_key is not None and self._reporter is not None:
             await self._reporter.report(issue_key, text)
         return JobFailedError(code)
 

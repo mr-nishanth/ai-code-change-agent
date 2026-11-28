@@ -114,11 +114,13 @@ async def test_a_refused_intake_blocks_only_a_request_that_never_started() -> No
     m = MemoryChanges()
     svc = m.service()
     req = m.add_request()
-    assert (await svc.refuse_request(req.id)).status == "BLOCKED"
-    assert (await svc.refuse_request(req.id)).status == "BLOCKED"  # a redelivered job: no change
+    assert await svc.refuse_request(req.id) is True
+    assert await svc.refuse_request(req.id) is False  # a redelivered job: no change
+    assert (await svc.get_request(req.id)).status == "BLOCKED"
     started = m.add_request(repository_id=uuid.uuid4(), profile_version_id=uuid.uuid4())
     att = await svc.start_attempt(started.id)
-    kept = await svc.refuse_request(started.id)  # the attempt owns the status projection
+    assert await svc.refuse_request(started.id) is False  # the attempt owns the projection
+    kept = await svc.get_request(started.id)
     assert kept.status == "PENDING" and kept.current_attempt_id == att.id
     with pytest.raises(ChangeNotFoundError):
         await svc.refuse_request(uuid.uuid4())

@@ -331,9 +331,10 @@ async def test_an_unresolvable_repository_is_reported_to_jira_once() -> None:
     # the request is terminal, not RECEIVED forever; a redelivered job changes nothing more
     assert (await changes.service().get_request(req.id)).status == "BLOCKED"
     with pytest.raises(JobFailedError, match="repository_unknown_repository"):
-        await handler(job({"code_change_request_id": str(req.id)}))
+        await handler(job({"code_change_request_id": str(req.id)}))  # lease expired after report
     blocked = await changes.service().get_request(req.id)
     assert blocked.status == "BLOCKED" and blocked.current_attempt_id is None
+    assert len(reporter.reports) == 1  # already BLOCKED before the re-run: no second comment
 
 
 async def test_a_refusal_that_cannot_be_recorded_is_retried_before_jira_hears_of_it() -> None:

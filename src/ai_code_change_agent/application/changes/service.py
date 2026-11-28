@@ -116,21 +116,20 @@ class CodeChangeService:
             return req
 
     @retry_concurrent
-    async def refuse_request(self, request_id: uuid.UUID) -> CodeChangeRequest:
+    async def refuse_request(self, request_id: uuid.UUID) -> bool:
         """Intake refused the request (for example its repository is not registered): no attempt
-        will ever start from that intake job, so the status projection becomes the terminal
-        BLOCKED instead of staying RECEIVED. Only a request that never had an attempt changes,
-        and only once: a redelivered intake job writes nothing."""
+        will start from this intake (it is never re-run), so the status projection becomes the
+        terminal BLOCKED instead of staying RECEIVED. Only a request that never had an attempt
+        changes, and only once: a redelivered intake job writes nothing. True when it changed."""
         async with self._uow() as uow:
             req = await uow.store.lock_request(request_id)
             if req is None:
                 raise ChangeNotFoundError("request_not_found")
             if req.current_attempt_id is not None or req.status != "RECEIVED":
-                return req
-            req = replace(req, status=AttemptStatus.BLOCKED.value)
-            await uow.store.update_request(req)
+                return False
+            await uow.store.update_request(replace(req, status=AttemptStatus.BLOCKED.value))
             await uow.commit()
-            return req
+            return True
 
     @retry_concurrent
     async def start_attempt(self, request_id: uuid.UUID) -> CodeChangeAttempt:
