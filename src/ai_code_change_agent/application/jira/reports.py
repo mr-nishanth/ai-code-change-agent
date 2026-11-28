@@ -19,9 +19,18 @@ never repeated blindly. Lifecycle (`ReportState`):
   (`retries_exhausted:<code>`). The worker's dispatcher calls `retry_due` on its relay tick.
 
 Reporting never changes an execution: callers keep the attempt/request status apart and only read
-the outcome. Residual limitation: the marker search reads the newest 100 comments; a comment that
-Jira created during an unknown outcome and that is followed by more than 100 newer comments before
-the retry is not found and is posted again."""
+the outcome. Only comments written by the reporting account (`/myself`) count as a marker match.
+
+Residual duplicate windows (Jira has no idempotency key):
+* a POST in flight: a POST whose reply timed out may still be created by Jira after the next
+  round's marker lookup. The round ends at the unknown outcome and the next one starts no sooner
+  than the client timeout + 1 s (in practice 30 s or more), which closes it unless Jira completes a
+  request more than that long after the client gave up;
+* a suspended holder: a worker that holds a claim, stops (GC pause, laptop sleep) for more than
+  STALE_SECONDS (300 s) after its POST was sent but before Jira answered, and whose claim is taken
+  over meanwhile, can race the new holder's lookup the same way;
+* the marker search reads the newest 100 comments: more than 100 newer comments between an unknown
+  outcome and the retry hide the first comment and the report is posted again."""
 
 import asyncio
 import hashlib
@@ -43,7 +52,17 @@ RETRY_BASE_SECONDS = 30.0  # between rounds: 30 s, 60 s, ... capped at RETRY_MAX
 RETRY_MAX_SECONDS = 900.0
 STALE_SECONDS = 300  # an IN_PROGRESS claim older than this belongs to a crashed poster
 TEXT_LIMIT = 7_900  # Jira comments are cut at 8000 characters; the marker line must survive
-DUE_BATCH = 25
+DUE_BATCH = 10  # reports tried per maintenance round (one POST each)
+RETRY_BUDGET_SECONDS = 45.0  # no delivery starts later than this into a maintenance round
+_UNKNOWN_OUTCOME = frozenset({"timeout", "transport_error"})
+
+
+@dataclass(frozen=True)
+class _Missing:  # a report whose text item is gone: settled FAILED_PERMANENT
+    status: str = "PERMANENT"
+    error: str = "report_text_missing"
+    comment_id: str | None = None
+    http_status: int | None = None
 
 
 class ReportState(StrEnum):
@@ -57,7 +76,7 @@ class ReportState(StrEnum):
 class ReportRecord:
     report_id: str
     issue_key: str
-    text: str
+    text: str  # "" when read from the state item (the text is a separate, write-once item)
     content_sha256: str
     state: ReportState
     attempts: int
@@ -101,13 +120,20 @@ class JiraReportStore(Protocol):
 
     async def get(self, report_id: str) -> ReportRecord | None: ...
 
+    async def text(self, report_id: str) -> str | None:
+        """The report's text (write-once, stored apart so claims and finishes stay small)."""
+        ...
+
     async def recent(self, limit: int) -> list[ReportRecord]:
         """The newest reports, newest first (operator CLI)."""
         ...
 
 
 def marker(report_id: str) -> str:
-    return f"aica-report-{report_id}"
+    """The id written into the comment. A multi-repository parent's report (`parent-<pid>-r<n>`)
+    keeps the marker its comments always had (`aica-report-<pid>-r<n>`), so a report posted before
+    durable reporting is still found and never posted again."""
+    return f"aica-report-{report_id.removeprefix('parent-')}"
 
 
 def report_text(report_id: str, text: str) -> str:
@@ -155,54 +181,91 @@ class DurableJiraReporter:
     async def find_comment(self, issue_key: str, marker_text: str) -> Any:
         return await self._reporter.find_comment(issue_key, marker_text)
 
-    async def report(self, issue_key: str, text: str, *, report_id: str | None = None) -> str:
+    async def prepare(self, issue_key: str, text: str, *, report_id: str) -> bool:
+        """Store the report (PENDING, due now) without posting it: from here on it is delivered
+        even if the caller dies (the worker's retry picks it up). True when it was new; False
+        when the id exists (the first text wins) or reporting is disabled."""
+        if not self.enabled:
+            return False
+        body = report_text(report_id, text)
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        if not await self._store.create(report_id, issue_key, body, sha):
+            return False
+        _log.info("jira_report_pending", report_id=report_id, issue_key=issue_key)
+        return True
+
+    async def report(
+        self, issue_key: str, text: str, *, report_id: str | None = None, reconcile: bool = False
+    ) -> str:
         """Store the report (once per id), then deliver it now. Returns "POSTED",
         "PERMANENT_FAILURE", "DISABLED", or "FAILED" while it is pending a retry (or another
-        worker holds it)."""
+        worker holds it). `reconcile`: an earlier, untracked POST of the same marker may exist
+        (a multi-repository report started before durable reporting): look before posting."""
         if not self.enabled:
             return "DISABLED"
         if report_id is None:  # nothing to key it on: one best-effort POST
             return str(await self._reporter.report(issue_key, text))
-        body = report_text(report_id, text)
-        sha = hashlib.sha256(body.encode()).hexdigest()
-        if await self._store.create(report_id, issue_key, body, sha):
-            _log.info("jira_report_pending", report_id=report_id, issue_key=issue_key)
-        state = await self.deliver(report_id)
+        await self.prepare(issue_key, text, report_id=report_id)
+        return self.outcome(await self.deliver(report_id, reconcile=reconcile))
+
+    @staticmethod
+    def outcome(state: ReportState | None) -> str:
         return _OUTCOME.get(state, "FAILED") if state is not None else "FAILED"
 
+    async def state(self, report_id: str) -> ReportState | None:
+        stored = await self._store.get(report_id)
+        return stored.state if stored is not None else None
+
     async def retry_due(self) -> int:
-        """Deliver every due report (worker dispatcher tick); returns how many were tried."""
+        """Deliver due reports (the worker's maintenance round): at most DUE_BATCH, one POST each
+        (no in-round pauses), and none started after RETRY_BUDGET_SECONDS; returns how many."""
         if not self.enabled:
             return 0
-        ids = await self._store.due(DUE_BATCH)
-        for report_id in ids:
-            await self.deliver(report_id)
-        return len(ids)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RETRY_BUDGET_SECONDS
+        tried = 0
+        for report_id in await self._store.due(DUE_BATCH):
+            if loop.time() >= deadline:
+                break
+            await self.deliver(report_id, tries=1)
+            tried += 1
+        return tried
 
-    async def deliver(self, report_id: str) -> ReportState | None:
-        """One delivery round when the report can be claimed; else its stored state."""
+    async def deliver(
+        self, report_id: str, *, tries: int = TRIES_PER_ROUND, reconcile: bool = False
+    ) -> ReportState | None:
+        """One delivery round when the report can be claimed; else its stored state. A POST whose
+        outcome is unknown (timeout, transport error) ends the round at once: Jira may still be
+        creating that comment, so the marker is looked up only in a later round, after at least
+        the client timeout."""
         claim = await self._store.claim(report_id, STALE_SECONDS)
         if claim is None:
-            stored = await self._store.get(report_id)
-            return stored.state if stored is not None else None
+            return await self.state(report_id)
         record = claim.record
         log = _log.bind(report_id=report_id, issue_key=record.issue_key, round=claim.attempts)
-        uncertain = claim.attempts > 1  # an earlier round may have reached Jira
+        uncertain = claim.attempts > 1 or reconcile  # an earlier POST may have reached Jira
         result: Any = None
-        for tried in range(TRIES_PER_ROUND):
+        text: str | None = None
+        for tried in range(tries):
             result = None
             if uncertain:
                 result = await self._reporter.find_comment(record.issue_key, marker(report_id))
                 if result is not None:
                     log.info("jira_report_lookup", lookup=str(result.status))
             if result is None:  # confirmed absent, or a first try: post it
-                result = await self._reporter.post_comment(record.issue_key, record.text)
+                text = text if text is not None else await self._store.text(report_id)
+                if text is None:  # the text item is missing: nothing can ever be posted
+                    result = _Missing()
+                    break
+                result = await self._reporter.post_comment(record.issue_key, text)
+                if str(result.status) == "RETRYABLE" and result.error in _UNKNOWN_OUTCOME:
+                    break  # in flight, maybe: never look (or post) again in this round
             status = str(result.status)
             if status != "RETRYABLE":
                 break
-            uncertain = True  # a timeout or 5xx may hide a comment Jira created
+            uncertain = True  # a 5xx may hide a comment Jira created
             pause = self._pause(tried, getattr(result, "retry_after", None))
-            if tried + 1 >= TRIES_PER_ROUND or pause is None:
+            if tried + 1 >= tries or pause is None:
                 break
             log.info("jira_report_retry", error=result.error, pause_seconds=round(pause, 2))
             await self._sleep(pause)
@@ -216,6 +279,8 @@ class DurableJiraReporter:
     def _next_retry(self, rounds: int, retry_after: float | None) -> datetime:
         delay = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * float(1 << max(rounds - 1, 0)))
         delay *= 0.75 + 0.5 * self._jitter()  # +-25 %: concurrent failures spread out
+        # never before an unknown-outcome POST of the last round could have finished
+        delay = max(delay, float(getattr(self._reporter, "timeout_seconds", 0.0)) + 1.0)
         if retry_after is not None and retry_after > delay:
             delay = min(retry_after, RETRY_MAX_SECONDS)
         return self._now() + timedelta(seconds=delay)

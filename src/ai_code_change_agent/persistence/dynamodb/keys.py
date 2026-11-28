@@ -302,6 +302,10 @@ def jira_report(report_id: str) -> Key:
     return Key(_join("JIRAREPORT", _last(report_id)), "REPORT")
 
 
+def jira_report_text(report_id: str) -> Key:
+    return Key(_join("JIRAREPORT", _last(report_id)), "TEXT")
+
+
 def jira_report_gsi3(due_at: datetime, report_id: str) -> dict[str, str]:
     return {"GSI3PK": GSI_REPORT, "GSI3SK": _join(_ts(due_at), _last(report_id))}
 

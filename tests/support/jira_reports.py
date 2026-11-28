@@ -16,6 +16,7 @@ from ai_code_change_agent.integrations.jira.authentication import BasicAuthentic
 from ai_code_change_agent.integrations.jira.reporting import JiraOutcomeReporter
 
 BASE = "https://tenant.atlassian.net"
+BOT = "acc-reporting-bot"  # the reporting account (/myself); comments carry it as author
 # A scripted POST outcome: an HTTP status, (status, headers), "timeout" (nothing created),
 # or "accepted_timeout" (Jira created the comment, the reply was lost).
 Step = int | tuple[int, dict[str, str]] | str
@@ -37,12 +38,13 @@ class CommentJira:
 
     script: list[Step] = field(default_factory=list)
     lookups: list[Step] = field(default_factory=list)
-    comments: list[tuple[str, str]] = field(default_factory=list)  # (issue path, text)
+    # (issue path, text[, author account id]): authored by the reporting account unless given
+    comments: list[tuple[str, ...]] = field(default_factory=list)
     posts: int = 0
     gets: int = 0
 
     def texts(self) -> list[str]:
-        return [text for _, text in self.comments]
+        return [c[1] for c in self.comments]
 
     def _step(self, steps: list[Step]) -> Step | None:
         return steps.pop(0) if steps else None
@@ -62,6 +64,8 @@ class CommentJira:
             if step == "accepted_timeout":
                 raise httpx.ReadTimeout("synthetic", request=request)
             return httpx.Response(201, json={"id": str(10000 + len(self.comments))})
+        if request.method == "GET" and path == "/rest/api/3/myself":
+            return httpx.Response(200, json={"accountId": BOT})
         if request.method == "GET" and path.endswith("/comment"):
             self.gets += 1
             step = self._step(self.lookups)
@@ -71,11 +75,13 @@ class CommentJira:
                 status, headers = step if isinstance(step, tuple) else (step, {})
                 return httpx.Response(int(status), headers=headers, json={})
             found = [
-                {"id": str(10001 + i), "body": {"type": "doc", "version": 1, "content": [
+                {"id": str(10001 + i), "author": {"accountId": author}, "body": {"type": "doc", "version": 1, "content": [
                     {"type": "paragraph", "content": [{"type": "text", "text": line}]}
                     for line in text.splitlines()
                 ]}}
-                for i, (p, text) in enumerate(self.comments)
+                for i, (p, text, author) in enumerate(
+                    (c[0], c[1], c[2] if len(c) > 2 else BOT) for c in self.comments
+                )
                 if p == path
             ]  # fmt: skip
             return httpx.Response(200, json={"comments": list(reversed(found))})
@@ -110,15 +116,20 @@ class MemoryReportStore:
     def __init__(self, now: Callable[[], datetime] | None = None) -> None:
         self.now = now or (lambda: datetime.now(UTC))
         self.items: dict[str, dict[str, Any]] = {}
+        self.texts: dict[str, str] = {}
 
     async def create(self, report_id: str, issue_key: str, text: str, sha256: str) -> bool:
         if report_id in self.items:
             return False
         now = self.now()
-        record = ReportRecord(report_id, issue_key, text, sha256, ReportState.PENDING, 0,
+        record = ReportRecord(report_id, issue_key, "", sha256, ReportState.PENDING, 0,
                               next_retry_at=now, created_at=now, updated_at=now)  # fmt: skip
         self.items[report_id] = {"record": record, "token": None, "claimed_at": None, "due": now}
+        self.texts[report_id] = text
         return True
+
+    async def text(self, report_id: str) -> str | None:
+        return self.texts.get(report_id)
 
     async def claim(self, report_id: str, stale_seconds: int) -> ReportClaim | None:
         item = self.items.get(report_id)

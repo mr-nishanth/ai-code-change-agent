@@ -37,6 +37,10 @@ async def test_a_report_is_stored_before_the_post_and_settles_out_of_the_retry_i
     assert item is not None and item["state"] == "POSTED" and item["attempts"] == 1
     assert "GSI3PK" not in item and int(item["expires_at"]) > 0 and item["comment_id"] == "10001"
     assert item["GSI2PK"] == keys.GSI_LIST_REPORT and len(item["content_sha256"]) == 64
+    assert "text" not in item  # claims and finishes rewrite only the small state item
+    body = await app_table.get(keys.jira_report_text("attempt-a"))
+    assert body is not None and body["text"].startswith("Done.")
+    assert await store.text("attempt-a") == jira.texts()[0]
     assert not await store.create("attempt-a", KEY, "other", "sha")  # one report per id
     assert [r.report_id for r in await store.recent(10)] == ["attempt-a"]
 

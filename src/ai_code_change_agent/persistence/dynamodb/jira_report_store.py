@@ -1,13 +1,15 @@
 """DynamoDB store for durable Jira reports (`application.jira.reports`, DYNAMODB-DATA-MODEL.md).
 
-One item per report: `JIRAREPORT#<report_id>/REPORT` with the posted text, its sha256, `state`
+Two items per report, written in one transaction: `JIRAREPORT#<report_id>/TEXT` (the posted text and
+its sha256, write-once, read only to post) and `JIRAREPORT#<report_id>/REPORT` (small: `state`
 (PENDING | IN_PROGRESS | POSTED | FAILED_PERMANENT), `attempts` (delivery rounds), `next_retry_at`,
 `last_error` (a code), `comment_id`, `claimed_at` + `claim_token` (the round in flight) and
 `row_version`. While not settled it sits in the sparse GSI3 partition `REPORTDUE` with
 `GSI3SK = <due>#<id>` (due = next_retry_at, or claimed_at + stale for a claim in flight), which
 the worker's dispatcher queries for retries; GSI2 `LIST#JIRAREPORT` lists every report newest
-first for the operator CLI. A settled report leaves GSI3 and gets `expires_at` (TTL). Every write
-is conditional; failures are `PersistenceError` without driver text (`table`)."""
+first for the operator CLI. A settled report leaves GSI3 and gets `expires_at` (TTL; the TEXT
+item is written once and never rewritten). Every write is conditional; failures are
+`PersistenceError` without driver text (`table`)."""
 
 import uuid
 from datetime import datetime, timedelta
@@ -42,7 +44,7 @@ def _record(item: Item) -> ReportRecord:
     return ReportRecord(
         report_id=str(item.get("report_id")),
         issue_key=str(item.get("issue_key")),
-        text=str(item.get("text") or ""),
+        text="",  # a separate write-once item: `text()`
         content_sha256=str(item.get("content_sha256") or ""),
         state=decode_enum(ReportState, item.get("state"), "state"),
         attempts=decode_int(item.get("attempts"), "attempts"),
@@ -61,13 +63,12 @@ class DynamoJiraReportStore:
 
     async def create(self, report_id: str, issue_key: str, text: str, sha256: str) -> bool:
         now = self._clock.now()
-        item: dict[str, Any] = {
+        state: dict[str, Any] = {
             **keys.jira_report(report_id).as_dict(),
             **keys.jira_report_gsi3(now, report_id),
             **keys.jira_report_gsi2(now, report_id),
             "report_id": report_id,
             "issue_key": issue_key,
-            "text": text,
             "content_sha256": sha256,
             "state": ReportState.PENDING.value,
             "attempts": 0,
@@ -76,11 +77,23 @@ class DynamoJiraReportStore:
             "updated_at": encode_timestamp(now),
             "row_version": 1,
         }
+        body = {
+            **keys.jira_report_text(report_id).as_dict(),
+            "text": text,
+            "content_sha256": sha256,
+        }
+        tx = self._table.transaction()
+        tx.put(state, condition="attribute_not_exists(PK)", on_failed=_Refused())
+        tx.put(body, condition="attribute_not_exists(PK)")
         try:
-            await self._table.put(item, condition="attribute_not_exists(PK)", on_failed=_Refused())
+            await tx.commit()
         except _Refused:
             return False
         return True
+
+    async def text(self, report_id: str) -> str | None:
+        item = await self._table.get(keys.jira_report_text(report_id))
+        return str(item["text"]) if item is not None and "text" in item else None
 
     async def claim(self, report_id: str, stale_seconds: int) -> ReportClaim | None:
         now = self._clock.now()

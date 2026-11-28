@@ -58,7 +58,7 @@ async def test_a_429_waits_retry_after_then_posts_after_checking_for_the_marker(
     assert len(rig.jira.comments) == 1
 
 
-@pytest.mark.parametrize("failure", [500, 503, "timeout"])
+@pytest.mark.parametrize("failure", [500, 503])
 async def test_a_transient_failure_is_retried_in_the_round(failure: Any) -> None:
     rig = Rig(CommentJira(script=[failure]))
     assert await rig.reporter.report(KEY, "x", report_id="attempt-1") == "POSTED"
@@ -66,11 +66,56 @@ async def test_a_transient_failure_is_retried_in_the_round(failure: Any) -> None
     assert rig.pauses == [1.5]  # 1 s base with jitter
 
 
-async def test_a_timeout_after_jira_accepted_is_found_by_its_marker_and_not_reposted() -> None:
-    rig = Rig(CommentJira(script=["accepted_timeout"]))
-    assert await rig.reporter.report(KEY, "x", report_id="attempt-1") == "POSTED"
-    assert rig.jira.posts == 1 and len(rig.jira.comments) == 1  # no duplicate
-    assert (await rig.state()).comment_id == "10001"
+@pytest.mark.parametrize("failure", ["timeout", "accepted_timeout"])
+async def test_an_unknown_outcome_ends_the_round_and_the_next_one_looks_first(failure: str) -> None:
+    """A POST that timed out may still be created by Jira: no lookup or second POST in that
+    round; the next round starts no sooner than the client timeout and looks for the marker."""
+    rig = Rig(CommentJira(script=[failure]))
+    assert await rig.reporter.report(KEY, "x", report_id="attempt-1") == "FAILED"
+    rec = await rig.state()
+    assert rig.jira.posts == 1 and rig.jira.gets == 0 and rig.pauses == []
+    assert rec.state is ReportState.PENDING and rec.last_error == "timeout"
+    assert rec.next_retry_at >= rig.clock() + timedelta(seconds=21)  # 20 s client timeout + 1
+    rig.clock.advance(reports.RETRY_MAX_SECONDS)
+    assert await rig.reporter.retry_due() == 1
+    assert (await rig.state()).state is ReportState.POSTED
+    assert len(rig.jira.comments) == 1  # found by its marker when Jira had created it
+    assert rig.jira.posts == (1 if failure == "accepted_timeout" else 2)
+
+
+async def test_a_comment_by_someone_else_carrying_the_marker_does_not_suppress_the_report() -> None:
+    jira = CommentJira(script=["timeout"])
+    rig = Rig(jira)
+    await rig.reporter.report(KEY, "x", report_id="attempt-1")
+    jira.comments.append((f"/rest/api/3/issue/{KEY}/comment", marker("attempt-1"), "user-9"))
+    rig.clock.advance(reports.RETRY_MAX_SECONDS)
+    await rig.reporter.retry_due()
+    assert (await rig.state()).state is ReportState.POSTED and jira.posts == 2
+
+
+async def test_the_maintenance_retry_posts_once_per_report_and_is_capped() -> None:
+    rig = Rig(CommentJira(script=[503] * 100))
+    for n in range(reports.DUE_BATCH + 3):
+        await rig.store.create(f"attempt-{n}", KEY, "body", "sha")
+    assert await rig.reporter.retry_due() == reports.DUE_BATCH  # capped per round
+    assert rig.jira.posts == reports.DUE_BATCH and rig.pauses == []  # one try each, no pauses
+
+
+async def test_prepare_stores_without_posting_and_the_retry_delivers_it() -> None:
+    rig = Rig(CommentJira())
+    assert await rig.reporter.prepare(KEY, "x", report_id="intake-1")
+    assert not await rig.reporter.prepare(KEY, "other", report_id="intake-1")  # first text wins
+    assert rig.jira.posts == 0 and await rig.reporter.retry_due() == 1
+    assert rig.jira.texts() == [report_text("intake-1", "x")]
+
+
+async def test_a_parent_report_keeps_its_legacy_marker_and_reconciles_first() -> None:
+    jira = CommentJira()
+    jira.comments.append((f"/rest/api/3/issue/{KEY}/comment", "old\nReport ID: aica-report-p1-r0"))
+    rig = Rig(jira)
+    assert marker("parent-p1-r0") == "aica-report-p1-r0"
+    outcome = await rig.reporter.report(KEY, "x", report_id="parent-p1-r0", reconcile=True)
+    assert outcome == "POSTED" and jira.posts == 0  # found the comment posted before the upgrade
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404])
@@ -169,6 +214,7 @@ async def test_concurrent_deliveries_post_once() -> None:
 
 async def test_a_failed_lookup_never_posts_blindly() -> None:
     rig = Rig(CommentJira(script=[503], lookups=["timeout", "timeout"]))
+    rig.reporter._reporter._account = "acc-reporting-bot"
     assert await rig.reporter.report(KEY, "x", report_id="attempt-1") == "FAILED"
     assert rig.jira.posts == 1 and rig.jira.gets == 2  # outcome unknown: no second POST
     assert (await rig.state()).last_error == "lookup_timeout"
