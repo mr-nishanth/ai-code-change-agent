@@ -604,12 +604,13 @@ def artifact_service(root: Path) -> ArtifactService:
 
 
 def make_real(
-    artifacts: ArtifactService,
+    artifacts: ArtifactService, max_repositories: int = 5
 ) -> tuple[Coordinator, MemStore, Queue, Reporter, AttemptChanges]:
     store, queue, reporter, changes = MemStore(), Queue(), Reporter(), AttemptChanges()
     coordinator = Coordinator(
         store=store, changes=changes, queue=queue, artifacts=artifacts,  # type: ignore[arg-type]
-        resolver=Resolver(), reporter=reporter, max_repositories=5, max_job_attempts=3,
+        resolver=Resolver(), reporter=reporter, max_repositories=max_repositories,
+        max_job_attempts=3,
     )  # fmt: skip
     return coordinator, store, queue, reporter, changes
 
@@ -922,6 +923,34 @@ async def test_a_child_that_failed_validation_reports_the_bounded_validation_det
     assert "- plan_scope: outside the approved plan: app/extra.py" in text
     assert "- command test: FAILED" in text
     assert "COMMAND OUTPUT" not in report and "secrets:" not in text
+
+
+async def test_the_aggregated_comment_caps_the_detail_of_many_failed_children(
+    tmp_path: Path,
+) -> None:
+    artifacts = artifact_service(tmp_path / "artifacts")
+    coordinator, store, _, reporter, changes = make_real(artifacts, max_repositories=10)
+    story = "".join(f"Repository: acme/repo-{i}\n" for i in range(10))
+    await coordinator.start(uuid.uuid4(), "SHOP-100", "SHOP", parse_story(story))
+    check = {"kind": "plan_scope", "status": "FAILED", "detail": "outside the plan: " + "p" * 480}
+    report_doc = {
+        "decision": "FAILED", "base_commit_sha": "a" * 40, "validation_policy": "v1",
+        "changeset_sha256": "b" * 64, "changed_files": [], "checks": [check] * 8, "commands": [],
+    }  # fmt: skip
+    for i in range(10):
+        await fail_with_artifact(
+            coordinator, store, changes, artifacts, f"repo-{i}",
+            "validation_failed", ArtifactKind.VALIDATION_REPORT, report_doc,
+        )  # fmt: skip
+    (report,) = [t for _, t in reporter.texts]
+    assert len(report) < 8000  # Jira's MAX_COMMENT, with room to spare
+    assert "   [... more detail omitted]" in report
+    for i in range(10):  # every child keeps its status, reason and retry line
+        assert "Reason: validation_failed" in entry(report, f"repo-{i}")
+    assert "Report ID:" in report or "Cross-Repository Result:" in report
+    for line in report.splitlines():  # whole lines only
+        if line.startswith("   - plan_scope:"):
+            assert line.endswith("p")
 
 
 async def test_a_contract_with_matching_provenance_is_accepted(tmp_path: Path) -> None:

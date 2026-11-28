@@ -77,6 +77,9 @@ _INTEGRITY_FAILURES = frozenset(
     }
 )
 _CHILD_DETAIL_CHARS = 2000  # one aggregated comment holds every child's detail
+# All children's detail together: Jira comments are cut at 8000 characters (MAX_COMMENT), and
+# the status, reason and retry lines of every child and the footer must always fit.
+_COMMENT_DETAIL_CHARS = 4000
 _RESULT_TEXT = {
     ParentStatus.COMPLETED: "all repository executions and required contracts completed.",
     ParentStatus.PARTIALLY_COMPLETED: "partially completed; successful PRs are kept.",
@@ -367,6 +370,7 @@ class Coordinator:
             "",
             "Repositories:",
         ]
+        budget: int | None = _COMMENT_DETAIL_CHARS
         for i, c in enumerate(sorted(children, key=lambda c: c.position), start=1):
             lines.append(f"{i}. {c.repository_key}" + (f" ({c.role})" if c.role else ""))
             lines.append(f"   Status: {c.status.value}")
@@ -391,7 +395,15 @@ class Coordinator:
                         f"below, then ai-code-change changes retry-child {c.id})"
                     )
                 lines += [f"   Reason: {c.failure_code or '-'}", f"   Retryable: {retry}"]
-                lines += [f"   {ln}" for ln in await self._child_detail(c)]
+                for ln in await self._child_detail(c):  # whole lines, within the total budget
+                    if budget is not None and len(ln) + 4 <= budget:
+                        lines.append(f"   {ln}")
+                        budget -= len(ln) + 4
+                    else:
+                        if budget is not None:
+                            lines.append("   [... more detail omitted]")
+                        budget = None  # every later child's detail is omitted too
+                        break
             if c.contract_sha256:
                 lines.append(f"   Published contract: sha256 {c.contract_sha256[:12]}")
             if c.runs > 1:
