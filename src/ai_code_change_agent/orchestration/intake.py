@@ -216,8 +216,9 @@ class ResumeHandler:
     A multi-repository child that paused at a gate is finished here: once the resumed (or
     expired) attempt is terminal the coordinator records the child and advances its parent, so
     the parent never stays RUNNING after its last child. Children report only through the
-    parent's aggregated comment. `around` wraps the run (the cost report), so it already sees the
-    expired attempt as FAILED."""
+    parent's aggregated comment, including an old attempt that retry-child unlinked from its
+    child (its request still has the parent). `around` wraps the run (the cost report), so it
+    already sees the expired attempt as FAILED."""
 
     def __init__(
         self,
@@ -243,7 +244,11 @@ class ResumeHandler:
             await self._run(attempt_id)
         except CheckpointExpiredError as exc:
             _log.warning("attempt_checkpoint_expired", attempt_id=str(attempt_id))
-            if not await self._child_finished(attempt_id) and self._report is not None:
+            if (
+                not await self._child_finished(attempt_id)
+                and self._report is not None
+                and not await self._of_multi_repo_request(attempt_id)
+            ):
                 await self._report(attempt_id)
             raise JobFailedError(exc.code) from None
         await self._child_finished(attempt_id)
@@ -258,6 +263,15 @@ class ResumeHandler:
                         attempt_id, AttemptStatus.FAILED, failure_code=exc.code
                     )
             raise
+
+    async def _of_multi_repo_request(self, attempt_id: uuid.UUID) -> bool:
+        """True when the attempt's request has a multi-repository parent. Covers an attempt no
+        child links any more (retry-child cleared the link): it was a child's, so it is reported
+        only through the parent's aggregated comment, never as a single-repository failure."""
+        if self._coordinator is None or self._changes is None:
+            return False
+        attempt = await self._changes.get_attempt(attempt_id)
+        return await self._coordinator.store.find_by_request(attempt.request_id) is not None
 
     async def _child_finished(self, attempt_id: uuid.UUID) -> bool:
         """True when the attempt belongs to a multi-repository child (notified if terminal)."""

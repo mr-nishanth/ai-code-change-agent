@@ -1251,6 +1251,40 @@ async def test_an_expired_checkpoint_fails_the_child_and_the_parent_reports_it_o
     assert p.single_reports == []  # children are reported through the parent only
 
 
+async def test_a_late_expired_resume_after_retry_child_never_reports_on_the_story(
+    tmp_path: Path,
+) -> None:
+    """retry-child cleared the child's link to its old attempt; a RESUME job for that old attempt
+    whose checkpoint expired still belongs to the multi-repository request, so it posts no
+    single-repository failure comment on the Story."""
+    p = await paused_children(tmp_path)
+    job = resume_job(p.attempts["backend-api"])
+    with pytest.raises(JobFailedError):
+        await p.handler(expired)(job)
+    await p.handler(p.resume_to(S.COMPLETED))(resume_job(p.attempts["web-app"]))
+    assert p.parent_status() is ParentStatus.PARTIALLY_COMPLETED and len(p.reporter.texts) == 1
+    retried = await p.coordinator.retry(by_key(p.store, "backend-api").id)
+    assert retried.attempt_id is None  # the old attempt is no longer linked to the child
+    with pytest.raises(JobFailedError) as raised:  # the late RESUME for the old attempt
+        await p.handler(expired)(job)
+    assert raised.value.code == "checkpoint_expired"
+    assert p.single_reports == [] and len(p.reporter.texts) == 1
+    assert p.parent_status() is ParentStatus.RUNNING  # the retry goes on untouched
+
+
+async def test_an_expired_single_repository_attempt_is_still_reported_once(
+    tmp_path: Path,
+) -> None:
+    p = await paused_children(tmp_path)
+    lone = CodeChangeAttempt(
+        uuid.uuid4(), uuid.uuid4(), 1, uuid.uuid4(), uuid.uuid4(), status=S.AWAITING_PLAN_APPROVAL
+    )
+    p.changes.attempts[lone.id] = lone
+    with pytest.raises(JobFailedError):
+        await p.handler(expired)(resume_job(lone))
+    assert p.single_reports == [lone.id] and p.reporter.texts == []
+
+
 async def test_a_duplicate_completion_notification_counts_once(tmp_path: Path) -> None:
     p = await paused_children(tmp_path)
     for key in ("backend-api", "web-app"):
