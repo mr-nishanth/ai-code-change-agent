@@ -32,6 +32,9 @@ from ai_code_change_agent.core.logging import get_logger
 Handler = Callable[[Job], Coroutine[Any, Any, None]]
 _log = get_logger("worker")
 MAX_BACKOFF_SECONDS = 900
+# A renewal must answer this long before the last successful one runs out (clock skew between
+# this host and DynamoDB, plus the cancel itself): at most 5 s, a tenth of shorter leases.
+HEARTBEAT_MARGIN_SECONDS = 5.0
 
 
 def backoff_seconds(attempts: int, base: int = 30) -> int:
@@ -213,15 +216,23 @@ class Worker:
         timeout, exhausted throttling retries) is logged and retried on the next beat while the last
         successful renewal still covers it; when the next retry would land after that lease ran
         out, the worker treats the lease as lost too, so it stops before another worker can claim
-        the job. Nothing raised here reaches the completion path (see `_stop_beat`)."""
+        the job. Each renewal is bounded by its own timeout that ends the safety margin before the
+        last successful renewal runs out: a call that hangs (driver read timeouts times retries)
+        counts as a lost lease, so the handler never keeps running past `covered_until`. Nothing
+        raised here reaches the completion path (see `_stop_beat`)."""
         loop = asyncio.get_running_loop()
         covered_until = loop.time() + self._lease  # the claim just set the lease
+        margin = min(HEARTBEAT_MARGIN_SECONDS, self._lease / 10)
         failures = 0
         while True:
             await asyncio.sleep(self._beat)
             asked_at = loop.time()  # a renewal's lease runs from the request, not the reply
             try:
-                renewed = await self._queue.heartbeat(job.id, self.owner, self._lease)
+                async with asyncio.timeout(max(0.0, covered_until - asked_at - margin)):
+                    renewed = await self._queue.heartbeat(job.id, self.owner, self._lease)
+            except TimeoutError:  # no answer before the lease would lapse: treat it as lost
+                _log.warning("job_heartbeat_timeout", job_id=str(job.id), kind=job.kind)
+                renewed = False
             except Exception as exc:  # transient: retry while the last renewal still holds
                 failures += 1
                 _log.warning(

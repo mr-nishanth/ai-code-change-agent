@@ -335,3 +335,97 @@ async def test_a_lost_lease_records_no_failure_from_the_handler() -> None:
     q = MemoryQueue([job()], keep_lease=False)
     await worker(q, {"k.one": fails_on_cancel}, beat=0.01).run_once()
     assert q.completed == [] and q.failed == []
+
+
+class HangingBeatQueue(MemoryQueue):
+    """A heartbeat that never answers (a hung DynamoDB call: read timeout x retries)."""
+
+    def __init__(self) -> None:
+        super().__init__([job()])
+        self.cancelled_beats = 0
+
+    async def heartbeat(self, job_id: uuid.UUID, owner: str, lease_seconds: int) -> bool:
+        self.beats += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled_beats += 1
+            raise
+        return True  # pragma: no cover - never reached
+
+
+async def test_a_successful_heartbeat_renews_the_lease_and_the_job_completes() -> None:
+    async def medium(j: Job) -> None:
+        await asyncio.sleep(0.15)
+
+    q = MemoryQueue([job()])
+    w = Worker(q, {"k.one": medium}, lease_seconds=1, heartbeat_seconds=0.05)
+    await asyncio.wait_for(w.run_once(), 5)
+    assert q.beats >= 2 and len(q.completed) == 1 and q.failed == []
+
+
+async def test_a_hung_heartbeat_times_out_before_the_lease_runs_out_and_records_nothing() -> None:
+    cancelled = asyncio.Event()
+
+    async def slow(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    q = HangingBeatQueue()
+    w = Worker(q, {"k.one": slow}, lease_seconds=1, heartbeat_seconds=0.2)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(w.run_once(), 5)  # must not wait for the hung call
+    elapsed = loop.time() - started
+    assert cancelled.is_set() and q.cancelled_beats == 1
+    assert elapsed < 1.0  # stopped before the 1 s lease ran out (minus the safety margin)
+    assert q.completed == [] and q.failed == []  # the lease may belong to another worker now
+
+
+async def test_a_handler_that_finishes_after_a_heartbeat_timeout_is_not_completed() -> None:
+    async def stubborn(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return  # finishes normally after the lease was given up
+
+    q = HangingBeatQueue()
+    w = Worker(q, {"k.one": stubborn}, lease_seconds=1, heartbeat_seconds=0.2)
+    await asyncio.wait_for(w.run_once(), 5)
+    assert q.completed == [] and q.failed == []  # no complete, no state overwrite
+
+
+async def test_a_hung_heartbeat_does_not_delay_a_job_that_finishes_in_time() -> None:
+    """Shutdown path: the handler finishes while a renewal hangs; stopping the heartbeat cancels
+    the hung call at once and the job is completed (the last renewal still covers it)."""
+
+    async def quick(j: Job) -> None:
+        await asyncio.sleep(0.1)
+
+    q = HangingBeatQueue()
+    w = Worker(q, {"k.one": quick}, lease_seconds=60, heartbeat_seconds=0.02)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(w.run_once(), 5)
+    assert loop.time() - started < 1.0 and q.cancelled_beats == 1
+    assert len(q.completed) == 1 and q.failed == []
+
+
+async def test_worker_shutdown_with_a_hung_heartbeat_stops_cleanly() -> None:
+    finished = asyncio.Event()
+
+    async def quick(j: Job) -> None:
+        await asyncio.sleep(0.1)
+        finished.set()
+
+    q = HangingBeatQueue()
+    w = Worker(q, {"k.one": quick}, lease_seconds=60, heartbeat_seconds=0.02, poll_seconds=0.01)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await asyncio.wait_for(finished.wait(), 5)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    assert len(q.completed) == 1 and q.failed == [] and q.cancelled_beats == 1
