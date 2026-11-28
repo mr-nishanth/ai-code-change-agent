@@ -389,6 +389,35 @@ async def test_a_hung_heartbeat_times_out_before_the_lease_runs_out_and_records_
     assert q.completed == [] and q.failed == []  # the lease may belong to another worker now
 
 
+async def test_a_timeout_raised_by_the_heartbeat_call_itself_is_a_transient_failure() -> None:
+    """Only the worker's own renewal deadline means a lost lease: a TimeoutError from inside the
+    call (a driver timeout) is retried on the next beat like any other failure."""
+
+    async def medium(j: Job) -> None:
+        await asyncio.sleep(0.2)
+
+    q = BeatScriptQueue([TimeoutError("driver read timeout"), True])
+    await asyncio.wait_for(worker(q, {"k.one": medium}, beat=0.02).run_once(), 5)
+    assert q.beats >= 3 and len(q.completed) == 1 and q.failed == []
+
+
+async def test_inner_timeouts_that_persist_give_up_before_the_lease_expires() -> None:
+    cancelled = asyncio.Event()
+
+    async def slow(j: Job) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    q = BeatScriptQueue([TimeoutError("driver read timeout")])
+    w = Worker(q, {"k.one": slow}, lease_seconds=1, heartbeat_seconds=0.1)
+    await asyncio.wait_for(w.run_once(), 5)
+    assert cancelled.is_set() and q.beats >= 5  # retried as transient, not lost at the first
+    assert q.completed == [] and q.failed == []
+
+
 async def test_a_handler_that_finishes_after_a_heartbeat_timeout_is_not_completed() -> None:
     async def stubborn(j: Job) -> None:
         try:

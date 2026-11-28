@@ -224,8 +224,13 @@ class Worker:
         out, the worker treats the lease as lost too, so it stops before another worker can claim
         the job. Each renewal is bounded by its own timeout that ends the safety margin before the
         last successful renewal runs out: a call that hangs (driver read timeouts times retries)
-        counts as a lost lease, so the handler never keeps running past `covered_until`. Nothing
-        raised here reaches the completion path (see `_stop_beat`)."""
+        counts as a lost lease, so the handler never keeps running past `covered_until`. Only that
+        deadline's own expiry is a lost lease; a `TimeoutError` raised by the call itself (a driver
+        timeout) is a transient failure like any other. The abandoned call keeps running in its
+        thread; the queue's renewal clients bound it to about one margin (`heartbeat_config`), and
+        a late success only extends this owner's lease (the renewal is conditional on the owner),
+        never lets a second worker run the job. Nothing raised here reaches the completion path
+        (see `_stop_beat`)."""
         loop = asyncio.get_running_loop()
         covered_until = loop.time() + self._lease  # the claim just set the lease
         margin = min(HEARTBEAT_MARGIN_SECONDS, self._lease / 10)
@@ -233,24 +238,27 @@ class Worker:
         while True:
             await asyncio.sleep(self._beat)
             asked_at = loop.time()  # a renewal's lease runs from the request, not the reply
+            deadline = asyncio.timeout(max(0.0, covered_until - asked_at - margin))
             try:
-                async with asyncio.timeout(max(0.0, covered_until - asked_at - margin)):
+                async with deadline:
                     renewed = await self._queue.heartbeat(job.id, self.owner, self._lease)
-            except TimeoutError:  # no answer before the lease would lapse: treat it as lost
-                _log.warning("job_heartbeat_timeout", job_id=str(job.id), kind=job.kind)
-                renewed = False
-            except Exception as exc:  # transient: retry while the last renewal still holds
-                failures += 1
-                _log.warning(
-                    "job_heartbeat_failed",
-                    job_id=str(job.id),
-                    kind=job.kind,
-                    code=_code(exc),
-                    failures=failures,
-                )
-                if loop.time() + self._beat < covered_until:
-                    continue
-                renewed = False
+            except Exception as exc:
+                if isinstance(exc, TimeoutError) and deadline.expired():
+                    # our own deadline: no answer before the lease would lapse, treat it as lost
+                    _log.warning("job_heartbeat_timeout", job_id=str(job.id), kind=job.kind)
+                    renewed = False
+                else:  # transient (a TimeoutError from inside the call too): retry while covered
+                    failures += 1
+                    _log.warning(
+                        "job_heartbeat_failed",
+                        job_id=str(job.id),
+                        kind=job.kind,
+                        code=_code(exc),
+                        failures=failures,
+                    )
+                    if loop.time() + self._beat < covered_until:
+                        continue
+                    renewed = False
             else:
                 if renewed:
                     covered_until = asked_at + self._lease
