@@ -152,6 +152,12 @@ class Worker:
             await self._queue.fail(job.id, self.owner, "no_handler", retry_in_seconds=None)
             _log.error("job_dead", job_id=str(job.id), kind=job.kind, reason="no_handler")
             return
+        try:
+            await self._run(job, handler)
+        finally:  # whatever happened, the job is out of this worker's hands
+            self._queue.release(job.id, self.owner)
+
+    async def _run(self, job: Job, handler: Handler) -> None:
         work = asyncio.create_task(handler(job))
         beat = asyncio.create_task(self._heartbeat(job, work))
         try:

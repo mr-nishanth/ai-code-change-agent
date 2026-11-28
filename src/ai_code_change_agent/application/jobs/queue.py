@@ -61,6 +61,12 @@ class JobQueue(Protocol):
 
     async def complete(self, job_id: uuid.UUID, owner: str) -> bool: ...
 
+    def release(self, job_id: uuid.UUID, owner: str) -> None:
+        """Drop what this process keeps in memory for `owner`'s claim of the job (the SQS receipt).
+        Never touches the stored job. Idempotent; the worker calls it once the job left its hands,
+        whatever the outcome (completed, failed, lease lost)."""
+        ...
+
     async def fail(
         self, job_id: uuid.UUID, owner: str, code: str, *, retry_in_seconds: int | None
     ) -> JobStatus:

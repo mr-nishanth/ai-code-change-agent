@@ -20,7 +20,8 @@ names no job, is left alone so SQS moves it to the DLQ after `maxReceiveCount`.
 
 The lease in DynamoDB decides ownership; SQS visibility follows it on a best-effort basis (a failed
 `ChangeMessageVisibility` or `DeleteMessage` is logged, never fatal: the next receipt reconciles).
-Receipt handles are kept in process (`job_id -> receipt`). Every write bumps `row_version`.
+Receipt handles are kept in process (`job_id -> receipt`) only while the job is in this worker's
+hands: the worker calls `release` after every outcome. Every write bumps `row_version`.
 SQS and DynamoDB failures that matter surface as `PersistenceError` whose message is a code, never
 driver text."""
 
@@ -344,6 +345,9 @@ class DynamoSqsJobQueue:
         if receipt is not None:
             del self._receipts[job_id]
         return receipt
+
+    def release(self, job_id: uuid.UUID, owner: str) -> None:
+        self._forget(job_id, owner)
 
     def _terminal_values(self) -> dict[str, Any]:
         now = self._clock.now()

@@ -141,6 +141,18 @@ async def test_a_lost_heartbeat_returns_false_and_forgets_the_receipt(stubs: Stu
     assert await stubs.queue.complete(JID, "w1")  # no receipt left: no DeleteMessage call
 
 
+async def test_release_forgets_only_the_owners_receipt(stubs: Stubs) -> None:
+    claimed(stubs)
+    await stubs.queue.claim("w1", 60)
+    stubs.queue.release(JID, "w2")  # not the claimant: nothing changes
+    assert JID in stubs.queue._receipts
+    stubs.queue.release(JID, "w1")
+    stubs.queue.release(JID, "w1")  # idempotent
+    assert JID not in stubs.queue._receipts
+    stubs.ddb.add_response("update_item", {"Attributes": serialize_item(job_item())})
+    assert await stubs.queue.complete(JID, "w1")  # no receipt left: no DeleteMessage call
+
+
 async def test_retry_visibility_and_delete_failures_are_not_fatal(stubs: Stubs) -> None:
     claimed(stubs)
     await stubs.queue.claim("w1", 60)

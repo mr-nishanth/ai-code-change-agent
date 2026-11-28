@@ -26,6 +26,7 @@ class MemoryQueue:
         self.beats = 0
         self.relays = 0
         self.sweeps = 0
+        self.released: list[uuid.UUID] = []
 
     async def enqueue(
         self, kind: str, payload: dict[str, Any], *, dedupe_key: str, max_attempts: int
@@ -49,6 +50,9 @@ class MemoryQueue:
     ) -> JobStatus:
         self.failed.append((job_id, code, retry_in_seconds))
         return JobStatus.QUEUED if retry_in_seconds is not None else JobStatus.DEAD
+
+    def release(self, job_id: uuid.UUID, owner: str) -> None:
+        self.released.append(job_id)
 
     async def dispatch_pending(self) -> int:
         self.relays += 1
@@ -429,3 +433,36 @@ async def test_worker_shutdown_with_a_hung_heartbeat_stops_cleanly() -> None:
     stop.set()
     await asyncio.wait_for(task, 5)
     assert len(q.completed) == 1 and q.failed == [] and q.cancelled_beats == 1
+
+
+async def _ok(j: Job) -> None:
+    return None
+
+
+async def _dead(j: Job) -> None:
+    raise JobFailedError("repository_unknown")
+
+
+async def _retry(j: Job) -> None:
+    raise JobRetryableError("jira_unavailable")
+
+
+async def _slow(j: Job) -> None:
+    await asyncio.sleep(30)
+
+
+@pytest.mark.parametrize(
+    ("handler", "queue"),
+    [(_ok, lambda: MemoryQueue([job()])),
+     (_dead, lambda: MemoryQueue([job()])),
+     (_retry, lambda: MemoryQueue([job()])),
+     (_slow, lambda: MemoryQueue([job()], keep_lease=False)),  # lease lost
+     (_slow, HangingBeatQueue)],  # heartbeat timeout
+    ids=["completed", "dead", "retried", "lease-lost", "heartbeat-timeout"],
+)  # fmt: skip
+async def test_the_claim_is_released_whatever_the_outcome(handler: Any, queue: Any) -> None:
+    q = queue()
+    (claimed,) = q.jobs
+    w = Worker(q, {"k.one": handler}, lease_seconds=1, heartbeat_seconds=0.05)
+    await asyncio.wait_for(w.run_once(), 5)
+    assert q.released == [claimed.id]  # no per-job state is left in the queue adapter

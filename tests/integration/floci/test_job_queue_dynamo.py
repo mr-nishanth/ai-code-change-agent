@@ -405,3 +405,36 @@ async def test_the_worker_relays_claims_and_completes_an_outbox_job(
     stop.set()
     await asyncio.wait_for(task, 10)
     assert [j.id for j in seen] == [jid] and messages(job_queues) == 0
+
+
+async def test_no_receipt_is_kept_after_completion_or_after_a_lost_lease(
+    app_table: Table, job_queues: JobQueues
+) -> None:
+    """S2117: the in-process receipt map holds only jobs this worker is still running."""
+    from ai_code_change_agent.domain.webhooks.models import PersistenceError
+
+    q = make(app_table, job_queues)
+    await q.enqueue("k.ok", {}, dedupe_key="done", max_attempts=3)
+    await q.enqueue("k.slow", {}, dedupe_key="lost", max_attempts=3)
+    seen: list[uuid.UUID] = []
+
+    async def ok(job: Job) -> None:
+        seen.append(job.id)
+
+    async def slow(job: Job) -> None:
+        seen.append(job.id)
+        await asyncio.sleep(30)
+
+    async def failing_heartbeat(job_id: uuid.UUID, owner: str, lease_seconds: int) -> bool:
+        raise PersistenceError("ReadTimeoutError")  # every renewal fails: the lease is given up
+
+    q.heartbeat = failing_heartbeat  # type: ignore[method-assign]
+    w = Worker(q, {"k.ok": ok, "k.slow": slow}, lease_seconds=2, heartbeat_seconds=0.5)
+    for _ in range(2):
+        assert await asyncio.wait_for(w.run_once(), 15) is not None
+    assert len(seen) == 2 and q._receipts == {}
+    done = await job_id_of(app_table, "done")
+    lost = await job_id_of(app_table, "lost")
+    assert (await item(app_table, done))["status"] == "SUCCEEDED"
+    held = await item(app_table, lost)
+    assert held["status"] == "RUNNING" and held["lease_owner"] == w.owner  # nothing recorded
