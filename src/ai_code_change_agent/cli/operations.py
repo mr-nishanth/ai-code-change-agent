@@ -6,12 +6,15 @@ resume job); the workflow re-reads and re-checks the approval itself."""
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import getpass
 import json
+import os
 import re
 import signal
 import sys
+import threading
 import uuid
 from typing import TextIO
 
@@ -40,13 +43,21 @@ def add_parsers(top: argparse._SubParsersAction) -> None:  # type: ignore[type-a
     reports = top.add_parser("reports", help="inspect durable Jira reports (pending, failed)")
     rsub = reports.add_subparsers(dest="command", required=True)
     rlist = rsub.add_parser("list", help="the newest reports and their delivery state")
-    rlist.add_argument("--state", choices=[s.value for s in ReportState])
-    rlist.add_argument("--limit", type=int, default=20)
+    rlist.add_argument(
+        "--state",
+        choices=[s.value for s in ReportState],
+        help="keep only this state, among the newest --limit reports (no index by state)",
+    )
+    rlist.add_argument("--limit", type=int, default=20, help="newest reports read (max 200)")
     rshow = rsub.add_parser("show", help="one report (never its comment text)")
     rshow.add_argument("report_id")
     jobs = top.add_parser("jobs", help="inspect the job queue")
     jsub = jobs.add_subparsers(dest="command", required=True)
-    dlq = jsub.add_parser("dlq", help="peek at dead-lettered messages and their jobs")
+    dlq = jsub.add_parser(
+        "dlq",
+        help="peek at dead-lettered messages and their jobs (each peek adds one to a message's "
+        "receive count on the DLQ, which has no redrive of its own)",
+    )
     dlq.add_argument("--max", type=int, default=10, choices=range(1, 11), metavar="1..10")
     costs = top.add_parser("costs", help="print LLM API cost reports from the usage ledger")
     costs.add_argument("--issue", action="append", default=[], help="Jira issue key (repeatable)")
@@ -101,23 +112,56 @@ async def _worker(once: bool) -> None:
                 return
             stop, force = asyncio.Event(), asyncio.Event()
             loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="acca-worker")
+            loop.set_default_executor(executor)
+            signals = _Signals(stop, force)
             for sig in (signal.SIGINT, signal.SIGTERM):
                 with contextlib.suppress(NotImplementedError):
-                    loop.add_signal_handler(sig, _on_signal, sig, stop, force)
-            await app.worker.run(stop, force)
+                    loop.add_signal_handler(sig, signals.received, sig)
+            try:
+                await app.worker.run(stop, force)
+            finally:  # queued blocking calls are dropped; running ones are bounded by the deadline
+                executor.shutdown(wait=False, cancel_futures=True)
         finally:
             await app.costs.print_session_summary()  # recomputed from the persisted ledger
 
 
-def _on_signal(sig: signal.Signals, stop: asyncio.Event, force: asyncio.Event) -> None:
-    """SIGINT and SIGTERM alike: the first stops claiming and gives a running job the worker's
-    shutdown grace; a second one cancels it at once (its lease is released either way)."""
-    if stop.is_set():
-        force.set()
-        _log.warning("worker_shutdown_forced", signal=sig.name)
-    else:
-        stop.set()
-        _log.warning("worker_shutdown_requested", signal=sig.name)
+# After the first signal the process exits within this long whatever still runs: one SQS long poll
+# (20 s) plus the 30 s grace, plus room for the lease release and the cost summary. It also bounds
+# asyncio.run's wait for executor threads (otherwise up to 300 s for a blocked Docker or AWS call).
+SHUTDOWN_DEADLINE_SECONDS = 90.0
+
+
+class _Signals:
+    """SIGINT and SIGTERM alike. The first stops claiming, gives a running job the worker's
+    shutdown grace and arms a hard deadline; the second cancels the job at once (its lease is
+    released either way); the third, or the deadline, exits the process immediately."""
+
+    deadline: threading.Timer | None = None  # the armed hard deadline (cancelled on a clean exit)
+
+    def __init__(self, stop: asyncio.Event, force: asyncio.Event) -> None:
+        self.stop, self.force, self.count = stop, force, 0
+
+    def received(self, sig: signal.Signals) -> None:
+        self.count += 1
+        if self.count == 1:
+            self.stop.set()
+            _log.warning("worker_shutdown_requested", signal=sig.name,
+                         deadline_seconds=SHUTDOWN_DEADLINE_SECONDS)  # fmt: skip
+            timer = threading.Timer(SHUTDOWN_DEADLINE_SECONDS, _hard_exit, ("deadline",))
+            timer.daemon = True
+            timer.start()
+            _Signals.deadline = timer
+        elif self.count == 2:
+            self.force.set()
+            _log.warning("worker_shutdown_forced", signal=sig.name)
+        else:
+            _hard_exit(sig.name)
+
+
+def _hard_exit(reason: str) -> None:
+    _log.error("worker_shutdown_hard_exit", reason=reason)
+    os._exit(130)
 
 
 async def _costs(args: argparse.Namespace, out: TextIO) -> None:
@@ -252,7 +296,11 @@ def _line_buffered_output() -> None:
 def run(args: argparse.Namespace, out: TextIO) -> int:
     if args.area == "worker":
         _line_buffered_output()
-        asyncio.run(_worker(args.once))
+        try:
+            asyncio.run(_worker(args.once))
+        finally:
+            if _Signals.deadline is not None:  # exited in time: nothing left to cut short
+                _Signals.deadline.cancel()
     elif args.area == "costs":
         asyncio.run(_costs(args, out))
     elif args.area == "reports":

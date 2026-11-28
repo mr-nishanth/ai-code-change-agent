@@ -326,6 +326,17 @@ def test_sigint_and_sigterm_stop_the_worker_and_a_second_signal_forces_it(
 
     seen: dict[str, bool] = {}
     monkeypatch.setattr(operations, "get_settings", lambda: local())
+    armed: list[float] = []
+
+    class Timer:  # the real one would end the test process after the deadline
+        def __init__(self, seconds: float, *_: Any) -> None:
+            armed.append(seconds)
+            self.daemon = False
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr("ai_code_change_agent.cli.operations.threading.Timer", Timer)
 
     class Worker:
         async def run(self, stop: asyncio.Event, force: asyncio.Event) -> None:
@@ -347,3 +358,38 @@ def test_sigint_and_sigterm_stop_the_worker_and_a_second_signal_forces_it(
     monkeypatch.setattr(operations, "worker_app", worker_app)
     asyncio.run(operations._worker(once=False))
     assert seen == {"stopped": True, "forced": True, "summary": True}
+    assert armed == [operations.SHUTDOWN_DEADLINE_SECONDS]  # armed by the first signal only
+
+
+def test_a_third_signal_or_the_deadline_exits_the_process_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker stuck in a blocking call (asyncio.run would wait up to 300 s for its executor
+    threads) still ends: the first signal arms a hard deadline, the third exits immediately."""
+    import signal
+
+    exits: list[int] = []
+    timers: list[Any] = []
+
+    class Timer:
+        def __init__(self, seconds: float, fn: Any, args: tuple[Any, ...]) -> None:
+            self.seconds, self.fn, self.args, self.daemon = seconds, fn, args, False
+            timers.append(self)
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr("ai_code_change_agent.cli.operations.threading.Timer", Timer)
+    monkeypatch.setattr("ai_code_change_agent.cli.operations.os._exit", exits.append)
+    stop, force = asyncio.Event(), asyncio.Event()
+    signals = operations._Signals(stop, force)
+    signals.received(signal.SIGTERM)
+    assert stop.is_set() and not force.is_set() and exits == []
+    (timer,) = timers
+    assert timer.daemon and timer.seconds == operations.SHUTDOWN_DEADLINE_SECONDS
+    signals.received(signal.SIGINT)
+    assert force.is_set() and exits == []
+    signals.received(signal.SIGINT)
+    assert exits == [130]
+    timer.fn(*timer.args)  # the deadline fires the same way
+    assert exits == [130, 130]
