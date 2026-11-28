@@ -8,7 +8,7 @@ client."""
 import contextlib
 import sys
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -30,7 +30,7 @@ from ai_code_change_agent.application.git_providers.baseline import BaselineRead
 from ai_code_change_agent.application.git_providers.delivery import DeliveryPublishers
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
 from ai_code_change_agent.application.jira.reports import DurableJiraReporter
-from ai_code_change_agent.application.jobs.queue import JobQueue
+from ai_code_change_agent.application.jobs.queue import Job, JobQueue
 from ai_code_change_agent.application.jobs.worker import Worker
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
 from ai_code_change_agent.application.multirepo.models import MultiRepoStore
@@ -637,6 +637,7 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
                 INTAKE: intake.on_dead,
                 RESUME: recovery.resume_dead,
                 CHILD: recovery.child_dead,
+                PARENT_REPORT: parent_report_dead(coordinator),
             },
             periodic=[("jira_report_retry", reporter.retry_due)],
         )
@@ -645,6 +646,19 @@ async def worker_app(settings: Settings, aws: AwsClients | None = None) -> Async
         await jira.aclose()
         if tracing:
             flush_traces()
+
+
+def parent_report_dead(coordinator: Coordinator) -> Callable[[Job], Coroutine[Any, Any, None]]:
+    """on_dead of `code_change.parent_report`: settle the parent's report projection."""
+
+    async def hook(job: Job) -> None:
+        try:
+            parent_id = uuid.UUID(str(job.payload["parent_id"]))
+        except (KeyError, ValueError):
+            return
+        await coordinator.settle_report(parent_id)
+
+    return hook
 
 
 def build_coordinator(

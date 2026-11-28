@@ -11,6 +11,7 @@ import json
 from ai_code_change_agent.application.artifacts.service import ArtifactService
 from ai_code_change_agent.application.changes.service import CodeChangeService
 from ai_code_change_agent.application.git_providers.ports import GitProviderRegistry
+from ai_code_change_agent.application.jira.reports import DurableJiraReporter
 from ai_code_change_agent.application.multirepo.coordinator import Coordinator
 from ai_code_change_agent.application.repositories.resolver import RepositoryResolver
 from ai_code_change_agent.application.repositories.service import RepositoryRegistryService
@@ -82,5 +83,5 @@ class CliStores:
             changes=self.changes,
             artifacts=self.artifacts(),
             resolver=self.resolver(),
-            reporter=build_jira_reporter(self.settings),
+            reporter=DurableJiraReporter(build_jira_reporter(self.settings), self.reports()),
         )

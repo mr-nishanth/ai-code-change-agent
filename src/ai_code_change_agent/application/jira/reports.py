@@ -150,8 +150,8 @@ _OUTCOME = {
 class DurableJiraReporter:
     """The reporter every app-posted comment goes through (see the module docstring). `reporter`
     is the single-POST Jira client (`JiraOutcomeReporter`): `post_comment`, `find_comment`
-    and `enabled`; its own `post_comment`/`find_comment` stay available for the
-    multi-repository parent, which keeps its report state on the parent item."""
+    and `enabled`. The multi-repository parent reports through it too (`parent-<pid>-r<n>`) and
+    keeps a projection of the report's state on the parent item."""
 
     def __init__(
         self,
@@ -161,7 +161,9 @@ class DurableJiraReporter:
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = random.random,
+        tries_per_round: int = TRIES_PER_ROUND,
     ) -> None:
+        self._tries = tries_per_round
         self._reporter = reporter
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
@@ -206,7 +208,7 @@ class DurableJiraReporter:
         if report_id is None:  # nothing to key it on: one best-effort POST
             return str(await self._reporter.report(issue_key, text))
         await self.prepare(issue_key, text, report_id=report_id)
-        return self.outcome(await self.deliver(report_id, reconcile=reconcile))
+        return self.outcome(await self.deliver(report_id, tries=self._tries, reconcile=reconcile))
 
     @staticmethod
     def outcome(state: ReportState | None) -> str:
@@ -215,6 +217,9 @@ class DurableJiraReporter:
     async def state(self, report_id: str) -> ReportState | None:
         stored = await self._store.get(report_id)
         return stored.state if stored is not None else None
+
+    async def record(self, report_id: str) -> ReportRecord | None:
+        return await self._store.get(report_id)
 
     async def retry_due(self) -> int:
         """Deliver due reports (the worker's maintenance round): at most DUE_BATCH, one POST each
@@ -232,7 +237,7 @@ class DurableJiraReporter:
         return tried
 
     async def deliver(
-        self, report_id: str, *, tries: int = TRIES_PER_ROUND, reconcile: bool = False
+        self, report_id: str, *, tries: int | None = None, reconcile: bool = False
     ) -> ReportState | None:
         """One delivery round when the report can be claimed; else its stored state. A POST whose
         outcome is unknown (timeout, transport error) ends the round at once: Jira may still be
@@ -246,6 +251,7 @@ class DurableJiraReporter:
         uncertain = claim.attempts > 1 or reconcile  # an earlier POST may have reached Jira
         result: Any = None
         text: str | None = None
+        tries = self._tries if tries is None else tries
         for tried in range(tries):
             result = None
             if uncertain:

@@ -389,6 +389,7 @@ async def test_children_resumed_after_their_gates_finish_the_parent_once(
         Resolver,
         ResumeChanges,
         artifact_service,
+        durable,
         expired,
         resume_job,
     )
@@ -398,7 +399,7 @@ async def test_children_resumed_after_their_gates_finish_the_parent_once(
     coordinator = Coordinator(
         store=store, changes=changes, queue=Queue(),  # type: ignore[arg-type]
         artifacts=artifact_service(tmp_path / "artifacts"), resolver=Resolver(),
-        reporter=reporter, max_repositories=5, max_job_attempts=3,
+        reporter=durable(reporter), max_repositories=5, max_job_attempts=3,
     )  # fmt: skip
     request_id = await seed_request(app_table)
     parent = await coordinator.start(request_id, "SHOP-9", "SHOP", parse_story(TWO))
